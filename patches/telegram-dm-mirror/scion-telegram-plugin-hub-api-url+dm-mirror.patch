@@ -1,0 +1,1236 @@
+diff --git a/extras/scion-telegram/internal/telegram/api.go b/extras/scion-telegram/internal/telegram/api.go
+index 2e643c051..79c61e004 100644
+--- a/extras/scion-telegram/internal/telegram/api.go
++++ b/extras/scion-telegram/internal/telegram/api.go
+@@ -168,6 +168,10 @@ type TGChat struct {
+ 	ID    int64  `json:"id"`
+ 	Type  string `json:"type"`
+ 	Title string `json:"title,omitempty"`
++
++	// Username is set for public chats, whose history anyone can read
++	// (local patch).
++	Username string `json:"username,omitempty"`
+ }
+ 
+ // apiResponse is the generic Telegram Bot API response wrapper.
+@@ -444,6 +448,37 @@ func (c *TelegramAPIClient) GetChatMember(ctx context.Context, chatID, userID in
+ 	return &member, nil
+ }
+ 
++// GetChatMemberCount calls the getChatMemberCount API to retrieve the number
++// of members in a chat, bots included (local patch).
++func (c *TelegramAPIClient) GetChatMemberCount(ctx context.Context, chatID int64) (int, error) {
++	url := fmt.Sprintf("%s?chat_id=%d", c.methodURL("getChatMemberCount"), chatID)
++	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
++	if err != nil {
++		return 0, fmt.Errorf("create getChatMemberCount request: %w", err)
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return 0, fmt.Errorf("getChatMemberCount request failed: %w", c.redactToken(err))
++	}
++	defer resp.Body.Close()
++
++	var apiResp apiResponse
++	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
++		return 0, fmt.Errorf("decode getChatMemberCount response: %w", err)
++	}
++
++	if !apiResp.OK {
++		return 0, &APIError{Code: apiResp.ErrorCode, Description: apiResp.Description}
++	}
++
++	var count int
++	if err := json.Unmarshal(apiResp.Result, &count); err != nil {
++		return 0, fmt.Errorf("unmarshal getChatMemberCount result: %w", err)
++	}
++	return count, nil
++}
++
+ // GetMe calls the getMe API to validate the bot token and retrieve bot info.
+ func (c *TelegramAPIClient) GetMe(ctx context.Context) (*BotUser, error) {
+ 	req, err := http.NewRequestWithContext(ctx, "GET", c.methodURL("getMe"), nil)
+diff --git a/extras/scion-telegram/internal/telegram/api_test.go b/extras/scion-telegram/internal/telegram/api_test.go
+index 0417eb77d..bc54484bc 100644
+--- a/extras/scion-telegram/internal/telegram/api_test.go
++++ b/extras/scion-telegram/internal/telegram/api_test.go
+@@ -595,6 +595,46 @@ func TestGetFile_Error(t *testing.T) {
+ 	assert.Contains(t, err.Error(), "invalid file_id")
+ }
+ 
++func TestGetChatMemberCount_Success(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assert.Equal(t, "/bottest-token/getChatMemberCount", r.URL.Path)
++		assert.Equal(t, "GET", r.Method)
++		assert.Equal(t, "-100123", r.URL.Query().Get("chat_id"))
++
++		resp := apiResponse{OK: true, Result: mustJSON(t, 2)}
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(resp)
++	}))
++	defer srv.Close()
++
++	client := newTestAPIClient(t, srv)
++	count, err := client.GetChatMemberCount(context.Background(), -100123)
++	require.NoError(t, err)
++	assert.Equal(t, 2, count)
++}
++
++func TestGetChatMemberCount_Error(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		resp := apiResponse{
++			OK:          false,
++			Description: "Bad Request: chat not found",
++			ErrorCode:   400,
++		}
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(resp)
++	}))
++	defer srv.Close()
++
++	client := newTestAPIClient(t, srv)
++	count, err := client.GetChatMemberCount(context.Background(), -100123)
++	require.Error(t, err)
++	assert.Zero(t, count)
++	var apiErr *APIError
++	require.ErrorAs(t, err, &apiErr)
++	assert.Equal(t, 400, apiErr.Code)
++	assert.Contains(t, apiErr.Description, "chat not found")
++}
++
+ func TestDownloadFile_Success(t *testing.T) {
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		assert.Equal(t, "/file/bottest-token/photos/file_0.jpg", r.URL.Path)
+diff --git a/extras/scion-telegram/internal/telegram/broker_v2.go b/extras/scion-telegram/internal/telegram/broker_v2.go
+index 69fe9130e..b173f7167 100644
+--- a/extras/scion-telegram/internal/telegram/broker_v2.go
++++ b/extras/scion-telegram/internal/telegram/broker_v2.go
+@@ -25,6 +25,7 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
+@@ -66,6 +67,7 @@ type TelegramBrokerV2 struct {
+ 	botInfo *BotUser
+ 
+ 	hubURL     string
++	hubAPIURL  string // optional base for plugin->hub API calls; hubURL stays the base for user-facing links
+ 	hmacKey    string
+ 	brokerID   string
+ 	pluginName string
+@@ -141,6 +143,13 @@ type TelegramBrokerV2 struct {
+ 	userProjects      map[string]userProjectsEntry
+ 	userProjectsMu    sync.Mutex
+ 	userProjectsGroup singleflight.Group
++
++	// mirrorPrivacy caches, per "chatID:telegramUserID", whether a group is
++	// private to the user for hub DM mirror copies (local patch). It is
++	// guarded by mirrorPrivacyMu, not b.mu, and the lock is never held
++	// during the Telegram calls that fill it.
++	mirrorPrivacy   map[string]mirrorPrivacyEntry
++	mirrorPrivacyMu sync.Mutex
+ }
+ 
+ // configGen is one successful configuration. Handlers hold the generation
+@@ -388,6 +397,12 @@ func (b *TelegramBrokerV2) configureLocked(config map[string]string) (*retiredCo
+ 		}
+ 	}
+ 
++	// hub_api_url receives HMAC-signed requests and message text (local
++	// patch); it is applied below with the other hub settings.
++	if err := validateHubAPIURL(config["hub_api_url"]); err != nil {
++		return nil, err
++	}
++
+ 	// Open the store and check the bot token with a new API client. Neither
+ 	// replaces the running ones until the Telegram calls below succeed.
+ 	api := NewAPIClient(botToken, config["api_base_url"])
+@@ -478,6 +493,9 @@ func (b *TelegramBrokerV2) configureLocked(config map[string]string) (*retiredCo
+ 	if v, ok := config["hub_url"]; ok {
+ 		b.hubURL = v
+ 	}
++	if v, ok := config["hub_api_url"]; ok {
++		b.hubAPIURL = v
++	}
+ 	if v, ok := config["hmac_key"]; ok {
+ 		b.hmacKey = v
+ 	}
+@@ -591,12 +609,13 @@ func (b *TelegramBrokerV2) configureLocked(config map[string]string) (*retiredCo
+ 	b.httpClient = &http.Client{Timeout: 10 * time.Second, Transport: transport}
+ 
+ 	// Create hub client, sharing the broker's (possibly wrapped) httpClient.
+-	b.hubClient = NewHTTPHubClient(b.hubURL, b.hmacKey, b.brokerID, b.httpClient)
++	b.hubClient = newHTTPHubClientWithAPI(b.hubURL, b.apiBaseURL(), b.hmacKey, b.brokerID, b.httpClient)
+ 
+ 	// Create component handlers.
+ 	b.commands = NewCommandHandler(b.store, b.api, b.hubClient, bot.Username, b.log)
+ 	b.callbacks = NewCallbackHandler(b.store, b.api, b.hubClient, b.log)
+ 	b.registration = NewRegistrationHandler(b.store, b.api, b.hubURL, b.hmacKey, b.brokerID, b.httpClient, b.log)
++	b.registration.apiURL = b.apiBaseURL()
+ 
+ 	// Handle v1 migration: import chat routes as group links.
+ 	if routesJSON, ok := config["v1_chat_routes"]; ok && routesJSON != "" {
+@@ -955,6 +974,13 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
+ 	// Determine the project and agent from the topic.
+ 	projectID, agentSlug := parseTopicComponents(topic)
+ 
++	// Hub DM mirror copies of notices would fan out to linked groups in the
++	// branches below; the hub mirrors none, so drop any (local patch).
++	if isHubMirror(msg) && !hubMirrorableType(msg.Type) {
++		b.log.Debug("Hub mirror: dropping copy of a non-conversational message", "topic", topic, "type", msg.Type)
++		return nil
++	}
++
+ 	// Route system messages to linked groups (similar to state-change
+ 	// with notify_in_group). System messages are operational notices and
+ 	// do not need DM routing.
+@@ -1029,8 +1055,22 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
+ 	// Collect target chat IDs via dynamic routing.
+ 	var chatIDs []int64
+ 
+-	// Priority 1: Direct chat ID from metadata.
+-	if msg != nil && msg.Metadata != nil {
++	// Hub DM mirror copies follow the DM's user and never fall back to the
++	// project-wide broadcast below (local patch).
++	if isHubMirror(msg) {
++		if store == nil || projectID == "" || agentSlug == "" {
++			return nil
++		}
++		chatIDs = b.resolveMirrorChats(ctx, api, store, msg, projectID, agentSlug)
++		if len(chatIDs) == 0 {
++			b.log.Debug("Hub mirror: no Telegram chat for this DM, dropping", "topic", topic)
++			return nil
++		}
++	}
++
++	// Priority 1: Direct chat ID from metadata. Not for hub mirror copies,
++	// which go only to the chat resolveMirrorChats picked (local patch).
++	if msg != nil && msg.Metadata != nil && !isHubMirror(msg) {
+ 		if chatIDStr, ok := msg.Metadata["telegram_chat_id"]; ok {
+ 			if chatID, err := strconv.ParseInt(chatIDStr, 10, 64); err == nil {
+ 				chatIDs = append(chatIDs, chatID)
+@@ -1040,8 +1080,15 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
+ 
+ 	// Priority 2: Look up via ConversationContext for the recipient.
+ 	if len(chatIDs) == 0 && msg != nil && msg.Recipient != "" && store != nil {
++		// User-topic messages carry no agent in the topic, but conversation
++		// contexts are keyed by agent slug: use the sending agent so the
++		// context matches instead of falling through to the broadcast.
++		routeSlug := agentSlug
++		if routeSlug == "" && strings.HasPrefix(msg.Sender, "agent:") {
++			routeSlug = strings.TrimPrefix(msg.Sender, "agent:")
++		}
+ 		var denied bool
+-		chatIDs, denied = b.resolveRecipientChats(ctx, msg.Recipient, msg.RecipientID, projectID, agentSlug)
++		chatIDs, denied = b.resolveRecipientChats(ctx, msg.Recipient, msg.RecipientID, projectID, routeSlug)
+ 		if denied {
+ 			// The recipient is a linked user who cannot read the project
+ 			// (or the check failed): drop rather than broadcast. The reason
+@@ -3349,12 +3396,56 @@ func (b *TelegramBrokerV2) replyAgentListUnavailable(ctx context.Context, chatID
+ 	b.api.SendMessage(ctx, chatID, text, replyTo) //nolint:errcheck
+ }
+ 
++// apiBaseURL returns the base URL for plugin->hub API calls. Behind an IAP
++// proxy the public hub_url rejects the plugin's HMAC-signed requests, so
++// hub_api_url (e.g. http://localhost:8080 on a single-node hub) can point the
++// calls at the hub directly while links shown to users keep using hub_url.
++// Callers must hold b.mu.
++func (b *TelegramBrokerV2) apiBaseURL() string {
++	if b.hubAPIURL != "" {
++		return b.hubAPIURL
++	}
++	return b.hubURL
++}
++
++// hubAPIURLRule is the hub_api_url requirement quoted in validation errors.
++const hubAPIURLRule = "hub_api_url must be https, or http on a loopback host (localhost, 127.0.0.1, ::1)"
++
++// validateHubAPIURL checks a hub_api_url setting (local patch). The plugin
++// sends HMAC-signed requests and message text there, so it must be an https
++// URL, or an http URL on a loopback host, with no credentials, query or
++// fragment. Empty means unset. Errors name only the scheme and host, never
++// the whole value.
++func validateHubAPIURL(raw string) error {
++	if raw == "" {
++		return nil
++	}
++	u, err := url.Parse(raw)
++	if err != nil {
++		// err quotes the whole value; leave it out.
++		return fmt.Errorf("invalid hub_api_url: not a valid URL; %s", hubAPIURLRule)
++	}
++	scheme := strings.ToLower(u.Scheme)
++	switch {
++	case u.Host == "":
++		return fmt.Errorf("invalid hub_api_url: no host; %s", hubAPIURLRule)
++	case u.User != nil:
++		return fmt.Errorf("invalid hub_api_url (host %q): credentials are not allowed; %s", u.Host, hubAPIURLRule)
++	case u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(raw, "?#"):
++		// ContainsAny also catches a bare "?" or "#".
++		return fmt.Errorf("invalid hub_api_url (host %q): a query or fragment is not allowed; %s", u.Host, hubAPIURLRule)
++	case scheme == "https", scheme == "http" && transportauth.IsLoopbackHost(u.Hostname()):
++		return nil
++	}
++	return fmt.Errorf("invalid hub_api_url (scheme %q, host %q): %s", u.Scheme, u.Host, hubAPIURLRule)
++}
++
+ // --- Hub delivery (reuses the same pattern as v1) ---
+ 
+ func (b *TelegramBrokerV2) deliverInbound(topic string, msg *messages.StructuredMessage) {
+ 	b.mu.RLock()
+ 	handler := b.InboundHandler
+-	hubURL := b.hubURL
++	hubURL := b.apiBaseURL()
+ 	hmacKey := b.hmacKey
+ 	brokerID := b.brokerID
+ 	pluginName := b.pluginName
+@@ -3446,7 +3537,7 @@ func (b *TelegramBrokerV2) shouldSuppressError(chatID int64, threadID int, error
+ func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic string, msg *messages.StructuredMessage) (statusCode int, errMsg string) {
+ 	b.mu.RLock()
+ 	handler := b.InboundHandler
+-	hubURL := b.hubURL
++	hubURL := b.apiBaseURL()
+ 	hmacKey := b.hmacKey
+ 	brokerID := b.brokerID
+ 	pluginName := b.pluginName
+@@ -3574,6 +3665,17 @@ func FormatMessageV2(msg *messages.StructuredMessage, agentSlug string, recipien
+ 		senderSlug := strings.TrimPrefix(msg.Sender, "agent:")
+ 		recipientSlug := strings.TrimPrefix(msg.Recipient, "agent:")
+ 		fmt.Fprintf(&b, "👀 🤖 %s → 🤖 %s 👀", senderSlug, recipientSlug)
++	} else if isHubMirror(msg) && strings.HasPrefix(msg.Sender, "user:") {
++		// A user's own web message mirrored by the hub: label it as the
++		// user, not as the agent whose topic carried it.
++		name := msg.Metadata[hubMirrorSenderNameKey]
++		if name == "" {
++			name = strings.TrimPrefix(msg.Sender, "user:")
++		}
++		fmt.Fprintf(&b, "👤 %s (%s)", name, msg.Metadata[hubMirrorOriginKey])
++		if agentSlug != "" {
++			fmt.Fprintf(&b, " → 🤖 %s", agentSlug)
++		}
+ 	} else if agentSlug != "" {
+ 		fmt.Fprintf(&b, "🤖 %s", agentSlug)
+ 		if len(recipientUsername) > 0 && recipientUsername[0] != "" &&
+diff --git a/extras/scion-telegram/internal/telegram/broker_v2_test.go b/extras/scion-telegram/internal/telegram/broker_v2_test.go
+index 128be5fe8..0c2c17840 100644
+--- a/extras/scion-telegram/internal/telegram/broker_v2_test.go
++++ b/extras/scion-telegram/internal/telegram/broker_v2_test.go
+@@ -162,6 +162,18 @@ type fakeTGServerV2 struct {
+ 	chatMemberDelay       time.Duration
+ 	chatMemberInFlight    int
+ 	chatMemberMaxInFlight int
++	// chatMemberCounts maps chatID → member count for getChatMemberCount
++	// (local patch).
++	chatMemberCounts map[int64]int
++	// failChatMemberCount makes getChatMemberCount fail with a server error
++	// for these chats.
++	failChatMemberCount map[int64]bool
++	// chatMemberCountCalls counts getChatMemberCount requests.
++	chatMemberCountCalls int
++	// chats maps chatID → chat for getChat; other chats get a 404 as
++	// before (local patch). getChatCalls counts getChat requests.
++	chats        map[int64]TGChat
++	getChatCalls int
+ 	// failSetWebhook makes setWebhook fail with a Telegram error.
+ 	failSetWebhook bool
+ 	// failDeleteWebhook makes deleteWebhook fail with a Telegram error.
+@@ -178,6 +190,40 @@ func (f *fakeTGServerV2) chatMemberStats() (calls, maxInFlight int) {
+ 	return f.chatMemberCalls, f.chatMemberMaxInFlight
+ }
+ 
++// setChatMemberCount records a chat's member count for getChatMemberCount.
++func (f *fakeTGServerV2) setChatMemberCount(chatID int64, n int) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.chatMemberCounts == nil {
++		f.chatMemberCounts = make(map[int64]int)
++	}
++	f.chatMemberCounts[chatID] = n
++}
++
++// chatMemberCountCallCount returns the getChatMemberCount call count.
++func (f *fakeTGServerV2) chatMemberCountCallCount() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.chatMemberCountCalls
++}
++
++// setChat records a chat for getChat.
++func (f *fakeTGServerV2) setChat(chat TGChat) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.chats == nil {
++		f.chats = make(map[int64]TGChat)
++	}
++	f.chats[chat.ID] = chat
++}
++
++// getChatCallCount returns the getChat call count.
++func (f *fakeTGServerV2) getChatCallCount() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.getChatCalls
++}
++
+ // setChatMember records a user's status in a chat for getChatMember.
+ func (f *fakeTGServerV2) setChatMember(chatID, userID int64, status string) {
+ 	f.mu.Lock()
+@@ -352,6 +398,35 @@ func newFakeTGServerV2(t *testing.T) *fakeTGServerV2 {
+ 			}
+ 			json.NewEncoder(w).Encode(apiResponse{OK: true, Result: mustJSONRawV2(t, TGChatMember{Status: status})})
+ 
++		case "/bottest-token/getChatMemberCount":
++			chatID, _ := strconv.ParseInt(r.URL.Query().Get("chat_id"), 10, 64)
++			f.mu.Lock()
++			f.chatMemberCountCalls++
++			fail := f.failChatMemberCount[chatID]
++			count, ok := f.chatMemberCounts[chatID]
++			f.mu.Unlock()
++			if fail {
++				json.NewEncoder(w).Encode(apiResponse{OK: false, ErrorCode: 500, Description: "Internal Server Error"})
++				return
++			}
++			if !ok {
++				json.NewEncoder(w).Encode(apiResponse{OK: false, ErrorCode: 400, Description: "Bad Request: chat not found"})
++				return
++			}
++			json.NewEncoder(w).Encode(apiResponse{OK: true, Result: mustJSONRawV2(t, count)})
++
++		case "/bottest-token/getChat":
++			chatID, _ := strconv.ParseInt(r.URL.Query().Get("chat_id"), 10, 64)
++			f.mu.Lock()
++			f.getChatCalls++
++			chat, ok := f.chats[chatID]
++			f.mu.Unlock()
++			if !ok {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			json.NewEncoder(w).Encode(apiResponse{OK: true, Result: mustJSONRawV2(t, chat)})
++
+ 		case "/bottest-token/setMyCommands":
+ 			json.NewEncoder(w).Encode(apiResponse{OK: true, Result: mustJSONRawV2(t, true)})
+ 
+@@ -2299,6 +2374,7 @@ func TestV2_Configure_InvalidConfigMakesNoAPICalls(t *testing.T) {
+ 		// Regression guard: agent_cache_ttl was already checked before any
+ 		// API call on main.
+ 		{"invalid agent_cache_ttl", map[string]string{"agent_cache_ttl": "soon"}, "invalid agent_cache_ttl"},
++		{"plain http hub_api_url", map[string]string{"hub_api_url": "http://10.0.0.5:8080"}, "invalid hub_api_url"},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			srv, calls := newRejectingTGServer(t)
+@@ -2324,6 +2400,100 @@ func TestV2_Configure_InvalidConfigMakesNoAPICalls(t *testing.T) {
+ 	}
+ }
+ 
++// hub_api_url receives HMAC-signed requests and message text, so Configure
++// accepts only https, or http on a loopback host (local patch). A rejected
++// value leaves the previous setting in place.
++func TestV2_Configure_HubAPIURL(t *testing.T) {
++	const previous = "https://previous.example.com"
++	for _, tc := range []struct {
++		value   string
++		wantErr bool
++	}{
++		{"https://hub.example.com", false},
++		{"http://localhost:8080", false},
++		{"http://127.0.0.1:8080", false},
++		{"http://[::1]:8080", false},
++		{"", false},
++		{"http://10.0.0.5:8080", true},
++		{"http://hub.example.com", true},
++		{"ftp://x", true},
++		{"https://u:p@hub.example.com", true},
++		{"https://hub.example.com?x=1", true},
++		{"::not a url", true},
++		{"not a url", true},
++	} {
++		t.Run(tc.value, func(t *testing.T) {
++			tgSrv := newFakeTGServerV2(t)
++			config := func(hubAPIURL string) map[string]string {
++				return map[string]string{
++					"bot_token":    "test-token",
++					"api_base_url": tgSrv.srv.URL,
++					"hub_url":      "http://hub.test",
++					"hub_api_url":  hubAPIURL,
++					"broker_id":    "broker-test",
++					"db_path":      filepath.Join(t.TempDir(), "test.db"),
++				}
++			}
++			b := NewV2(slog.Default())
++			t.Cleanup(func() { b.Close() })
++			require.NoError(t, b.Configure(config(previous)))
++
++			err := b.Configure(config(tc.value))
++
++			b.mu.RLock()
++			got := b.hubAPIURL
++			b.mu.RUnlock()
++			if tc.wantErr {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "hub_api_url must be https, or http on a loopback host (localhost, 127.0.0.1, ::1)")
++				assert.NotContains(t, err.Error(), tc.value, "the error names only the scheme and host")
++				assert.Equal(t, previous, got, "a rejected Configure keeps the previous hub_api_url")
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tc.value, got)
++		})
++	}
++}
++
++func TestValidateHubAPIURL(t *testing.T) {
++	for _, raw := range []string{
++		"",
++		"https://hub.example.com",
++		"HTTPS://hub.example.com",
++		"https://hub.example.com:8443/prefix",
++		"http://localhost:8080",
++		"http://127.0.0.1",
++		"http://[::1]:8080",
++	} {
++		assert.NoError(t, validateHubAPIURL(raw), raw)
++	}
++
++	for _, raw := range []string{
++		"http://localhost.evil.com",
++		"http://localhost.evil.com:8080",
++		"http://10.0.0.5:8080",
++		"http://0.0.0.0:8080",
++		"http://hub.example.com",
++		"ftp://x",
++		"https://u:p@hub.example.com",
++		"https://u@hub.example.com",
++		"https://hub.example.com?x=1",
++		"https://hub.example.com?",
++		"https://hub.example.com#frag",
++		"https:hub.example.com",
++		"localhost:8080",
++		"//hub.example.com",
++		"::not a url",
++	} {
++		err := validateHubAPIURL(raw)
++		if assert.Error(t, err, raw) {
++			assert.Contains(t, err.Error(), "hub_api_url must be https, or http on a loopback host", raw)
++			assert.NotContains(t, err.Error(), raw, "the error names only the scheme and host")
++		}
++	}
++}
++
+ // captureOpenedStores records the SQLite stores Configure opens from now
+ // until the test ends.
+ func captureOpenedStores(t *testing.T) *[]Store {
+diff --git a/extras/scion-telegram/internal/telegram/commands.go b/extras/scion-telegram/internal/telegram/commands.go
+index 52b6c9d87..9a0c77abe 100644
+--- a/extras/scion-telegram/internal/telegram/commands.go
++++ b/extras/scion-telegram/internal/telegram/commands.go
+@@ -870,7 +870,8 @@ func isGroupChat(chatID int64) bool { return chatID < 0 }
+ 
+ // httpHubClient implements HubClient using HTTP calls to the Scion hub API.
+ type httpHubClient struct {
+-	hubURL     string
++	hubURL     string // user-facing base (HubBaseURL)
++	apiURL     string // base for API requests
+ 	hmacKey    string
+ 	brokerID   string
+ 	httpClient *http.Client
+@@ -879,11 +880,18 @@ type httpHubClient struct {
+ // NewHTTPHubClient creates a new HubClient that calls the Scion hub API.
+ // If httpClient is nil, a default client with a 10s timeout is used.
+ func NewHTTPHubClient(hubURL, hmacKey, brokerID string, httpClient *http.Client) HubClient {
++	return newHTTPHubClientWithAPI(hubURL, hubURL, hmacKey, brokerID, httpClient)
++}
++
++// newHTTPHubClientWithAPI is NewHTTPHubClient with API requests sent to
++// apiURL instead of hubURL (see TelegramBrokerV2.apiBaseURL).
++func newHTTPHubClientWithAPI(hubURL, apiURL, hmacKey, brokerID string, httpClient *http.Client) HubClient {
+ 	if httpClient == nil {
+ 		httpClient = &http.Client{Timeout: 10 * time.Second}
+ 	}
+ 	return &httpHubClient{
+ 		hubURL:     hubURL,
++		apiURL:     apiURL,
+ 		hmacKey:    hmacKey,
+ 		brokerID:   brokerID,
+ 		httpClient: httpClient,
+@@ -914,7 +922,7 @@ type hubAgent struct {
+ }
+ 
+ func (c *httpHubClient) ListProjectsFresh(ctx context.Context) ([]ProjectOption, error) {
+-	url := c.hubURL + "/api/v1/broker/projects"
++	url := c.apiURL + "/api/v1/broker/projects"
+ 
+ 	slog.Debug("Listing fresh projects from hub broker endpoint", "url", url, "broker_id", c.brokerID)
+ 
+@@ -981,7 +989,7 @@ func (c *httpHubClient) ListProjectsForUser(ctx context.Context, onBehalfOf stri
+ 
+ // listUserProjectsPage fetches one page of the linked user's projects.
+ func (c *httpHubClient) listUserProjectsPage(ctx context.Context, onBehalfOf, cursor string) (*hubProjectsResponse, error) {
+-	endpoint := c.hubURL + "/api/v1/projects"
++	endpoint := c.apiURL + "/api/v1/projects"
+ 	if cursor != "" {
+ 		endpoint += "?cursor=" + neturl.QueryEscape(cursor)
+ 	}
+@@ -1044,7 +1052,7 @@ func (c *httpHubClient) ListAgents(ctx context.Context, projectID, onBehalfOf st
+ 
+ // listAgentsPage fetches one page of a project's agents as the linked user.
+ func (c *httpHubClient) listAgentsPage(ctx context.Context, projectID, onBehalfOf, cursor string) (*hubAgentsResponse, error) {
+-	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/agents", c.hubURL, projectID)
++	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/agents", c.apiURL, projectID)
+ 	if cursor != "" {
+ 		endpoint += "?cursor=" + neturl.QueryEscape(cursor)
+ 	}
+diff --git a/extras/scion-telegram/internal/telegram/hub_mirror.go b/extras/scion-telegram/internal/telegram/hub_mirror.go
+new file mode 100644
+index 000000000..750d33870
+--- /dev/null
++++ b/extras/scion-telegram/internal/telegram/hub_mirror.go
+@@ -0,0 +1,203 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package telegram
++
++// Hub DM mirror copies (local patch, hub experiment hub.telegram_dm_mirror).
++//
++// The hub publishes observer-only copies of web DM traffic (agent replies and
++// the user's own web messages) on the agent topic, marked with mirror_origin.
++// They go only to the DM user's last chat with that agent, and only while
++// that chat is private to the user: their DM with the bot, or a non-public
++// group whose only members are the user and the bot. They are never sent to a
++// shared or public group, and never broadcast to the project's linked groups.
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/GoogleCloudPlatform/scion/pkg/messages"
++)
++
++const (
++	// The hub patch defines the same literals.
++	hubMirrorOriginKey     = "mirror_origin"
++	hubMirrorSenderNameKey = "sender_display_name"
++)
++
++// isHubMirror reports whether msg is a hub DM mirror copy.
++func isHubMirror(msg *messages.StructuredMessage) bool {
++	return msg != nil && msg.ObserverOnly && msg.Metadata[hubMirrorOriginKey] != ""
++}
++
++// hubMirrorableType reports whether a mirror copy of type t may be sent. The
++// hub mirrors only these conversational types (tgMirrorableType there).
++func hubMirrorableType(t string) bool {
++	switch t {
++	case messages.TypeInstruction, messages.TypeChat, messages.TypeReply:
++		return true
++	}
++	return false
++}
++
++// resolveMirrorChats picks the chats for a hub DM mirror copy. The DM's user
++// is the sender for a mirrored web message and the recipient for a mirrored
++// agent reply. The copy goes to that user's last chat with the agent, and
++// only when mirrorChatIsPrivate confirms the chat is private to the user.
++// Users without a Telegram link, who cannot read the project, or without a
++// chat with the agent get nothing, as do shared or unverifiable chats.
++func (b *TelegramBrokerV2) resolveMirrorChats(ctx context.Context, api *TelegramAPIClient, store Store, msg *messages.StructuredMessage, projectID, agentSlug string) []int64 {
++	principal, principalID := msg.Recipient, msg.RecipientID
++	if strings.HasPrefix(msg.Sender, "user:") {
++		principal, principalID = msg.Sender, msg.SenderID
++	}
++	email := strings.TrimPrefix(principal, "user:")
++	if email == principal {
++		return nil
++	}
++
++	mapping, err := store.GetUserMappingByEmail(ctx, email)
++	if (err != nil || mapping == nil) && principalID != "" {
++		mapping, err = store.GetUserMappingByScionUserID(ctx, principalID)
++	}
++	if err != nil || mapping == nil {
++		b.log.Debug("Hub mirror: DM user has no Telegram link, not sending", "principal", principal)
++		return nil
++	}
++
++	if ok, reason := b.recipientCanReadProject(ctx, mapping, projectID); !ok {
++		b.logReadDenial("Not mirroring to user's chat", reason, projectID)
++		return nil
++	}
++
++	cc, err := store.GetConversationContext(ctx, mapping.TelegramUserID, projectID, agentSlug)
++	if err != nil || cc == nil {
++		b.log.Debug("Hub mirror: DM user has no Telegram chat with the agent, not sending",
++			"project_id", projectID, "agent", agentSlug)
++		return nil
++	}
++	tgUserID, err := strconv.ParseInt(mapping.TelegramUserID, 10, 64)
++	if err != nil {
++		b.log.Debug("Hub mirror: DM user's Telegram link has an invalid user ID, not sending")
++		return nil
++	}
++	if !b.mirrorChatIsPrivate(ctx, api, cc.LastChatID, tgUserID) {
++		b.log.Debug("Hub mirror: DM user's last chat with the agent is not private to them, not sending",
++			"chat_id", cc.LastChatID, "agent", agentSlug)
++		return nil
++	}
++	return []int64{cc.LastChatID}
++}
++
++// mirrorPrivacyEntry is a cached mirrorChatIsPrivate decision for a group.
++type mirrorPrivacyEntry struct {
++	private   bool
++	failed    bool
++	checkedAt time.Time
++}
++
++// ttl returns how long the entry is reused.
++func (e mirrorPrivacyEntry) ttl() time.Duration {
++	if e.failed {
++		return mirrorPrivacyFailureTTL
++	}
++	return mirrorPrivacyCacheTTL
++}
++
++const (
++	// mirrorPrivacyCacheTTL bounds how long a group privacy decision is
++	// reused.
++	mirrorPrivacyCacheTTL = 2 * time.Minute
++	// mirrorPrivacyFailureTTL bounds how long a failed check is remembered;
++	// mirror copies to that chat are not sent meanwhile.
++	mirrorPrivacyFailureTTL = 30 * time.Second
++)
++
++func mirrorPrivacyKey(chatID, tgUserID int64) string {
++	return strconv.FormatInt(chatID, 10) + ":" + strconv.FormatInt(tgUserID, 10)
++}
++
++// mirrorChatIsPrivate reports whether chatID is private to the Telegram user
++// tgUserID. A private chat (positive ID) qualifies only when it is that
++// user's own chat with the bot. A group qualifies only when the user is a
++// current member, the chat has exactly two members, and it is a group or
++// supergroup without a public @username: anyone can read a public group, and
++// only members can query a non-public one, so the two members are the user
++// and this bot. Any failed check counts as not private (fail closed). Group
++// decisions are cached briefly; failed checks for a shorter time.
++func (b *TelegramBrokerV2) mirrorChatIsPrivate(ctx context.Context, api *TelegramAPIClient, chatID, tgUserID int64) bool {
++	if chatID > 0 {
++		return chatID == tgUserID
++	}
++	if chatID == 0 || api == nil {
++		return false
++	}
++
++	key := mirrorPrivacyKey(chatID, tgUserID)
++	if entry, ok := b.cachedMirrorPrivacy(key); ok {
++		return entry.private
++	}
++
++	if ctx.Err() != nil {
++		return false
++	}
++	entry := mirrorPrivacyEntry{checkedAt: time.Now()}
++	member, err := api.GetChatMember(ctx, chatID, tgUserID)
++	if err == nil && member.IsCurrentMember() {
++		var count int
++		count, err = api.GetChatMemberCount(ctx, chatID)
++		if err == nil && count == 2 {
++			var chat *TGChat
++			chat, err = api.GetChat(ctx, chatID)
++			entry.private = err == nil && chat.Username == "" &&
++				(chat.Type == "group" || chat.Type == "supergroup")
++		}
++	}
++	if err != nil {
++		if ctx.Err() != nil {
++			// The request ended with the caller's context; not remembered.
++			return false
++		}
++		// Includes the user or bot no longer seeing the chat
++		// (isNotVisibleChatError): not private either way.
++		b.log.Debug("Hub mirror: could not check whether the chat is private", "chat_id", chatID, "error", err)
++		entry.failed = true
++	}
++
++	b.mirrorPrivacyMu.Lock()
++	if b.mirrorPrivacy == nil {
++		b.mirrorPrivacy = make(map[string]mirrorPrivacyEntry)
++	}
++	for k, e := range b.mirrorPrivacy {
++		if time.Since(e.checkedAt) >= e.ttl() {
++			delete(b.mirrorPrivacy, k)
++		}
++	}
++	b.mirrorPrivacy[key] = entry
++	b.mirrorPrivacyMu.Unlock()
++	return entry.private
++}
++
++// cachedMirrorPrivacy returns the unexpired cached privacy decision for key.
++func (b *TelegramBrokerV2) cachedMirrorPrivacy(key string) (mirrorPrivacyEntry, bool) {
++	b.mirrorPrivacyMu.Lock()
++	defer b.mirrorPrivacyMu.Unlock()
++	e, ok := b.mirrorPrivacy[key]
++	if !ok || time.Since(e.checkedAt) >= e.ttl() {
++		return mirrorPrivacyEntry{}, false
++	}
++	return e, true
++}
+diff --git a/extras/scion-telegram/internal/telegram/hub_mirror_test.go b/extras/scion-telegram/internal/telegram/hub_mirror_test.go
+new file mode 100644
+index 000000000..09390c1fd
+--- /dev/null
++++ b/extras/scion-telegram/internal/telegram/hub_mirror_test.go
+@@ -0,0 +1,350 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package telegram
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/GoogleCloudPlatform/scion/pkg/messages"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const hubMirrorTestTopic = "scion.project.proj-1.agent.coder.messages"
++
++// asHubMirror marks m the way the hub marks DM mirror copies.
++func asHubMirror(m *messages.StructuredMessage, senderName string) *messages.StructuredMessage {
++	m.ObserverOnly = true
++	m.Channel = "telegram"
++	m.Metadata = map[string]string{hubMirrorOriginKey: "web"}
++	if senderName != "" {
++		m.Metadata[hubMirrorSenderNameKey] = senderName
++	}
++	return m
++}
++
++func webMessageFrom(sender string) *messages.StructuredMessage {
++	return &messages.StructuredMessage{
++		Version:   messages.Version,
++		Timestamp: time.Now().Format(time.RFC3339Nano),
++		Sender:    sender,
++		Recipient: "agent:coder",
++		Msg:       "ping from the web",
++		Type:      messages.TypeInstruction,
++	}
++}
++
++func saveCoderContext(t *testing.T, store Store, chatID int64) {
++	t.Helper()
++	require.NoError(t, store.SaveConversationContext(context.Background(), &ConversationContext{
++		TelegramUserID: "456", ProjectID: "proj-1", AgentSlug: "coder", LastChatID: chatID, LastMessageAt: time.Now(),
++	}))
++}
++
++func sentChatIDs(tgSrv *fakeTGServerV2) []int64 {
++	var ids []int64
++	for _, m := range tgSrv.getSentMessages() {
++		ids = append(ids, m.ChatID)
++	}
++	return ids
++}
++
++// makePrivateGroup makes chatID look like a non-public supergroup whose only
++// members are the linked test user (456) and the bot.
++func makePrivateGroup(tgSrv *fakeTGServerV2, chatID int64) {
++	tgSrv.setChatMember(chatID, 456, "member")
++	tgSrv.setChatMemberCount(chatID, 2)
++	tgSrv.setChat(TGChat{ID: chatID, Type: "supergroup"})
++}
++
++// privacyCheckCalls returns the getChatMember, getChatMemberCount and getChat
++// call counts.
++func privacyCheckCalls(tgSrv *fakeTGServerV2) (member, count, chat int) {
++	member, _ = tgSrv.chatMemberStats()
++	return member, tgSrv.chatMemberCountCallCount(), tgSrv.getChatCallCount()
++}
++
++func TestHubMirror_UserWebMessage_GoesToContextChatAsUser(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++	saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "")
++	saveCoderContext(t, b.store, -300)
++	makePrivateGroup(tgSrv, -300)
++
++	require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++		asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")))
++
++	sent := tgSrv.getSentMessages()
++	require.Len(t, sent, 1)
++	assert.Equal(t, int64(-300), sent[0].ChatID)
++	assert.True(t, strings.HasPrefix(sent[0].Text, "👤 Alice (web) → 🤖 coder"), sent[0].Text)
++	assert.Contains(t, sent[0].Text, "ping from the web")
++}
++
++func TestHubMirror_NoContext_SendsNothing(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "other")
++	saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "coder")
++	saveTestGroupLink(t, b.store, -400, "proj-1", "alpha", "")
++
++	require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++		asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")))
++
++	assert.Empty(t, tgSrv.getSentMessages(), "without a chat with the agent, a mirror goes nowhere")
++}
++
++func TestHubMirror_UserWithoutUsableLink_SendsNothing(t *testing.T) {
++	for name, tc := range map[string]struct {
++		sender string
++		setup  func(*fakeHubClient, string)
++	}{
++		"unlinked user": {sender: "user:nobody@example.com", setup: func(h *fakeHubClient, p string) {
++			h.userProjects = map[string][]ProjectOption{p: {{ID: "proj-1"}}}
++		}},
++		"cannot read project": {sender: "user:alice@example.com", setup: func(h *fakeHubClient, p string) {
++			h.userProjects = map[string][]ProjectOption{p: {}}
++		}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			b, tgSrv, hub, principal := newDMScopeBroker(t)
++			tc.setup(hub, principal)
++			saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++				asHubMirror(webMessageFrom(tc.sender), "")))
++
++			assert.Empty(t, tgSrv.getSentMessages(), "a mirror is never broadcast to the project's groups")
++		})
++	}
++}
++
++func TestHubMirror_AgentReply_RoutedByRecipient(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++	saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "")
++	saveCoderContext(t, b.store, -300)
++	makePrivateGroup(tgSrv, -300)
++
++	require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++		asHubMirror(agentReplyFor("user:alice@example.com"), "")))
++
++	sent := tgSrv.getSentMessages()
++	require.Len(t, sent, 1)
++	assert.Equal(t, int64(-300), sent[0].ChatID)
++	assert.True(t, strings.HasPrefix(sent[0].Text, "🤖 coder"), sent[0].Text)
++}
++
++func TestHubMirror_PrivateChat_SendsWithoutMembershipCheck(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++	saveCoderContext(t, b.store, 456) // the user's own chat with the bot
++
++	require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++		asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")))
++
++	assert.Equal(t, []int64{456}, sentChatIDs(tgSrv))
++	member, count, chat := privacyCheckCalls(tgSrv)
++	assert.Zero(t, member, "a private chat needs no getChatMember call")
++	assert.Zero(t, count, "a private chat needs no getChatMemberCount call")
++	assert.Zero(t, chat, "a private chat needs no getChat call")
++}
++
++func TestHubMirror_ChatNotPrivateToUser_SendsNothing(t *testing.T) {
++	for name, tc := range map[string]struct {
++		chatID int64
++		setup  func(*fakeTGServerV2)
++	}{
++		"another user's private chat": {chatID: 789, setup: func(*fakeTGServerV2) {}},
++		"group with three members": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMember(-300, 456, "member")
++			f.setChatMemberCount(-300, 3)
++			f.setChat(TGChat{ID: -300, Type: "supergroup"})
++		}},
++		"public group (has a username)": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			makePrivateGroup(f, -300)
++			f.setChat(TGChat{ID: -300, Type: "supergroup", Username: "somename"})
++		}},
++		"channel": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			makePrivateGroup(f, -300)
++			f.setChat(TGChat{ID: -300, Type: "channel"})
++		}},
++		"chat lookup fails": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMember(-300, 456, "member")
++			f.setChatMemberCount(-300, 2)
++		}},
++		"user left the group": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMember(-300, 456, "left")
++			f.setChatMemberCount(-300, 2)
++		}},
++		"user not in the group": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMemberCount(-300, 2)
++		}},
++		"member count check fails": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMember(-300, 456, "member")
++			f.failChatMemberCount = map[int64]bool{-300: true}
++		}},
++		"membership check fails": {chatID: -300, setup: func(f *fakeTGServerV2) {
++			f.setChatMemberCount(-300, 2)
++			f.failChatMember = map[int64]bool{-300: true}
++		}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			b, tgSrv, hub, principal := newDMScopeBroker(t)
++			hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++			saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++			saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "")
++			saveCoderContext(t, b.store, tc.chatID)
++			tc.setup(tgSrv)
++
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++				asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")))
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic,
++				asHubMirror(agentReplyFor("user:alice@example.com"), "")))
++
++			assert.Empty(t, tgSrv.getSentMessages(), "a mirror goes only to a chat private to the DM user")
++		})
++	}
++}
++
++func TestHubMirror_GroupPrivacyCheckIsCached(t *testing.T) {
++	for name, tc := range map[string]struct {
++		setup    func(*fakeTGServerV2)
++		wantSent []int64
++	}{
++		"private group": {setup: func(f *fakeTGServerV2) { makePrivateGroup(f, -300) }, wantSent: []int64{-300, -300}},
++		"failed check": {setup: func(f *fakeTGServerV2) {
++			// getChat fails: no chat registered.
++			f.setChatMember(-300, 456, "member")
++			f.setChatMemberCount(-300, 2)
++		}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			b, tgSrv, hub, principal := newDMScopeBroker(t)
++			hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++			saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "")
++			saveCoderContext(t, b.store, -300)
++			tc.setup(tgSrv)
++
++			first := asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")
++			second := asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")
++			second.Msg = "second ping from the web"
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic, first))
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic, second))
++
++			assert.Equal(t, tc.wantSent, sentChatIDs(tgSrv))
++			member, count, chat := privacyCheckCalls(tgSrv)
++			assert.Equal(t, 1, member, "getChatMember is called once within the cache TTL")
++			assert.Equal(t, 1, count, "getChatMemberCount is called once within the cache TTL")
++			assert.Equal(t, 1, chat, "getChat is called once within the cache TTL")
++		})
++	}
++}
++
++func TestHubMirror_PrivacyCacheExpiry(t *testing.T) {
++	for name, tc := range map[string]struct {
++		entry     mirrorPrivacyEntry
++		wantCheck bool
++	}{
++		"answer within its TTL":  {entry: mirrorPrivacyEntry{checkedAt: time.Now().Add(-time.Minute)}},
++		"answer past its TTL":    {entry: mirrorPrivacyEntry{checkedAt: time.Now().Add(-mirrorPrivacyCacheTTL)}, wantCheck: true},
++		"failure within its TTL": {entry: mirrorPrivacyEntry{failed: true, checkedAt: time.Now().Add(-10 * time.Second)}},
++		"failure past its TTL":   {entry: mirrorPrivacyEntry{failed: true, checkedAt: time.Now().Add(-mirrorPrivacyFailureTTL)}, wantCheck: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			// Each cached entry says "not private" while the group is private,
++			// so the result shows whether the entry was reused.
++			b, tgSrv, _, _ := newDMScopeBroker(t)
++			makePrivateGroup(tgSrv, -300)
++			b.mirrorPrivacy = map[string]mirrorPrivacyEntry{mirrorPrivacyKey(-300, 456): tc.entry}
++
++			got := b.mirrorChatIsPrivate(context.Background(), b.api, -300, 456)
++
++			member, count, chat := privacyCheckCalls(tgSrv)
++			if tc.wantCheck {
++				assert.True(t, got, "the expired entry is re-checked")
++				assert.Equal(t, 1, member)
++				assert.Equal(t, 1, count)
++				assert.Equal(t, 1, chat)
++			} else {
++				assert.False(t, got, "the cached entry is reused")
++				assert.Zero(t, member)
++				assert.Zero(t, count)
++				assert.Zero(t, chat)
++			}
++		})
++	}
++}
++
++func TestHubMirror_IgnoresMetadataChatID(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveCoderContext(t, b.store, 456)
++
++	msg := asHubMirror(webMessageFrom("user:alice@example.com"), "Alice")
++	msg.Metadata["telegram_chat_id"] = "-100999"
++	require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic, msg))
++
++	assert.Equal(t, []int64{456}, sentChatIDs(tgSrv), "a mirror goes only to the DM user's chat")
++}
++
++func TestHubMirror_NonConversationalType_SendsNothing(t *testing.T) {
++	for _, typ := range []string{messages.TypeInputNeeded, messages.TypeStateChange, messages.TypeSystem} {
++		t.Run(typ, func(t *testing.T) {
++			b, tgSrv, hub, principal := newDMScopeBroker(t)
++			hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++			require.NoError(t, b.store.SaveGroupLink(context.Background(), &GroupLink{
++				ChatID: -200, ProjectID: "proj-1", ProjectSlug: "alpha",
++				LinkedAt: time.Now().UTC(), Active: true, NotifyInGroup: true,
++			}))
++			saveCoderContext(t, b.store, 456)
++
++			msg := asHubMirror(agentReplyFor("user:alice@example.com"), "")
++			msg.Type = typ
++			require.NoError(t, b.Publish(context.Background(), hubMirrorTestTopic, msg))
++
++			assert.Empty(t, tgSrv.getSentMessages(), "the hub mirrors only conversational messages")
++		})
++	}
++}
++
++func TestV2_Publish_UserTopicReplyUsesSendingAgentContext(t *testing.T) {
++	b, tgSrv, hub, principal := newDMScopeBroker(t)
++	hub.userProjects = map[string][]ProjectOption{principal: {{ID: "proj-1"}}}
++	saveTestGroupLink(t, b.store, -200, "proj-1", "alpha", "")
++	saveTestGroupLink(t, b.store, -300, "proj-1", "alpha", "")
++	saveCoderContext(t, b.store, -300)
++
++	// Not a mirror: an ordinary agent reply routed to telegram by reply
++	// affinity arrives on the user topic, whose topic names no agent.
++	require.NoError(t, b.Publish(context.Background(), "scion.project.proj-1.user."+principal+".messages",
++		agentReplyFor("user:alice@example.com")))
++
++	assert.Equal(t, []int64{-300}, sentChatIDs(tgSrv), "the context chat, not every linked group")
++}
++
++func TestFormatMessageV2_HubMirrorUserSender(t *testing.T) {
++	marked := FormatMessageV2(asHubMirror(webMessageFrom("user:alice@example.com"), ""), "coder")
++	assert.True(t, strings.HasPrefix(marked, "👤 alice@example.com (web) → 🤖 coder\n\n"), marked)
++
++	unmarked := FormatMessageV2(webMessageFrom("user:alice@example.com"), "coder")
++	assert.True(t, strings.HasPrefix(unmarked, "🤖 coder\n\n"), unmarked)
++}
+diff --git a/extras/scion-telegram/internal/telegram/register_v2.go b/extras/scion-telegram/internal/telegram/register_v2.go
+index c4c94a4b8..d315e2d32 100644
+--- a/extras/scion-telegram/internal/telegram/register_v2.go
++++ b/extras/scion-telegram/internal/telegram/register_v2.go
+@@ -35,7 +35,8 @@ import (
+ type RegistrationHandler struct {
+ 	store      Store
+ 	api        *TelegramAPIClient
+-	hubURL     string
++	hubURL     string // base for the link the user opens
++	apiURL     string // base for linking API calls (see TelegramBrokerV2.apiBaseURL)
+ 	hmacKey    string
+ 	brokerID   string
+ 	httpClient *http.Client
+@@ -93,6 +94,7 @@ func NewRegistrationHandler(store Store, api *TelegramAPIClient, hubURL, hmacKey
+ 		store:      store,
+ 		api:        api,
+ 		hubURL:     hubURL,
++		apiURL:     hubURL,
+ 		hmacKey:    hmacKey,
+ 		brokerID:   brokerID,
+ 		httpClient: httpClient,
+@@ -460,7 +462,7 @@ func (h *RegistrationHandler) registerCodeWithHub(ctx context.Context, code, tel
+ 		return fmt.Errorf("marshal linking code request: %w", err)
+ 	}
+ 
+-	url := h.hubURL + "/api/v1/telegram/link"
++	url := h.apiURL + "/api/v1/telegram/link"
+ 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+ 	if err != nil {
+ 		return fmt.Errorf("create linking code request: %w", err)
+@@ -487,7 +489,7 @@ func (h *RegistrationHandler) registerCodeWithHub(ctx context.Context, code, tel
+ 
+ // checkLinkingStatus checks with the hub whether a linking code was confirmed.
+ func (h *RegistrationHandler) checkLinkingStatus(ctx context.Context, telegramUserID string) (*linkingStatusResponse, error) {
+-	url := fmt.Sprintf("%s/api/v1/telegram/link/status?telegram_user_id=%s", h.hubURL, telegramUserID)
++	url := fmt.Sprintf("%s/api/v1/telegram/link/status?telegram_user_id=%s", h.apiURL, telegramUserID)
+ 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("create linking status request: %w", err)
+diff --git a/extras/scion-telegram/internal/telegram/telegram.go b/extras/scion-telegram/internal/telegram/telegram.go
+index cbed8bf1a..0108dc4c6 100644
+--- a/extras/scion-telegram/internal/telegram/telegram.go
++++ b/extras/scion-telegram/internal/telegram/telegram.go
+@@ -371,6 +371,14 @@ func (b *TelegramBroker) Publish(ctx context.Context, topic string, msg *message
+ 		return fmt.Errorf("telegram broker not configured")
+ 	}
+ 
++	// Hub DM mirror copies (local patch) must reach only the DM user's
++	// private chat, which only the v2 broker resolves; the routes below
++	// ignore the user.
++	if isHubMirror(msg) {
++		b.log.Debug("Hub mirror copies need the v2 broker, dropping", "topic", topic)
++		return nil
++	}
++
+ 	// Dedup: skip if we've already sent this exact message recently.
+ 	dedupKey := msgDedupKey(msg)
+ 	if dedupKey != "" {
+diff --git a/extras/scion-telegram/internal/telegram/telegram_test.go b/extras/scion-telegram/internal/telegram/telegram_test.go
+index 2bee03de0..6d3fc808b 100644
+--- a/extras/scion-telegram/internal/telegram/telegram_test.go
++++ b/extras/scion-telegram/internal/telegram/telegram_test.go
+@@ -402,6 +402,21 @@ func TestPublishPatternMatch(t *testing.T) {
+ 	assert.Equal(t, int64(789), sent[0].ChatID)
+ }
+ 
++// Hub DM mirror copies need the v2 broker's per-user routing, so v1 drops
++// them even when a route matches (local patch).
++func TestPublish_DropsHubMirror(t *testing.T) {
++	tgSrv := newFakeTelegramServer(t)
++	b := newTestBroker(t, tgSrv)
++	b.chatRoutes[789] = "scion.project.p1.agent.*.messages"
++	b.topicChats["scion.project.p1.agent.*.messages"] = []int64{789}
++
++	msg := asHubMirror(messages.NewInstruction("agent:coder", "user:alice@example.com", "web DM reply"), "")
++	msg.Metadata["telegram_chat_id"] = "999"
++	require.NoError(t, b.Publish(context.Background(), "scion.project.p1.agent.coder.messages", msg))
++
++	assert.Empty(t, tgSrv.getSentMessages())
++}
++
+ func TestPublishClosed(t *testing.T) {
+ 	tgSrv := newFakeTelegramServer(t)
+ 	b := New(slog.Default())

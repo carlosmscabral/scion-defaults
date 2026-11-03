@@ -683,6 +683,7 @@ flowchart TB
 - **Multi-harness fleet:** Role templates and harness patches run Antigravity, OpenCode, and Hermes on Gemini 4 Argon alongside Claude Code on Opus through Vertex AI.
 - **Transport-agnostic, self-healing control plane:** [`scripts/hub_client.py`](scripts/hub_client.py), [`scripts/factory-watchdog.py`](scripts/factory-watchdog.py), and [`scripts/install-k8s-control-plane.py`](scripts/install-k8s-control-plane.py) reap hung subprocesses via `/exec` and recover crashed pods with Firestore circuit breakers. They also guard schedules, sync `knowledge-plane` files, and escalate PO blockers to Cloud Logging.
 - **Stacked Cloud Trace waterfalls:** [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) links each agent turn into a three-level trace waterfall across sessions.
+- **Telegram DM mirror:** [`patches/telegram-dm-mirror/`](patches/telegram-dm-mirror/README.md) shows one DM conversation in web chat and Telegram. It also lets the Telegram plugin work behind IAP.
 - **Five-layer evaluation control tower:** [`scripts/sync-factory-agents.py`](scripts/sync-factory-agents.py) exports agent state and token/tool counters to Firestore every minute, while [`docs/verification-and-eval.md`](docs/verification-and-eval.md) defines the L1–L5 verification pyramid.
 - **Production safety guardrails:** Orphan-branch evaluation isolation, GKE Workload Identity least-privilege KSAs (`scion-worker` and `scion-deployer`), clean `git archive` Cloud Run rollouts, backups, alerts, and budgets.
 
@@ -713,6 +714,7 @@ Inspect [`presets/`](presets/) for three complete `FactorySpec` examples:
 | [`docs/`](docs/) | Architecture (`architecture.md`), VM setup (`setup-runbook.md`), operations (`operations-runbook.md`), agent protocol, evaluation pyramid, grill playbook (`grill-me-playbook.md`), specs (`specs/`), plans (`plans/`), and lessons L1–L33 (`lessons-learned.md`). |
 | [`docs/telemetry/`](docs/telemetry/README.md) | ASD-STE100 guides for Cloud Trace waterfalls, Cloud Monitoring counters, and the evaluation pipeline. |
 | [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) | Go patch for three-level stacked Cloud Trace waterfalls and cumulative metric epochs. |
+| [`patches/telegram-dm-mirror/`](patches/telegram-dm-mirror/README.md) | Go patches for the Hub and the Telegram plugin: one DM conversation in web chat and Telegram, and `hub_api_url` for Hubs behind IAP. |
 
 ## Contribute
 
