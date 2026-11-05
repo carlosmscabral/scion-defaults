@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500;700&display=swap">
+
+<style>
+  /*
+   * The page chrome commits to one dark surface; the drawing keeps a white
+   * sheet, because the product icons are drawn for paper and a tinted
+   * group loses its meaning on a dark fill.
+   */
+  :root {
+    color-scheme: dark;
+
+    --blue: #4285F4; --red: #EA4335; --yellow: #FBBC04; --green: #34A853;
+
+    --ground: #0C0E12;
+    --panel: #171B22;
+    --panel-2: #1F242D;
+    --rim: #2C323C;
+
+    --ink: #EDEFF3; --ink-2: #A2A9B4; --ink-3: #6F7784;
+
+    --sheet: #FFFFFF;
+    --sheet-ink: #202124; --sheet-ink-2: #5F6368; --sheet-line: #C8CCD1;
+    --wire: #9AA0A6; --disc: #1A73E8;
+
+    --body: "Google Sans Text", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: "Roboto Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --accent: #8AB4F8;        /* reads on the dark chrome */
+    --accent-paper: #1A73E8;  /* reads on the white sheet */
+  }
+
+  * { box-sizing: border-box; }
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --ground: #F5F7FA; --panel: #FFFFFF; --panel-2: #EAF0F8;
+    --rim: #DCE2EA; --ink: #202124; --ink-2: #526071; --ink-3: #657184;
+  }
+  :root:not([data-theme="dark"]) .sheet { box-shadow: 0 8px 32px #24334A0D; border: 1px solid var(--rim); }
+  .context { flex: none; font-size: 12px; color: var(--ink-2); padding-bottom: 8px; }
+  .context p { margin: 3px 0; }
+  .component-picker { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--rim); border-radius: 6px; max-width: 100%; padding: 7px; margin-top: 5px; }
+  .notes-toggle { color: var(--ink); background: var(--panel); border: 1px solid var(--rim); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+  .notes { position: absolute; z-index: 8; inset: auto 16px 16px; padding: 16px; max-height: 40%; overflow: auto; color: var(--ink); background: var(--panel); border: 1px solid var(--rim); border-radius: 10px; white-space: pre-wrap; }
+  [data-mode="diagram"] .caption, [data-mode="diagram"] .rail { display: none; }
+  [data-mode="diagram"] .screen { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  @media print {
+    :root { color-scheme: light; }
+    body { background: white !important; color: #202124 !important; }
+    .caption, .rail, .tip, .notes, .notes-toggle, .component-picker { display: none !important; }
+    .screen { display: block !important; }
+    .stagewrap { height: 75vh; }
+    .sheet { box-shadow: none !important; }
+    #stage { transform: none !important; }
+    .dim { opacity: 1 !important; }
+    .sheet::after { display: none; }
+  }
+  /* .tip sets display:flex, and a class beats the user agent's
+     [hidden] rule — without this the tooltip never hides. */
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; overflow: hidden;
+    background: var(--ground); color: var(--ink);
+    font: 15px/1.55 var(--body);
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; border-radius: 4px; }
+
+  .shell { height: 100%; display: flex; flex-direction: column; padding: 0 clamp(14px, 2.4vw, 30px); }
+
+  .topbar { flex: none; display: flex; align-items: center; gap: 14px; padding-block: 14px 12px; }
+  .topbar h1 { margin: 0; font-size: 15px; font-weight: 500; }
+  .counter { margin-left: auto; font: 12px var(--mono); color: var(--ink-3); }
+
+  .screen {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-columns: minmax(260px, 24vw) 1fr;
+    gap: clamp(14px, 2vw, 26px);
+    padding-block: clamp(14px, 2.4vh, 26px);
+  }
+
+  .caption { min-width: 0; min-height: 0; display: flex; flex-direction: column; justify-content: center; gap: 12px; }
+  .stepno { font: 400 clamp(56px, 8vw, 104px)/.8 var(--mono); color: var(--accent); }
+  .caption h2 { margin: 0; font-size: clamp(24px, 2.6vw, 34px); font-weight: 500; line-height: 1.1; text-wrap: balance; }
+  .caption .line { margin: 0; color: var(--ink-2); font-size: clamp(14px, 1.15vw, 17px); max-width: 42ch; }
+
+  .chips { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 7px; }
+  .chips li {
+    display: flex; flex-direction: column; gap: 1px; min-width: 0;
+    padding: 7px 11px; background: var(--panel);
+    border: 1px solid var(--rim); border-left: 3px solid var(--accent);
+    border-radius: 3px 8px 8px 3px;
+  }
+  .chips b { font: 500 12.5px var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+  .chips span { font-size: 11px; color: var(--ink-3); }
+
+  .stagewrap { position: relative; min-width: 0; min-height: 0; }
+  .sheet {
+    position: absolute; inset: 0; padding: 14px;
+    background: var(--sheet); border-radius: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 40px rgba(0,0,0,.35);
+  }
+  /* a hard crop lands mid-word; fade instead, and only while zoomed */
+  .sheet::after {
+    content: ""; position: absolute; inset: 14px; border-radius: 10px;
+    pointer-events: none; opacity: 0; transition: opacity .35s;
+    background:
+      linear-gradient(to right, #FFF, rgba(255,255,255,0) 46px),
+      linear-gradient(to left, #FFF, rgba(255,255,255,0) 46px),
+      linear-gradient(to bottom, #FFF, rgba(255,255,255,0) 32px),
+      linear-gradient(to top, #FFF, rgba(255,255,255,0) 32px);
+  }
+  .sheet.zoomed::after { opacity: 1; }
+
+  .diagram { display: block; width: 100%; height: 100%; }
+  #stage { transition: transform .55s cubic-bezier(.22,.61,.36,1); }
+
+  .box { fill: var(--sheet); stroke: var(--sheet-line); stroke-width: 1.2; rx: 6; }
+  .box-title { fill: var(--sheet-ink); font-size: 13px; font-weight: 500; }
+  .box-sub { fill: var(--sheet-ink-2); font-size: 11px; font-family: var(--mono); }
+  .grp { fill: var(--tint); stroke: var(--edge); stroke-width: 1.2; rx: 8; }
+  .grp-title { fill: var(--sheet-ink); font-size: 12.5px; font-weight: 500; }
+  .card { fill: var(--sheet); stroke: var(--edge); stroke-width: 1.2; rx: 5; }
+  .card-title { fill: var(--sheet-ink); font-size: 12.5px; font-weight: 500; }
+  .card-sub { fill: var(--sheet-ink-2); font-size: 10.5px; font-family: var(--mono); }
+  .gc-frame { fill: none; stroke: var(--sheet-line); stroke-width: 1.2; rx: 8; }
+  .gc-label { fill: var(--sheet-ink-2); font-size: 12.5px; font-weight: 500; }
+  .zone-label { fill: var(--sheet-ink-2); font-size: 11px; font-family: var(--mono); letter-spacing: .05em; }
+
+  .wire { stroke: var(--wire); stroke-width: 1.3; fill: none; }
+  .wire.dash { stroke-dasharray: 5 4; }
+  .wire-head { fill: var(--wire); }
+  .wire-label {
+    fill: var(--sheet-ink-2); font-size: 10px; font-family: var(--mono);
+    paint-order: stroke; stroke: var(--sheet); stroke-width: 3.5px; stroke-linejoin: round;
+  }
+  .disc { fill: var(--disc); stroke: var(--sheet); stroke-width: 2; }
+  .disc-n { fill: #FFF; font: 700 10px var(--mono); }
+
+  .unit, .wirepart { transition: opacity .4s, stroke .2s, fill .2s; }
+  .unit { cursor: pointer; }
+  .dim { opacity: .14; }
+  .unit.lit rect, .unit:hover rect { stroke: var(--accent-paper); stroke-width: 2.4; }
+  .wire.lit { stroke: var(--accent-paper); stroke-width: 2.4; }
+  .wire-head.lit { fill: var(--accent-paper); }
+  .wire-label.lit { fill: var(--sheet-ink); }
+  .disc.lit { fill: var(--accent-paper); }
+  .unit:hover { opacity: 1; }
+
+  @media (prefers-reduced-motion: reduce) { #stage, .unit, .wirepart, .sheet::after { transition: none; } }
+
+  .tip {
+    position: absolute; z-index: 6; width: 262px; max-width: calc(100% - 20px);
+    padding: 11px 13px 13px; background: var(--panel);
+    border: 1px solid var(--rim); border-left: 3px solid var(--accent);
+    border-radius: 9px; box-shadow: 0 8px 26px rgba(0,0,0,.55);
+    pointer-events: none; display: flex; flex-direction: column; gap: 2px;
+  }
+  .tip b { font-size: 13.5px; font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+  .tip .tip-sub { font: 11px var(--mono); color: var(--ink-3); overflow-wrap: anywhere; }
+  .tip p { margin: 5px 0 0; font-size: 12.5px; line-height: 1.45; color: var(--ink-2); }
+
+  .rail { flex: none; display: flex; align-items: center; gap: 10px; padding-block: 10px 14px; }
+  .nav {
+    flex: none; width: 38px; height: 34px; display: grid; place-items: center;
+    background: var(--panel); border: 1px solid var(--rim); border-radius: 8px;
+    color: var(--ink-2); font: 15px var(--mono); cursor: pointer;
+  }
+  .nav:hover { background: var(--panel-2); color: var(--ink); }
+  .dots { flex: 1; min-width: 0; display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
+  .dots::-webkit-scrollbar { display: none; }
+  .dot {
+    flex: 1 1 0; min-width: 26px; height: 34px; padding: 0; display: grid; place-items: center;
+    background: var(--panel); border: 1px solid var(--rim); border-bottom: 3px solid var(--rim);
+    border-radius: 4px 4px 7px 7px; color: var(--ink-3);
+    font: 500 13px var(--mono); cursor: pointer;
+  }
+  .dot:hover { background: var(--panel-2); color: var(--ink); }
+  .dot[aria-current="true"] { color: var(--dot); border-bottom-color: var(--dot); background: var(--panel-2); }
+
+  @media (max-width: 900px), (max-height: 520px) {
+    .screen { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); gap: 12px; }
+    .caption { justify-content: flex-start; gap: 8px; }
+    .stepno { font-size: 48px; }
+    .caption h2 { font-size: 24px; }
+  }
+  @media (max-width: 560px) {
+    .chips li:nth-child(n + 3) { display: none; }
+    .dots { gap: 3px; }
+    .dot { min-width: 19px; font-size: 11px; }
+    .nav { width: 30px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <header class="topbar">
+    <h1 id="doc-title">Architecture</h1>
+    <span class="counter" id="counter"></span>
+    <button class="notes-toggle" id="notes-toggle" type="button" aria-expanded="false" aria-controls="notes" hidden>Notes</button>
+  </header>
+
+  <main class="screen">
+    <aside class="caption" aria-live="polite">
+      <span class="stepno" id="stepno" hidden></span>
+      <h2 id="title"></h2>
+      <p class="line" id="line"></p>
+      <ul class="chips" id="chips" hidden></ul>
+    </aside>
+
+    <div class="stagewrap" id="stagewrap">
+      <div class="sheet" id="sheet">
+        <svg class="diagram" id="diagram" viewBox="0 0 1025 745"
+             preserveAspectRatio="xMidYMid meet" role="img" aria-label="Architecture diagram">
+          <g id="stage">
+            <g id="layer-frames"></g>
+            <g id="layer-wires"></g>
+            <g id="layer-units"></g>
+          </g>
+        </svg>
+      </div>
+      <div class="tip" id="tip" hidden>
+        <b id="tip-title"></b>
+        <span class="tip-sub" id="tip-sub"></span>
+        <p id="tip-what"></p>
+        <p id="tip-why" hidden></p>
+      </div>
+      <div class="notes" id="notes" hidden></div>
+    </div>
+  </main>
+  <div class="context"><p id="notice" hidden></p><p id="legend" hidden></p><select class="component-picker" id="component-picker" aria-label="Explore a component"><option value="">Explore a component…</option></select></div>
+
+  <footer class="rail">
+    <button class="nav" id="prev" type="button" aria-label="Previous step">&#9664;</button>
+    <div class="dots" id="dots" role="group" aria-label="Steps"></div>
+    <button class="nav" id="next" type="button" aria-label="Next step">&#9654;</button>
+  </footer>
+</div>
+
+<script>
+/* Google Cloud product icons, from the Iconify gcp mirror. */
+/* The marks belong to Google. Follow cloud.google.com/icons when publishing. */
+const ICONS = {"identity-aware-proxy":{"vb":"0 0 24 24","d":"<path fill=\"#4285f4\" d=\"M11.85 7a5.1 5.1 0 1 0 5.1 5.1a5.1 5.1 0 0 0-5.1-5.1m0 9.08a4 4 0 1 1 4-4a4 4 0 0 1-4 4.01Z\"/><path fill=\"#669df6\" d=\"M13.77 12.71a2 2 0 0 0-.28-.22a3.11 3.11 0 0 0-2.61-.28a2.3 2.3 0 0 0-.89.47a.86.86 0 0 0-.37.65v1h4.47v-.82a1 1 0 0 0-.32-.8m-1.92-1.18a1.16 1.16 0 1 0-1.17-1.15a1.17 1.17 0 0 0 1.17 1.15\"/><path fill=\"#aecbfa\" d=\"M20.78 10.72h-1.04l.77.77H18.3v.9h2.21l-.77.78h1.04L22 11.94z\"/><path fill=\"#669df6\" d=\"m17.54 8.5l.64.64l.98-.97v1.09l.73-.74V6.79h-1.73l-.73.74h1.09zm1.62 7.33l-.98-.97l-.64.63l.98.98h-1.09l.73.73h1.73v-1.73l-.73-.73zM3.35 10.65A1.35 1.35 0 1 0 4.71 12a1.35 1.35 0 0 0-1.36-1.35m0 2.1a.76.76 0 1 1 .76-.75a.76.76 0 0 1-.76.75\"/>"},"cloud-run":{"vb":"0 0 24 24","d":"<g fill-rule=\"evenodd\"><path fill=\"#aecbfa\" d=\"M8.9 2.63L12.02 12h9.36z\"/><path fill=\"#4285f4\" d=\"M21.38 12h-9.36L8.9 21.38zM3.44 21.38l3.13-1.57L8.9 12H5.78z\"/><path fill=\"#aecbfa\" d=\"M3.44 2.63L5.78 12H8.9L6.57 4.19z\"/></g>"},"cloud-sql":{"vb":"0 0 24 24","d":"<g fill-rule=\"evenodd\"><path fill=\"#aecbfa\" d=\"M4.67 10.44v3.01l7.33 3.9v-3.01zm0 4.65v3.01L12 22v-3.01z\"/><path fill=\"#669df6\" d=\"m12 17.35l7.33-3.9v-3.01L12 14.34zM12 22l7.33-3.9v-3.01L12 18.99z\"/><path fill=\"#4285f4\" d=\"M19.33 8.91V5.9L12 2v3.01z\"/><path fill=\"#669df6\" d=\"M12 2L4.67 5.9v3.01L12 5.01z\"/><path fill=\"#aecbfa\" d=\"M4.67 5.87v3.02l7.33 3.9V9.77z\"/><path fill=\"#669df6\" d=\"m12 12.79l7.33-3.9V5.87L12 9.77z\"/></g>"},"filestore":{"vb":"0 0 24 24","d":"<path fill=\"#4285f4\" d=\"M8 12h8l-2 2h-4z\"/><path fill=\"#aecbfa\" d=\"M7 4h10l1 2H6zM4 7h16l1 2H3z\"/><path fill=\"#669df6\" d=\"M22 20v-9h-6l-2 3h-4l-2-3H2v9z\"/>"},"google-kubernetes-engine":{"vb":"0 0 24 24","d":"<path fill=\"#4285f4\" fill-rule=\"evenodd\" d=\"m14.68 13.06l4.55 2.63v.99l-4.94-2.85z\"/><path fill=\"#669df6\" fill-rule=\"evenodd\" d=\"m9.98 13.65l-5.21 3.01l-.32-.8l5.08-2.94z\"/><path fill=\"#aecbfa\" d=\"M11.55 3.29h.86v5.78h-.86z\"/><path fill=\"#aecbfa\" fill-rule=\"evenodd\" d=\"M3.25 7v10L12 22l8.74-5V7L12 2Zm15.63 8.89L12 19.78l-6.88-3.89V8.11L12 4.22l6.87 3.89v7.78Z\"/><path fill=\"#aecbfa\" fill-rule=\"evenodd\" d=\"m11.98 11.5l3.98-2.29l-3.98-2.3l-3.97 2.3z\"/><path fill=\"#669df6\" fill-rule=\"evenodd\" d=\"m11.52 12.3l-3.86-2.29v4.59l3.86 2.29z\"/><path fill=\"#4285f4\" fill-rule=\"evenodd\" d=\"M12.48 12.3v4.59l3.86-2.29v-4.59z\"/>"},"vertexai":{"vb":"0 0 24 24","d":"<path fill=\"#669df6\" d=\"M20 13.89a.77.77 0 0 0-1-.16l-7 5.14v.22a.72.72 0 1 1 0 1.43a.74.74 0 0 0 .45-.15l7.41-5.47a.76.76 0 0 0 .14-1.01\"/><path fill=\"#aecbfa\" d=\"M12 20.52a.72.72 0 0 1 0-1.43v-.22l-7-5.14a.76.76 0 0 0-1 .16a.74.74 0 0 0 .16 1l7.41 5.47a.73.73 0 0 0 .44.15Z\"/><path fill=\"#4285f4\" d=\"M12 18.34a1.47 1.47 0 1 0 1.47 1.47A1.47 1.47 0 0 0 12 18.34m0 2.18a.72.72 0 1 1 .72-.71a.71.71 0 0 1-.72.71\"/><path fill=\"#aecbfa\" d=\"M6 6.11a.76.76 0 0 1-.75-.75V3.48a.76.76 0 1 1 1.51 0v1.88a.76.76 0 0 1-.76.75\"/><circle cx=\"5.98\" cy=\"12\" r=\".76\" fill=\"#aecbfa\"/><circle cx=\"5.98\" cy=\"9.79\" r=\".76\" fill=\"#aecbfa\"/><circle cx=\"5.98\" cy=\"7.57\" r=\".76\" fill=\"#aecbfa\"/><path fill=\"#4285f4\" d=\"M18 8.31a.76.76 0 0 1-.75-.76V5.67a.75.75 0 1 1 1.5 0v1.88a.75.75 0 0 1-.75.76\"/><circle cx=\"18.02\" cy=\"12.01\" r=\".76\" fill=\"#4285f4\"/><circle cx=\"18.02\" cy=\"9.76\" r=\".76\" fill=\"#4285f4\"/><circle cx=\"18.02\" cy=\"3.48\" r=\".76\" fill=\"#4285f4\"/><path fill=\"#669df6\" d=\"M12 15a.76.76 0 0 1-.75-.75v-1.91a.76.76 0 0 1 1.51 0v1.89A.76.76 0 0 1 12 15\"/><circle cx=\"12\" cy=\"16.45\" r=\".76\" fill=\"#669df6\"/><circle cx=\"12\" cy=\"10.14\" r=\".76\" fill=\"#669df6\"/><circle cx=\"12\" cy=\"7.92\" r=\".76\" fill=\"#669df6\"/><path fill=\"#4285f4\" d=\"M15 10.54a.76.76 0 0 1-.75-.75V7.91a.76.76 0 1 1 1.51 0v1.88a.76.76 0 0 1-.76.75\"/><circle cx=\"15.01\" cy=\"5.69\" r=\".76\" fill=\"#4285f4\"/><circle cx=\"15.01\" cy=\"14.19\" r=\".76\" fill=\"#4285f4\"/><circle cx=\"15.01\" cy=\"11.97\" r=\".76\" fill=\"#4285f4\"/><circle cx=\"8.99\" cy=\"14.19\" r=\".76\" fill=\"#aecbfa\"/><circle cx=\"8.99\" cy=\"7.92\" r=\".76\" fill=\"#aecbfa\"/><circle cx=\"8.99\" cy=\"5.69\" r=\".76\" fill=\"#aecbfa\"/><path fill=\"#aecbfa\" d=\"M9 12.73a.76.76 0 0 1-.76-.73v-1.9a.75.75 0 1 1 1.5 0V12a.75.75 0 0 1-.74.73\"/>"},"project":{"vb":"0 0 24 24","d":"<path fill=\"none\" d=\"M0 0h24v24H0z\"/><path fill=\"#85a4e6\" fill-rule=\"evenodd\" d=\"M.8 5.9L3.7.8h5.8l2.9 5.1l-2.9 5H3.7z\"/><path fill=\"#5c85de\" fill-rule=\"evenodd\" d=\"M11.4 7.7L8.5 2.6l1-1.9l2.9 5.2z\"/><path fill=\"#3367d6\" fill-rule=\"evenodd\" d=\"M2.7 9.3h5.8l2-3.4l.9 1.8l-1.9 3.2l-5.8.1z\"/><path fill=\"#85a4e6\" fill-rule=\"evenodd\" d=\"m11.2 11.9l3-5.1H20l2.9 5.1l-2.9 5h-5.8z\"/><path fill=\"#5c85de\" fill-rule=\"evenodd\" d=\"M21.9 13.7L19 8.6l1-1.9l2.9 5.2z\"/><path fill=\"#3367d6\" fill-rule=\"evenodd\" d=\"M13.2 15.3H19l2-3.4l.9 1.8l-1.9 3.2l-5.8.1z\"/><path fill=\"#85a4e6\" fill-rule=\"evenodd\" d=\"m.8 17.9l2.9-5.1h5.8l2.9 5.1l-2.9 5H3.7z\"/><path fill=\"#5c85de\" fill-rule=\"evenodd\" d=\"m11.4 19.7l-2.9-5.1l1-1.9l2.9 5.2z\"/><path fill=\"#3367d6\" fill-rule=\"evenodd\" d=\"M2.7 21.3h5.8l2-3.4l.9 1.8l-1.9 3.2l-5.8.1z\"/>"},"cloud-logging":{"vb":"0 0 24 24","d":"<path fill=\"#4285f4\" d=\"M6 11h4v2H6zm-2 7h6v2H4z\"/><path fill=\"none\" d=\"M0 0h24v24H0z\"/><path fill=\"#4285f4\" d=\"M4 18h2V6H4z\"/><path fill=\"#669df6\" d=\"M9 7h13V3H9zm0 7h13v-4H9zm0 7h13v-4H9z\"/><path fill=\"#aecbfa\" d=\"M2 8h6V2H2z\"/>"},"bigquery":{"vb":"0 0 24 24","d":"<g fill-rule=\"evenodd\"><path fill=\"#aecbfa\" d=\"M6.73 10.83v2.63a4.9 4.9 0 0 0 1.71 1.74v-4.37Z\"/><path fill=\"#669df6\" d=\"M9.89 8.41v7.53A8 8 0 0 0 11 16a8 8 0 0 0 1 0V8.41Z\"/><path fill=\"#aecbfa\" d=\"M13.64 11.86v3.29a5 5 0 0 0 1.7-1.82v-1.47Z\"/><path fill=\"#4285f4\" d=\"m17.74 16.32l-1.42 1.42a.42.42 0 0 0 0 .6l3.54 3.54a.42.42 0 0 0 .59 0l1.43-1.43a.42.42 0 0 0 0-.59l-3.54-3.54a.42.42 0 0 0-.6 0\"/><path fill=\"#669df6\" d=\"M11 2a9 9 0 1 0 9 9a9 9 0 0 0-9-9m0 15.69A6.68 6.68 0 1 1 17.69 11A6.68 6.68 0 0 1 11 17.69\"/></g>"},"google-cloud":{"vb":"0 0 256 206","d":"<path fill=\"#ea4335\" d=\"m170.252 56.819l22.253-22.253l1.483-9.37C153.437-11.677 88.976-7.496 52.42 33.92C42.267 45.423 34.734 59.764 30.717 74.573l7.97-1.123l44.505-7.34l3.436-3.513c19.797-21.742 53.27-24.667 76.128-6.168z\"/><path fill=\"#4285f4\" d=\"M224.205 73.918a100.25 100.25 0 0 0-30.217-48.722l-31.232 31.232a55.52 55.52 0 0 1 20.379 44.037v5.544c15.35 0 27.797 12.445 27.797 27.796c0 15.352-12.446 27.485-27.797 27.485h-55.671l-5.466 5.934v33.34l5.466 5.231h55.67c39.93.311 72.553-31.494 72.864-71.424a72.3 72.3 0 0 0-31.793-60.453\"/><path fill=\"#34a853\" d=\"M71.87 205.796h55.593V161.29H71.87a27.3 27.3 0 0 1-11.399-2.498l-7.887 2.42l-22.409 22.253l-1.952 7.574c12.567 9.489 27.9 14.825 43.647 14.757\"/><path fill=\"#fbbc05\" d=\"M71.87 61.426C31.94 61.663-.237 94.227.001 134.158a72.3 72.3 0 0 0 28.222 56.88l32.248-32.246c-13.99-6.322-20.208-22.786-13.887-36.776s22.786-20.208 36.775-13.888a27.8 27.8 0 0 1 13.887 13.888l32.248-32.248A72.22 72.22 0 0 0 71.87 61.427\"/>"}};
+/*
+ * Multi-Project Scion Software Factory — Executive Architecture & Closed-Loop Learning
+ *
+ * Every coordinate is in the SVG's own units and placed by hand following
+ * references/layout-rules.md:
+ *   - Outside column: x = 20..260
+ *   - Corridor 1:     x = 260..422 (lanes at x = 282, 296, 328, 364)
+ *   - Middle column:  groups x = 408..704, cards x = 422..690
+ *   - Corridor 2:     x = 690..862 (non-crossing bus lanes at x = 724, 748, 768)
+ *   - Right column:   groups x = 848..1164, cards x = 862..1150
+ */
+
+const DIAGRAM = {
+  title: "Multi-Project Scion Software Factory · Executive Architecture",
+  theme: "light",
+  mode: "slides",
+  notice: "Target architecture overview: Shared HA Hub, Cloud SQL, Filestore, GKE Autopilot, Vertex AI, and sciontool OTLP are deployed baseline components; N-project scoped KSA delegation, BigQuery trajectory warehouse, and Self-Learning Harvester are proposed.",
+  legend: [
+    "Solid 1–10: closed-loop project onboarding, issue delivery, eval & default promotion",
+    "Dashed: admin ingress, state/workspace mounts & GitHub PR outcome sync",
+    "Blue/Green/Yellow: verified HA baseline · Grey/Red: proposed multi-tenant & eval loop"
+  ],
+  viewBox: [1200, 720],
+  outsideLabel: "OUTSIDE GOOGLE CLOUD",
+  cloud: {
+    x: 388, y: 20, w: 796, h: 688,
+    icon: "google-cloud",
+    label: "Google Cloud · Shared Software Factory & Isolated Target Sandboxes"
+  }
+};
+
+const OUTSIDE = [
+  {
+    id: "admin", x: 20, y: 66, w: 240, h: 64, glyph: "person",
+    title: "Platform Admin", sub: "provisions Project 1..N",
+    what: "Creates isolated Scion projects on the shared Hub and assigns delegated Project Owners without standing up another Scion cluster.",
+    why: "Amortizes one HA control plane across the engineering portfolio instead of maintaining N separate Scion deployments."
+  },
+  {
+    id: "owners", x: 20, y: 152, w: 240, h: 66, glyph: "person",
+    title: "Project Owners (1..N)", sub: "scoped RBAC · live hooks",
+    what: "Inspect provisioned agents for their project and tune lifecycle hooks, prompts, and harness settings on the fly.",
+    why: "Teams adapt agent guardrails at delivery speed while live edits become candidate signals for future factory defaults."
+  },
+  {
+    id: "github", x: 20, y: 274, w: 240, h: 66, glyph: "server",
+    title: "Product GitHub Repos", sub: "issues · PRs · CI status",
+    what: "Holds each team's application code, incoming issues, pull requests, CI checks, merge events, and post-merge reverts.",
+    why: "Anchors agent work to concrete issues and PRs so cost and quality evaluations reflect merged software outcomes."
+  },
+  {
+    id: "defaults", x: 20, y: 594, w: 240, h: 66, glyph: "server",
+    title: "scion-defaults Repo", sub: "golden templates & hooks",
+    what: "Versioned blueprint catalog of agent role templates, harness hooks, verification gates, and starter presets.",
+    why: "Turns hard-won prompt and hook improvements from live teams into reviewable defaults for Project N+1."
+  }
+];
+
+const GROUPS = [
+  { id: "g-cp",      x: 408, y: 58,  w: 296, h: 320, title: "Shared HA Control Plane · Host Proj", tone: "blue" },
+  { id: "g-compute", x: 408, y: 402, w: 296, h: 122, title: "Elastic Agent Compute · Host Proj",   tone: "green" },
+  { id: "g-learn",   x: 408, y: 552, w: 296, h: 128, title: "Self-Learning Loop · Proposed",       tone: "red" },
+  { id: "g-models",  x: 848, y: 58,  w: 316, h: 124, title: "Frontier Models · Multi-Harness",     tone: "yellow" },
+  { id: "g-sandbox", x: 848, y: 218, w: 316, h: 136, title: "Isolated Sandboxes · Projects 1..N",  tone: "grey" },
+  { id: "g-eval",    x: 848, y: 402, w: 316, h: 278, title: "Trajectory & Eval Plane · Proposed",  tone: "red" }
+];
+
+const CARDS = [
+  {
+    id: "iap", group: "g-cp", x: 422, y: 96, w: 268, h: 52, icon: "identity-aware-proxy",
+    title: "Identity-Aware Proxy", sub: "Google SSO · scoped access",
+    what: "Authenticates platform admins and delegated project owners with corporate Google identity before any request reaches the Hub.",
+    why: "Eliminates public unauthenticated ingress while passing verified identity headers into Scion's project RBAC."
+  },
+  {
+    id: "hub", group: "g-cp", x: 422, y: 164, w: 268, h: 54, icon: "cloud-run",
+    title: "Scion HA Hub", sub: "Cloud Run · Projects 1..N",
+    what: "Single multi-project control plane hosting N isolated groves, project-scoped RBAC, templates, hooks, and agent messaging.",
+    why: "One HA deployment serves every onboarded team, avoiding duplicated control planes and operational drift."
+  },
+  {
+    id: "sql", group: "g-cp", x: 422, y: 236, w: 268, h: 52, icon: "cloud-sql",
+    title: "Cloud SQL", sub: "PostgreSQL · RBAC & hashes",
+    what: "Stores multi-project metadata, user delegation grants, agent state, and each project's initial template baseline hash.",
+    why: "Recording the initial baseline hash lets the platform detect intentional owner hook adaptations without overwriting them."
+  },
+  {
+    id: "nfs", group: "g-cp", x: 422, y: 304, w: 268, h: 52, icon: "filestore",
+    title: "Filestore", sub: "NFS RWX · agent workspaces",
+    what: "Provides durable ReadWriteMany workspaces mounted per project so resumable coordinators keep git worktrees across pod restarts.",
+    why: "Shared HA storage survives Cloud Run or GKE node rescheduling without losing in-progress branches."
+  },
+  {
+    id: "gke", group: "g-compute", x: 422, y: 440, w: 268, h: 64, icon: "google-kubernetes-engine",
+    title: "GKE Autopilot Agent Pool", sub: "per-issue pods + sciontool",
+    what: "Runs ephemeral per-issue worker and reviewer pods across Claude Code, Antigravity, OpenCode, and Codex with in-pod sciontool telemetry.",
+    why: "Per-issue pods scale to zero when idle and isolate clean cost and trajectory attribution per GitHub issue and PR."
+  },
+  {
+    id: "harvester", group: "g-learn", x: 422, y: 596, w: 268, h: 58, icon: "cloud-run",
+    title: "Self-Learning Harvester", sub: "Cloud Run Job · drift miner",
+    what: "Proposed scheduled job that compares live project hook and prompt edits against baseline hashes and correlates them with BigQuery KPIs.",
+    why: "Closes the meta-factory loop by promoting only adaptations backed by lower cost or higher verified PR completion."
+  },
+  {
+    id: "vertex", group: "g-models", x: 862, y: 98, w: 288, h: 58, icon: "vertexai",
+    title: "Vertex AI & Model APIs", sub: "Gemini · Claude · multi-model",
+    what: "Serves frontier reasoning and coding models across harnesses so tasks can pair different harnesses and models empirically.",
+    why: "Side-by-side model and harness execution enables objective cost-versus-completion benchmarking on real repositories."
+  },
+  {
+    id: "sandboxes", group: "g-sandbox", x: 862, y: 262, w: 288, h: 64, icon: "project",
+    title: "Project Sandboxes (1..N)", sub: "isolated GCP · <slug>-deployer",
+    what: "Proposed per-project target GCP environments bound solely to that project's Kubernetes Service Account via Workload Identity.",
+    why: "Prevents cross-tenant blast radius: Project A's agents cannot touch Project B's cloud services, data, or secrets."
+  },
+  {
+    id: "logs", group: "g-eval", x: 862, y: 444, w: 288, h: 58, icon: "cloud-logging",
+    title: "Cloud Logging & Router", sub: "trajectories · OTLP · sink",
+    what: "Proposed structured trajectory pipeline capturing tool calls, hook verdicts, and token counts stamped with project, issue, PR, harness, and model.",
+    why: "Centralizes every harness's execution trace without fragile per-container log scraping before streaming to BigQuery."
+  },
+  {
+    id: "bq", group: "g-eval", x: 862, y: 596, w: 288, h: 58, icon: "bigquery",
+    title: "BigQuery Eval Warehouse", sub: "$/PR · $/Issue · harness evals",
+    what: "Proposed analytics warehouse joining structured agent trajectories, model token pricing, and GitHub PR merge and revert outcomes.",
+    why: "Answers executive ROI questions directly: true cost per merged PR, cost per issue, and which harness × model wins."
+  }
+];
+
+const EDGES = [
+  {
+    id: "e1", n: "1", from: "defaults", to: "hub",
+    pts: [[260, 608], [364, 608], [364, 206], [422, 206]],
+    disc: [364, 412],
+    label: "baseline", lx: 323, ly: 599, anchor: "middle"
+  },
+  {
+    id: "e2", n: "2", from: "owners", to: "iap",
+    pts: [[260, 184], [296, 184], [296, 134], [422, 134]],
+    disc: [296, 159],
+    label: "hook edits", lx: 342, ly: 125, anchor: "middle"
+  },
+  {
+    id: "e3", n: "3", from: "github", to: "hub",
+    pts: [[260, 294], [328, 294], [328, 182], [422, 182]],
+    disc: [328, 238]
+  },
+  {
+    id: "e4", n: "4", from: "hub", to: "gke",
+    pts: [[690, 192], [724, 192], [724, 448], [690, 448]],
+    disc: [724, 320]
+  },
+  {
+    id: "e5", n: "5", from: "gke", to: "vertex",
+    pts: [[690, 462], [748, 462], [748, 127], [862, 127]],
+    disc: [748, 196],
+    label: "LLM turns", lx: 805, ly: 118, anchor: "middle"
+  },
+  {
+    id: "e6", n: "6", from: "gke", to: "sandboxes",
+    pts: [[690, 476], [768, 476], [768, 294], [862, 294]],
+    disc: [768, 376],
+    label: "rollout", lx: 815, ly: 285, anchor: "middle"
+  },
+  {
+    id: "e7", n: "7", from: "gke", to: "logs",
+    pts: [[690, 490], [862, 490]],
+    disc: [724, 490],
+    label: "work tags", lx: 815, ly: 481, anchor: "middle"
+  },
+  {
+    id: "e8", n: "8", from: "logs", to: "bq",
+    pts: [[1006, 502], [1006, 596]],
+    disc: [1006, 542],
+    label: "stream", lx: 1022, ly: 568, anchor: "start"
+  },
+  {
+    id: "e9", n: "9", from: "bq", to: "harvester",
+    pts: [[862, 625], [690, 625]],
+    disc: [814, 625],
+    label: "eval winners", lx: 748, ly: 616, anchor: "middle"
+  },
+  {
+    id: "e10", n: "10", from: "harvester", to: "defaults",
+    pts: [[422, 634], [260, 634]],
+    disc: [382, 634],
+    label: "upgrade PR", lx: 327, ly: 625, anchor: "middle"
+  },
+
+  {
+    id: "s1", from: "admin", to: "iap", dash: true,
+    pts: [[260, 108], [422, 108]],
+    label: "onboard + RBAC", lx: 334, ly: 99, anchor: "middle"
+  },
+  {
+    id: "s2", from: "iap", to: "hub", dash: true,
+    pts: [[556, 148], [556, 164]]
+  },
+  {
+    id: "s3", from: "hub", to: "sql", dash: true,
+    pts: [[556, 218], [556, 236]]
+  },
+  {
+    id: "s4", from: "gke", to: "nfs", dash: true,
+    pts: [[664, 440], [664, 356]]
+  },
+  {
+    id: "s5", from: "gke", to: "github", dash: true,
+    pts: [[422, 472], [328, 472], [328, 320], [260, 320]]
+  },
+  {
+    id: "s6", from: "github", to: "bq", dash: true,
+    pts: [[260, 332], [282, 332], [282, 696], [1006, 696], [1006, 654]],
+    label: "merge & revert events", lx: 776, ly: 690, anchor: "middle"
+  }
+];
+
+const SLIDES = [
+  {
+    title: "One shared Scion factory for N teams — that learns from every PR",
+    line: "One HA GKE stack hosts N delegated projects, measures cost and quality in BigQuery, and upgrades its own defaults.",
+    notes: "Executive summary view.\n\nVerified today: Cloud Run HA Scion Hub behind IAP, Cloud SQL PostgreSQL, Filestore RWX NFS, GKE Autopilot runtime, Vertex AI models, and in-pod sciontool OTLP telemetry.\n\nProposed next: N-project onboarding CLI with project-scoped RBAC and per-project Workload Identity KSAs, structured trajectory Log Router sink to BigQuery, PR/issue cost & harness scorecards, and the Self-Learning Harvester PR loop.",
+    edges: [], units: []
+  },
+  {
+    n: "1", tone: "blue", title: "Seed Project k on the shared Hub",
+    line: "Platform Admin provisions a new isolated project from scion-defaults onto the existing HA Hub — zero new control planes.",
+    facts: [["Control planes", "1 shared HA"], ["Tenancy", "Projects 1..N"]],
+    notes: "Instead of deploying a separate Cloud Run + Cloud SQL + Filestore + GKE stack per team, each new project is registered as an isolated Scion project (grove) seeded from the versioned scion-defaults baseline.",
+    edges: ["e1"], units: ["defaults", "hub"]
+  },
+  {
+    n: "2", tone: "blue", title: "Delegate owners to adapt hooks live",
+    line: "Responsible project owners sign in via IAP with scoped RBAC to inspect agents and tune hooks and prompts on the fly.",
+    facts: [["Access scope", "Single project"], ["Drift policy", "Tracked, not clobbered"]],
+    notes: "Cloud SQL records the initial template hash at onboarding. Fleet sync monitors all N projects without overwriting intentional hook or prompt adjustments made by delegated owners.",
+    edges: ["e2", "s2", "s3"], units: ["owners", "iap", "hub", "sql"]
+  },
+  {
+    n: "3", tone: "blue", title: "Issues & PR reviews enter the Hub",
+    line: "GitHub issues and review events route to that project's coordinator on the shared Scion Hub.",
+    facts: [["Work unit", "Issue / PR"], ["Attribution", "Stamped from start"]],
+    notes: "Anchoring orchestration to explicit GitHub issue and PR identifiers lets every downstream agent turn carry work-item context.",
+    edges: ["e3"], units: ["github", "hub"]
+  },
+  {
+    n: "4", tone: "green", title: "Spawn elastic multi-harness pods",
+    line: "The Hub launches ephemeral per-issue worker and reviewer pods on GKE Autopilot that stop as soon as the task finishes.",
+    facts: [["Harnesses", "Claude · Agy · OpenCode · Codex"], ["Idle pod waste", "Scales down"]],
+    notes: "Replaces standing idle role pods per project with on-demand per-issue pods while mounting resumable Filestore RWX workspaces.",
+    edges: ["e4", "s4"], units: ["hub", "gke", "nfs"]
+  },
+  {
+    n: "5", tone: "yellow", title: "Execute turns across frontier models",
+    line: "Agent harnesses run reasoning, coding, and review turns against Vertex AI and frontier model endpoints.",
+    facts: [["Telemetry", "sciontool OTLP"], ["Tokens", "Input · output · cache"]],
+    notes: "In-container sciontool normalizes native and hook telemetry across harnesses so token and latency accounting uses one schema.",
+    edges: ["e5"], units: ["gke", "vertex"]
+  },
+  {
+    n: "6", tone: "grey", title: "Verify in isolated project sandboxes",
+    line: "Per-project Workload Identity deploys and tests strictly inside that team's target GCP project, then opens the GitHub PR.",
+    facts: [["Identity", "<slug>-deployer KSA"], ["Blast radius", "1 sandbox project"]],
+    notes: "Proposed multi-tenant boundary: dedicated Kubernetes Service Accounts per onboarded project ensure Team A's agents never receive IAM grants on Team B's cloud resources.",
+    edges: ["e6"], units: ["gke", "sandboxes"]
+  },
+  {
+    n: "7", tone: "red", title: "Emit structured trajectories to Logging",
+    line: "Harness hooks and sciontool write structured trajectory logs stamped with project, issue, PR, harness, model, and hook verdicts.",
+    facts: [["Correlation", "project · issue · pr"], ["Collection", "Cloud Logging"]],
+    notes: "Proposed trajectory schema captures tool calls, retries, verification gate pass/fail, and token counts directly in structured JSON logs.",
+    edges: ["e7"], units: ["gke", "logs"]
+  },
+  {
+    n: "8", tone: "red", title: "Score cost & quality in BigQuery",
+    line: "Log Router streams trajectories to BigQuery and joins GitHub outcomes to rank $/PR, $/Issue, and Harness × Model performance.",
+    facts: [["Unit economics", "$/PR · $/Issue"], ["Quality evals", "Pass · cycle · survival"]],
+    notes: "Proposed fleet scorecard metrics: (1) True cost per merged PR & per issue across all rework turns, (2) Harness × Model completion vs. cost Pareto frontier, (3) First-pass CI/review acceptance, (4) 7-day post-merge survival (no revert/hotfix), and (5) Trajectory thrash & hook catch rate.",
+    edges: ["e8"], units: ["logs", "bq"]
+  },
+  {
+    n: "9", tone: "red", title: "Mine winning live adaptations",
+    line: "The Self-Learning Harvester correlates live owner hook and prompt diffs against BigQuery cost and completion gains.",
+    facts: [["Signal", "Live hook & prompt diffs"], ["Filter", "Statistically better KPIs"]],
+    notes: "Proposed scheduled Cloud Run Job inspects what delegated owners changed in high-performing projects and filters out noisy one-off edits.",
+    edges: ["e9"], units: ["bq", "harvester"]
+  },
+  {
+    n: "10", tone: "red", title: "Promote new defaults via pull request",
+    line: "Verified improvements open an evidence-backed PR on scion-defaults so Project N+1 launches with the upgraded factory baseline.",
+    facts: [["Governance", "Human-reviewed PR"], ["Compounding", "Project N+1 starts smarter"]],
+    notes: "Keeps a human platform owner in the loop before new hooks or templates become the organization's default baseline.",
+    edges: ["e10"], units: ["harvester", "defaults"]
+  },
+  {
+    n: "·", tone: "grey", title: "Guardrails, state & outcome joins",
+    line: "IAP gates every human login, Cloud SQL and Filestore persist HA state, and GitHub outcomes ground BigQuery evals.",
+    facts: [["Ingress", "Zero anonymous routes"], ["State", "Cloud SQL + Filestore"]],
+    notes: "Supporting operational paths shown dashed: Platform Admin onboarding via IAP, Hub catalog/hash storage in Cloud SQL, RWX workspaces on Filestore, agent PR creation, and GitHub merge/CI ingestion into BigQuery.",
+    edges: ["s1", "s2", "s3", "s4", "s5", "s6"],
+    units: ["admin", "iap", "hub", "sql", "nfs", "gke", "github", "bq"]
+  },
+  {
+    title: "Compounding software factory economics",
+    line: "Amortize one HA GKE platform across N teams, measure true $/PR by harness and model, and compound every team's best hooks.",
+    facts: [["Platform cost", "Shared 1 → N"], ["North star", "$ / verified merged PR"]],
+    notes: "Closing overview for discussion: (1) Immediate cap-ex/op-ex efficiency from 1 shared HA Scion deployment, (2) Autonomous team velocity via delegated Project Owners and isolated sandboxes, (3) Objective model/harness procurement data in BigQuery, and (4) Compounding engineering quality via scion-defaults.",
+    edges: [], units: []
+  }
+];
+
+const NS = "http://www.w3.org/2000/svg";
+const mk = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+
+/* Two tints per hue for the group, plus one accent per surface. */
+const TONES = {
+  dash:   { tint: "#F8F9FA", edge: "#BDC1C6", paper: "#5F6368", screen: "#BDC1C6", dashed: true },
+  blue:   { tint: "#E8F0FE", edge: "#A8C7FA", paper: "#1A73E8", screen: "#8AB4F8" },
+  red:    { tint: "#FCE8E6", edge: "#F2B8B5", paper: "#C5221F", screen: "#F28B82" },
+  yellow: { tint: "#FEF7E0", edge: "#FDE293", paper: "#B06000", screen: "#FDD663" },
+  green:  { tint: "#E6F4EA", edge: "#A8DAB5", paper: "#137333", screen: "#81C995" },
+  grey:   { tint: "#F1F3F4", edge: "#C8CCD1", paper: "#5F6368", screen: "#BDC1C6" }
+};
+
+document.getElementById("doc-title").textContent = DIAGRAM.title;
+document.title = DIAGRAM.title;
+document.documentElement.dataset.theme = DIAGRAM.theme || "light";
+document.documentElement.dataset.mode = DIAGRAM.mode || "slides";
+document.getElementById("diagram").setAttribute("viewBox", `0 0 ${DIAGRAM.viewBox.join(" ")}`);
+for (const [id, value] of [["notice", DIAGRAM.notice], ["legend", (DIAGRAM.legend || []).join(" · ")]]) {
+  const el = document.getElementById(id); el.textContent = value || ""; el.hidden = !value;
+}
+
+/** A product icon, top-left at (x, y), drawn at `size`. */
+function icon(name, x, y, size) {
+  const ic = ICONS[name];
+  if (!ic) return null;
+  const [vx, vy, vw, vh] = ic.vb.split(/\s+/).map(Number);
+  const scale = size / Math.max(vw, vh);
+  const g = mk("g", { transform: `translate(${x + (size - vw * scale) / 2} ${y + (size - vh * scale) / 2}) scale(${scale}) translate(${-vx} ${-vy})` });
+  g.innerHTML = ic.d;
+  return g;
+}
+
+/* --------------------------------------------------------------- frames -- */
+
+const frames = document.getElementById("layer-frames");
+const cloud = DIAGRAM.cloud;
+
+frames.append(mk("rect", { class: "gc-frame", x: cloud.x, y: cloud.y, width: cloud.w, height: cloud.h }));
+const mark = cloud.icon && icon(cloud.icon, cloud.x + 16, cloud.y + 10, 20);
+if (mark) frames.append(mark);
+const cloudLabel = mk("text", { class: "gc-label", x: cloud.x + (mark ? 44 : 16), y: cloud.y + 25 });
+cloudLabel.textContent = cloud.label;
+frames.append(cloudLabel);
+
+if (DIAGRAM.outsideLabel) {
+  const t = mk("text", { class: "zone-label", x: 16, y: 26 });
+  t.textContent = DIAGRAM.outsideLabel;
+  frames.append(t);
+}
+
+for (const g of GROUPS) {
+  const tone = TONES[g.tone];
+  frames.append(mk("rect", {
+    class: "grp", x: g.x, y: g.y, width: g.w, height: g.h,
+    style: `--tint:${tone.tint};--edge:${tone.edge}` + (tone.dashed ? ";stroke-dasharray:5 4" : "")
+  }));
+  const t = mk("text", { class: "grp-title", x: g.x + 14, y: g.y + 21 });
+  t.textContent = g.title;
+  frames.append(t);
+}
+
+/* ---------------------------------------------------------------- wires -- */
+
+const wires = document.getElementById("layer-wires");
+const wireParts = {};
+const edgeById = Object.fromEntries(EDGES.map((e) => [e.id, e]));
+
+for (const e of EDGES) {
+  const d = e.pts.map((p, i) => (i ? `L ${p[0]} ${p[1]}` : `M ${p[0]} ${p[1]}`)).join(" ");
+  const parts = [mk("path", { class: "wirepart wire" + (e.dash ? " dash" : ""), d })];
+
+  const [px, py] = e.pts[e.pts.length - 2];
+  const [qx, qy] = e.pts[e.pts.length - 1];
+  if (py === qy) {
+    const s = qx > px ? 1 : -1;
+    parts.push(mk("polygon", { class: "wirepart wire-head", points: `${qx - 7 * s},${qy - 4} ${qx - 7 * s},${qy + 4} ${qx},${qy}` }));
+  } else {
+    const s = qy > py ? 1 : -1;
+    parts.push(mk("polygon", { class: "wirepart wire-head", points: `${qx - 4},${qy - 7 * s} ${qx + 4},${qy - 7 * s} ${qx},${qy}` }));
+  }
+
+  if (e.label) {
+    const label = mk("text", { class: "wirepart wire-label", x: e.lx, y: e.ly, "text-anchor": e.anchor || "middle" });
+    label.textContent = e.label;
+    parts.push(label);
+  }
+  if (e.disc) {
+    parts.push(mk("circle", { class: "wirepart disc", cx: e.disc[0], cy: e.disc[1], r: 9 }));
+    const n = mk("text", { class: "wirepart disc-n", x: e.disc[0], y: e.disc[1] + 3.5, "text-anchor": "middle" });
+    n.textContent = e.n;
+    parts.push(n);
+  }
+
+  wires.append(...parts);
+  wireParts[e.id] = parts;
+}
+
+/* ---------------------------------------------------------------- units -- */
+
+const units = document.getElementById("layer-units");
+const unitG = {};
+const ALL = [];
+
+/** Line-art glyphs for actors. Actors never get a product icon. */
+function glyph(kind, x, y) {
+  const g = mk("g", {
+    transform: `translate(${x} ${y})`, fill: "none", stroke: "#5F6368",
+    "stroke-width": "1.6", "stroke-linecap": "round", "stroke-linejoin": "round"
+  });
+  const paths = {
+    person: ["M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z", "M4 21a8 8 0 0 1 16 0"],
+    browser: ["M3 5h18v14H3z", "M3 9h18"],
+    phone: ["M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z", "M11 18h2"],
+    printer: ["M7 9V4h10v5", "M5 9h14a2 2 0 0 1 2 2v5h-4v4H7v-4H3v-5a2 2 0 0 1 2-2Z"],
+    server: ["M4 5h16v6H4z", "M4 13h16v6H4z", "M8 8h.01", "M8 16h.01"]
+  }[kind] || [];
+  for (const d of paths) g.append(mk("path", { d }));
+  return g;
+}
+
+function addUnit(u) {
+  const g = mk("g", {
+    class: "unit", id: "u-" + u.id, role: "button", tabindex: "0",
+    "aria-label": u.title + ", " + u.sub + ". " + u.what
+  });
+
+  if (u.kind === "outside") {
+    g.append(mk("rect", { class: "box", x: u.x, y: u.y, width: u.w, height: u.h }));
+    g.append(glyph(u.glyph, u.x + 13, u.y + 12));
+    const t = mk("text", { class: "box-title", x: u.x + 45, y: u.y + 25 });
+    t.textContent = u.title;
+    const s = mk("text", { class: "box-sub", x: u.x + 45, y: u.y + 40 });
+    s.textContent = u.sub;
+    g.append(t, s);
+    (u.rows || []).forEach((r, i) => {
+      const row = mk("text", { class: "box-sub", x: u.x + 14, y: u.y + 70 + i * 22 });
+      row.textContent = "· " + r;
+      g.append(row);
+    });
+  } else {
+    g.append(mk("rect", { class: "card", x: u.x, y: u.y, width: u.w, height: u.h, style: `--edge:${TONES[u.tone].edge}` }));
+    const ic = u.icon && icon(u.icon, u.x + 11, u.y + (u.h - 20) / 2, 20);
+    if (ic) g.append(ic);
+    const tx = u.icon ? u.x + 40 : u.x + 13;
+    const two = u.h >= 50;
+    const t = mk("text", { class: "card-title", x: tx, y: u.y + (two ? 22 : 18) });
+    t.textContent = u.title;
+    const s = mk("text", { class: "card-sub", x: tx, y: u.y + (two ? 38 : 32) });
+    s.textContent = u.sub;
+    g.append(t, s);
+  }
+
+  g.addEventListener("mouseenter", () => showTip(u.id));
+  g.addEventListener("focus", () => showTip(u.id));
+  g.addEventListener("mouseleave", hideTip);
+  g.addEventListener("blur", hideTip);
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); showTip(u.id); });
+  g.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); showTip(u.id); }
+  });
+
+  units.append(g);
+  unitG[u.id] = g;
+  ALL.push(u);
+}
+
+for (const o of OUTSIDE) { o.kind = "outside"; addUnit(o); }
+for (const c of CARDS) {
+  const grp = GROUPS.find((g) => g.id === c.group);
+  c.tone = grp.tone;
+  c.kind = "card";
+  c.groupTitle = grp.title;
+  addUnit(c);
+}
+
+const byId = Object.fromEntries(ALL.map((u) => [u.id, u]));
+const componentPicker = document.getElementById("component-picker");
+for (const u of ALL) { const option = document.createElement("option"); option.value = u.id; option.textContent = u.title; componentPicker.append(option); }
+componentPicker.addEventListener("change", () => { if (componentPicker.value) showTip(componentPicker.value); else hideTip(); });
+
+/* ------------------------------------------------------------- the tip -- */
+
+const stagewrap = document.getElementById("stagewrap");
+const tip = document.getElementById("tip");
+
+function showTip(id) {
+  const u = byId[id];
+  document.getElementById("tip-title").textContent = u.title;
+  document.getElementById("tip-sub").textContent = u.groupTitle ? u.groupTitle + " · " + u.sub : u.sub;
+  document.getElementById("tip-what").textContent = u.what;
+  const why = document.getElementById("tip-why"); why.textContent = u.why || ""; why.hidden = !u.why;
+  tip.hidden = false;
+
+  const box = unitG[id].getBoundingClientRect();
+  const frame = stagewrap.getBoundingClientRect();
+  const left = box.left - frame.left, top = box.top - frame.top;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = frame.width - (left + box.width) > w + 20 ? left + box.width + 12 : left - w - 12;
+  x = Math.max(10, Math.min(x, frame.width - w - 10));
+  let y = top + box.height / 2 - h / 2;
+  y = Math.max(10, Math.min(y, frame.height - h - 10));
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+
+function hideTip() { tip.hidden = true; }
+document.addEventListener("click", (ev) => { if (ev.target !== componentPicker) hideTip(); });
+
+/* ----------------------------------------------------------- the slides -- */
+
+const VW = DIAGRAM.viewBox[0], VH = DIAGRAM.viewBox[1];
+const stage = document.getElementById("stage");
+const sheet = document.getElementById("sheet");
+
+/** The frame a slide zooms to: everything it lights, plus room to breathe. */
+function focusBox(slide) {
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  const grow = (ax, ay, bx, by) => {
+    x1 = Math.min(x1, ax); y1 = Math.min(y1, ay);
+    x2 = Math.max(x2, bx); y2 = Math.max(y2, by);
+  };
+  for (const id of slide.units) { const u = byId[id]; if (u) grow(u.x, u.y, u.x + u.w, u.y + u.h); }
+  for (const id of slide.edges) { const e = edgeById[id]; if (e) for (const [px, py] of e.pts) grow(px, py, px, py); }
+  if (x1 === Infinity) return { x: 0, y: 0, w: VW, h: VH };
+  const pad = 46;
+  return { x: x1 - pad, y: y1 - pad, w: x2 - x1 + pad * 2, h: y2 - y1 + pad * 2 };
+}
+
+function frameStage(slide) {
+  const f = focusBox(slide);
+  const s = Math.max(1, Math.min(VW / f.w, VH / f.h, 2.3));
+  const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
+  let tx = VW / 2 - s * cx, ty = VH / 2 - s * cy;
+  tx = Math.min(0, Math.max(VW * (1 - s), tx));
+  ty = Math.min(0, Math.max(VH * (1 - s), ty));
+  stage.setAttribute("transform", `translate(${tx.toFixed(2)} ${ty.toFixed(2)}) scale(${s.toFixed(4)})`);
+  sheet.classList.toggle("zoomed", s > 1.02);
+}
+
+const elStepNo = document.getElementById("stepno");
+const elTitle = document.getElementById("title");
+const elLine = document.getElementById("line");
+const elChips = document.getElementById("chips");
+const elCounter = document.getElementById("counter");
+const notes = document.getElementById("notes"), notesToggle = document.getElementById("notes-toggle");
+notesToggle.addEventListener("click", () => { notes.hidden = !notes.hidden; notesToggle.setAttribute("aria-expanded", String(!notes.hidden)); });
+
+const dotBtn = SLIDES.map((s, i) => {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "dot";
+  b.textContent = s.n || "◆";
+  b.setAttribute("aria-label", "Step " + (i + 1) + ": " + s.title);
+  b.style.setProperty("--dot", TONES[s.tone || "blue"][DIAGRAM.theme === "dark" ? "screen" : "paper"]);
+  b.addEventListener("click", () => go(i));
+  document.getElementById("dots").append(b);
+  return b;
+});
+
+let at = 0;
+
+function go(i) {
+  if (DIAGRAM.mode === "diagram") i = 0;
+  at = (i + SLIDES.length) % SLIDES.length;
+  const s = SLIDES[at];
+  const tone = TONES[s.tone || "blue"];
+
+  document.documentElement.style.setProperty("--accent", DIAGRAM.theme === "dark" ? tone.screen : tone.paper);
+  document.documentElement.style.setProperty("--accent-paper", tone.paper);
+
+  elStepNo.hidden = !s.n;
+  if (s.n) elStepNo.textContent = s.n;
+  elTitle.textContent = s.title;
+  elLine.textContent = s.line;
+  notes.textContent = s.notes || ""; notes.hidden = true; notesToggle.hidden = !s.notes || DIAGRAM.mode === "diagram";
+  notesToggle.setAttribute("aria-expanded", "false");
+
+  elChips.hidden = !s.facts;
+  elChips.textContent = "";
+  for (const [k, v] of s.facts || []) {
+    const li = document.createElement("li");
+    const b = document.createElement("b"); b.textContent = v;
+    const sp = document.createElement("span"); sp.textContent = k;
+    li.append(b, sp);
+    elChips.append(li);
+  }
+
+  const showAll = !s.edges.length && !s.units.length;
+  for (const u of ALL) {
+    const lit = s.units.includes(u.id);
+    unitG[u.id].classList.toggle("lit", lit);
+    unitG[u.id].classList.toggle("dim", !showAll && !lit);
+  }
+  for (const e of EDGES) {
+    const lit = s.edges.includes(e.id);
+    for (const part of wireParts[e.id]) {
+      part.classList.toggle("lit", lit);
+      part.classList.toggle("dim", !showAll && !lit);
+    }
+  }
+
+  frameStage(s);
+  hideTip();
+  dotBtn.forEach((b, j) => b.setAttribute("aria-current", String(j === at)));
+  elCounter.textContent = (at + 1) + " / " + SLIDES.length;
+  dotBtn[at].scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+document.getElementById("prev").addEventListener("click", () => go(at - 1));
+document.getElementById("next").addEventListener("click", () => go(at + 1));
+
+addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { hideTip(); notes.hidden = true; notesToggle.setAttribute("aria-expanded", "false"); return; }
+  if (ev.target.closest('button, input, textarea, select, [contenteditable="true"]')) return;
+  if (ev.key === "ArrowRight" || ev.key === "PageDown" || ev.key === " ") { ev.preventDefault(); go(at + 1); }
+  else if (ev.key === "ArrowLeft" || ev.key === "PageUp") { ev.preventDefault(); go(at - 1); }
+  else if (ev.key === "Home") go(0);
+  else if (ev.key === "End") go(SLIDES.length - 1);
+});
+
+let downX = null;
+stagewrap.addEventListener("pointerdown", (ev) => { downX = ev.clientX; });
+stagewrap.addEventListener("pointerup", (ev) => {
+  if (downX === null) return;
+  const dx = ev.clientX - downX;
+  downX = null;
+  if (Math.abs(dx) > 55) go(at + (dx < 0 ? 1 : -1));
+});
+
+addEventListener("resize", () => frameStage(SLIDES[at]));
+go(0);
+</script>
+</body>
+</html>
