@@ -310,6 +310,26 @@ scripts/run-on-hub.sh scripts/scion-admin.py message --project <project> --agent
 
 Make the same change in the template so it survives restarts.
 
+### Automated live hot-upgrade (`scion-factory hot-upgrade`)
+
+If you add a specialist or rule on an active factory, run `scion-factory hot-upgrade` in dry-run mode first.
+By default, the command creates only missing Hub templates so existing live template edits stay intact.
+It also broadcasts rule deltas by message and asks `lead` to start child specialists without restarting containers:
+
+```bash
+./scripts/scion-factory hot-upgrade \
+  --project <project> \
+  --kit <kit_dir> \
+  --env config/factory.env \
+  --roles reviewer,reviewer-2 \
+  --rule-delta "Run git grep across the repository before reporting missing routes." \
+  --spawn reviewer-2 \
+  --json
+```
+
+After you review the dry-run plan, pass `--apply` to execute it.
+If you want to overwrite existing Hub templates in `--roles`, add `--overwrite-templates`.
+
 ## Switch an agent's harness
 
 Change `default_harness_config` in the role's template, then push it with

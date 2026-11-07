@@ -2603,6 +2603,26 @@ def main(argv: list[str] | None = None) -> int:
     p_role.add_argument("--evidence", action="append", default=[],
                         help="Why the role is needed (repeatable), e.g. a path discovery found")
 
+    p_hot = sub.add_parser(
+        "hot-upgrade",
+        help="Create missing templates, broadcast live rule deltas, and ask lead to spawn child specialists",
+    )
+    p_hot.add_argument("--project", required=True, help="Target Scion Hub project slug")
+    p_hot.add_argument("--kit", required=True, help="Compiled kit directory containing templates/")
+    p_hot.add_argument("--env", default="", help="Optional factory.env path")
+    p_hot.add_argument("--roles", default="", help="Comma-separated template roles to push")
+    p_hot.add_argument("--create-only", action="store_true", help="Default mode: create only missing Hub templates")
+    p_hot.add_argument("--overwrite-templates", action="store_true", help="Overwrite existing Hub templates in --roles")
+    p_hot.add_argument("--rule-delta", default="", help="Live prompt rule delta sent via Hub message")
+    p_hot.add_argument("--rule-delta-file", default="", help="File containing a live prompt rule delta")
+    p_hot.add_argument("--notify-agents", default="", help="Explicit comma-separated running agents to message")
+    p_hot.add_argument("--spawn", action="append", default=[], help="Specialist to start via lead: template[:agent_name]")
+    p_hot.add_argument("--lead", default="", help="Explicit lead agent slug (auto-detected by default)")
+    p_hot.add_argument("--branch", default="", help="Optional Git branch flag (-b) for per-agent specialist starts")
+    p_hot.add_argument("--harness-auth", default="vertex-ai", help="Harness auth flag passed to scion start")
+    p_hot.add_argument("--apply", action="store_true", help="Execute mutations (dry-run by default)")
+    p_hot.add_argument("--json", action="store_true", help="Output JSON")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "inspect":
@@ -2669,7 +2689,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "provision":
         spec = load_spec(args.spec_path)
         import provision_factory
-        from pathlib import Path
         report = provision_factory.provision_factory(
             spec,
             Path(args.kit),
@@ -2705,6 +2724,36 @@ def main(argv: list[str] | None = None) -> int:
             "ready": report["ready"],
             "next": "recompile the kit and push the new template",
         }, indent=2))
+        return 0
+
+    if args.cmd == "hot-upgrade":
+        import hot_upgrade
+        delta = args.rule_delta
+        if args.rule_delta_file:
+            delta = Path(args.rule_delta_file).read_text(encoding="utf-8")
+        try:
+            report = hot_upgrade.run_hot_upgrade(
+                project_slug=args.project,
+                templates_dir=Path(args.kit) / "templates",
+                env_file=Path(args.env) if args.env else None,
+                roles=[r for r in args.roles.split(",") if r.strip()],
+                overwrite_templates=bool(args.overwrite_templates and not args.create_only),
+                rule_delta=delta,
+                notify_agents=[a for a in args.notify_agents.split(",") if a.strip()],
+                spawn_specs=hot_upgrade.parse_spawn_specs(args.spawn),
+                lead_slug=args.lead,
+                branch=args.branch,
+                harness_auth=args.harness_auth,
+                apply=args.apply,
+            )
+        except (ValueError, RuntimeError) as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            mode = "APPLY" if report["apply"] else "DRY-RUN"
+            print(f"[{mode}] project={report['project']} templates={report['templates_pushed']} notified={report['notified_agents']} spawns={len(report['spawn_commands'])}")
         return 0
 
     return 1
