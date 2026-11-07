@@ -81,7 +81,7 @@ def _build_project_payload(
         if not git_url.endswith(".git"):
             git_url += ".git"
         branch = _resolve_branch(spec, branch_key, eff_env)
-        default_ws = "per-agent" if runtime == "kubernetes" else "shared"
+        default_ws = "per-agent" if runtime == "kubernetes" or vcs_enabled else "shared"
         ws_mode = eff_env.get("WORKSPACE_MODE", default_ws)
         body["gitRemote"] = git_url
         body["workspaceMode"] = ws_mode
@@ -177,22 +177,25 @@ def provision_factory(
         else:
             phases.append({"phase": "preflight", "ok": True, "local": True})
 
-        # 2. sandbox
-        sb_env = {**sub_base_env, "DRY_RUN": "0" if apply else "1"}
-        if gh_token:
-            sb_env["GITHUB_TOKEN"] = gh_token
-        r_sb = subprocess.run(
-            ["bash", "scripts/setup-sandbox.sh"],
-            cwd=ROOT_DIR,
-            env=sb_env,
-            capture_output=True,
-            text=True,
-        )
-        if r_sb.returncode == 0:
-            phases.append({"phase": "sandbox", "ok": True})
+        # 2. sandbox (run when SANDBOX_PROJECT is configured and SKIP_SANDBOX is not set)
+        if eff_env.get("SANDBOX_PROJECT") and eff_env.get("SKIP_SANDBOX") != "1":
+            sb_env = {**sub_base_env, "DRY_RUN": "0" if apply else "1"}
+            if gh_token:
+                sb_env["GITHUB_TOKEN"] = gh_token
+            r_sb = subprocess.run(
+                ["bash", "scripts/setup-sandbox.sh"],
+                cwd=ROOT_DIR,
+                env=sb_env,
+                capture_output=True,
+                text=True,
+            )
+            if r_sb.returncode == 0:
+                phases.append({"phase": "sandbox", "ok": True})
+            else:
+                phases.append({"phase": "sandbox", "ok": False, "stderr": r_sb.stderr})
+                return {"ok": False, "apply": apply, "phases": phases}
         else:
-            phases.append({"phase": "sandbox", "ok": False, "stderr": r_sb.stderr})
-            return {"ok": False, "apply": apply, "phases": phases}
+            phases.append({"phase": "sandbox", "ok": True, "skipped": True})
 
         # 3. seed_repo
         seed_script = kit_dir / "scripts" / "seed-github-waves.sh"
@@ -234,14 +237,26 @@ def provision_factory(
         deployer_sa_name = eff_env.get("DEPLOYER_SA_NAME", "")
         runtime_profile = eff_env.get("RUNTIME_PROFILE") or spec.get("infrastructure", {}).get("runtime_profile", "")
 
-        worker_sa_email = f"{worker_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
-        control_sa_email = f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
-        deployer_sa_email = f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
+        worker_sa_email = eff_env.get("WORKER_SA_EMAIL") or (
+            f"{worker_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if sandbox_project else ""
+        )
+        control_sa_email = eff_env.get("CONTROL_SA_EMAIL") or (
+            f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if control_sa_name and sandbox_project else ""
+        )
+        deployer_sa_email = eff_env.get("DEPLOYER_SA_EMAIL") or (
+            f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if deployer_sa_name and sandbox_project else ""
+        )
+        sa_gcp_project = sandbox_project or eff_env.get("HUB_PROJECT", "")
+        if not sa_gcp_project and ".iam.gserviceaccount.com" in worker_sa_email and "@" in worker_sa_email:
+            sa_gcp_project = worker_sa_email.split("@", 1)[1].split(".iam.", 1)[0]
 
-        if runtime == "kubernetes" and apply:
+        id_mode = eff_env.get("GCP_IDENTITY_DEFAULT") or eff_env.get("GCP_IDENTITY_MODE") or "assign"
+        docker_assign = runtime == "docker" and id_mode == "assign" and bool(
+            eff_env.get("WORKER_SA_EMAIL") or eff_env.get("GCP_IDENTITY_DEFAULT") or eff_env.get("GCP_IDENTITY_MODE")
+        ) and bool(worker_sa_email)
+
+        if apply and (runtime == "kubernetes" or docker_assign):
             from hub_client import HubAPIError
-
-            id_mode = eff_env.get("GCP_IDENTITY_DEFAULT", "assign")
             if control_sa_email and not client.find_user(control_sa_email):
                 try:
                     client.request("POST", "/api/v1/users", body={"email": control_sa_email})
@@ -250,10 +265,12 @@ def provision_factory(
                         raise
 
             for pid in (build_pid_id, eval_pid_id):
-                worker_sa_rec = client.register_project_service_account(pid, worker_sa_email, sandbox_project, name=worker_sa_name)
+                worker_sa_rec = client.register_project_service_account(pid, worker_sa_email, sa_gcp_project, name=worker_sa_name)
                 worker_sa_uuid = worker_sa_rec.get("id", worker_sa_email)
-                if scion_factory.deploy_mode(spec) != "none" and deployer_sa_name:
-                    client.register_project_service_account(pid, deployer_sa_email, sandbox_project, name=deployer_sa_name)
+                if scion_factory.deploy_mode(spec) != "none" and deployer_sa_email:
+                    client.register_project_service_account(
+                        pid, deployer_sa_email, sa_gcp_project, name=deployer_sa_name or deployer_sa_email.split("@", 1)[0]
+                    )
 
                 patch: dict = {"defaultGCPIdentityMode": id_mode}
                 if id_mode == "assign":

@@ -26,6 +26,9 @@ Run all commands from the root of the `scion-defaults` repository.
   provisioned database for it. For the product, default to Cloud Run, Firestore, BigQuery, Cloud Storage, and Vertex
   AI, and record a provisioned store (Spanner, AlloyDB, Cloud SQL) only with the requirement that justifies it.
 
+## Pre-Bootstrap Option: Greenfield Ideation Studio
+If the product requirements and visual direction are unsettled, run a lightweight Ideation and Domain Consultant Studio first. Shut down the studio containers before you start the Build and Eval factory.
+
 ## Step 0: Target Hub mode
 
 Ask the user for the target Hub mode: **New Full GKE Scion Hub**, **Existing GKE / Cloud Run Scion Hub**, or **Existing Single-VM Hub**. If installing Scion from scratch on GKE, guide the user to use `scripts/setup-gke-hub.sh` with the appropriate tier flag:
@@ -73,7 +76,7 @@ Work through the `questions` in pillar order. For each question:
 |---|---|
 | `1_mission_and_boundaries` | `project.name`, `project.mission`, `project.non_goals`, and the `vcs` section |
 | `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""` or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
-| `3_roster_models_and_cost` | `team.build_roles`, `team.eval_roles`, `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode`, `team.max_wip`, `infrastructure.budget_usd` |
+| `3_roster_models_and_cost` | `team.build_roles` (with role-scoped `skills`), `team.eval_roles`, `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode`, `team.max_wip`, `infrastructure.budget_usd`. Prefer upstream skills. Strip stack contradictions via `audit-skills`. Cap at 6 skills per role. |
 | `4_evaluation_pyramid_oracle` | `evaluation_pyramid.l1_health` through `evaluation_pyramid.l5_latency_slo` |
 | `5_backlog_waves_and_autonomy` | `waves[*].issues[*]` with `owner_role`, `acceptance_criteria`, and `requirements` (REQ- IDs) |
 | `6_knowledge_plane` | `knowledge_plane.sources`, `knowledge_plane.requirements`, `knowledge_plane.invariants`, `knowledge_plane.decisions`, `knowledge_plane.glossary` |
@@ -145,6 +148,13 @@ verify in a diff or with a command. Every wave issue should cite the `REQ-` IDs 
 
 For each entry in `missing_or_weak`, return to the matching pillar and resolve it with the human. Repeat until the
 report shows `"ready": true`.
+
+## Step 3.5: Mandatory Pre-Compile Adversarial and Container Readiness Gate
+Before you compile the kit, run the independent zero-context adversarial review. Run the topology audit to verify container binary readiness, PATH configurations, and UID mapping requirements.
+```bash
+./scripts/scion-factory audit-topology factory.yaml
+```
+Verify the checklist before you proceed.
 
 ## Step 4: Compile and verify the kit
 

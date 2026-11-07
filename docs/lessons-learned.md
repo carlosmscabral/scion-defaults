@@ -748,3 +748,24 @@ fix now lives. Dates are UTC. "Encoded in" points to the script, template rule o
   6. **Firestore REST URL + K8s `CronJob` resilience (`factory_store.py`, `factory-watchdog.py`, `install-k8s-control-plane.py`):**
      `load_control_state` prepends `{store.api}/` to `store.doc_name(...)`, K8s `CronJob`s set `backoffLimit: 1` under `concurrencyPolicy: Forbid`, and API-mode `factory-watchdog.py` uses `should_wake` for `<prefix>-lead` monorepo slugs and camelCase `createdAt` on `/api/v1/messages`.
 - **Encoded in:** [`scripts/setup-gke-hub.sh`](../scripts/setup-gke-hub.sh), [`scripts/hub_client.py`](../scripts/hub_client.py), [`config/harness/home/.local/bin/factory-cd.sh`](../config/harness/home/.local/bin/factory-cd.sh), [`scripts/provision_factory.py`](../scripts/provision_factory.py), [`scripts/factory_store.py`](../scripts/factory_store.py), [`scripts/factory-watchdog.py`](../scripts/factory-watchdog.py), [`scripts/install-k8s-control-plane.py`](../scripts/install-k8s-control-plane.py), and [`docs/gke-setup-runbook.md`](gke-setup-runbook.md).
+
+## L34. Git-backed Docker workspace concurrency
+- **Symptom:** Running multiple specialist containers (`max_wip > 1`) on a Single-VM Docker Hub with `vcs.enabled: true` triggered `.git/index.lock` failures and concurrent `node_modules` / virtualenv corruption.
+- **Root cause:** Defaulting `runtime: docker` projects to `workspaceMode: shared` bind-mounts a single host `/workspace` checkout into every agent container.
+- **Fix:** Default `workspaceMode` to `per-agent` whenever Git VCS is enabled (`vcs.enabled: true`) or `runtime == "kubernetes"`, falling back to `shared` only for local non-Git projects.
+- **Encoded in:** [`scripts/provision_factory.py`](../scripts/provision_factory.py) and [`scripts/topology_audit.py`](../scripts/topology_audit.py).
+
+## L35. Workload-proportional role splitting vs. Single-VM container sizing
+- **Symptom:** When >60% of backlog issues targeted one implementer or frontend role while `max_wip >= 3`, parallel capacity sat idle behind one container. Conversely, keeping 15 build and evaluation templates on a 4-vCPU Single-VM Docker host exhausted host memory.
+- **Fix:** Warn during readiness checks (`audit-topology`) when one `owner_role` holds >60% of issues so the PO can split the role into parallel domain slices via `default_kind`, and warn when `runtime: docker` exceeds 10 active roles so idle defaults are pruned via `team.dropped_defaults` and evaluation probes are consolidated into `domain-evaluator`.
+- **Encoded in:** [`scripts/topology_audit.py`](../scripts/topology_audit.py), [`scripts/scion_factory.py`](../scripts/scion_factory.py), and [`skills/scion-factory-bootstrap/SKILL.md`](../skills/scion-factory-bootstrap/SKILL.md).
+
+## L36. Upstream skill curation, stack alignment, and role-scoped injection
+- **Symptom:** Vendoring uncurated community skills injected 10k–25k lines of unrelated framework files into agent contexts and introduced conflicting package-manager commands (`pnpm` or `yarn` inside `npm` repositories).
+- **Fix:** Audit skill banks with `./scripts/scion-factory audit-skills <dir> --spec factory.yaml` before compilation, cap skills at 3–6 focused packages per role, and inject role-scoped skills into `templates/<role>/skills/` via `--skill-bank`.
+- **Encoded in:** [`scripts/skill_curation.py`](../scripts/skill_curation.py), [`scripts/scion_factory.py`](../scripts/scion_factory.py), and [`skills/scion-factory-bootstrap/SKILL.md`](../skills/scion-factory-bootstrap/SKILL.md).
+
+## L37. Strict Scion container delegation and custom image UID invariants
+- **Symptom:** Claude Code coordinators asked for fresh subagents defaulted to in-process `Agent` / `Task` tools instead of spawning isolated Scion child containers, and custom harness image layers ending with `USER scion` broke `sciontool init` host UID remapping (`Permission denied` on `/workspace/.git`).
+- **Fix:** Support `team.strict_scion_delegation: true` to emit `templates/<role>/home/.claude/settings.json` denying `"Agent"` and `"Task"` on Claude leads, support `assign` service-account registration on Single-VM Docker hubs, and enforce the `USER root` + system browser checklist in `audit-topology`.
+- **Encoded in:** [`scripts/skill_curation.py`](../scripts/skill_curation.py), [`scripts/provision_factory.py`](../scripts/provision_factory.py), [`scripts/topology_audit.py`](../scripts/topology_audit.py), and [`skills/scion-factory-bootstrap/SKILL.md`](../skills/scion-factory-bootstrap/SKILL.md).

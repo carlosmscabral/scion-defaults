@@ -892,6 +892,8 @@ def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     missing.extend(kp.validate_knowledge_plane(spec))
     team_errors, warnings = _team_readiness(spec)
     missing.extend(team_errors)
+    import topology_audit
+    warnings.extend(topology_audit.audit(spec)["warnings"])
 
     total_checks = 17
     passed = max(0, total_checks - len(missing))
@@ -1351,6 +1353,11 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
         if runtime_mode(spec) == "kubernetes" and _vcs_enabled(spec)
         else ""
     )
+    id_mode = (
+        str((spec.get("infrastructure") or {}).get("gcp_identity_mode") or "").strip()
+        or os.environ.get("GCP_IDENTITY_DEFAULT", "")
+        or os.environ.get("GCP_IDENTITY_MODE", "")
+    )
     rows = []
     for r in team:
         if r["role"] == lead_role:
@@ -1358,7 +1365,8 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
         cmd = f'scion start {_agent(spec, r["role"])} -t {r["role"]}'
         if team_branch:
             cmd += f" -b {team_branch}"
-        cmd += " --harness-auth vertex-ai"
+        if id_mode != "assign":
+            cmd += " --harness-auth vertex-ai"
         if r.get("gcp_identity"):
             cmd += " --service-account <ID>"
         rows.append(f'| `{_agent(spec, r["role"])}` | `{cmd} "Read your instructions, then run your wake-up steps."` |')
@@ -2297,7 +2305,10 @@ def _render_enable_git_sh(spec: dict[str, Any]) -> str:
 
 
 def compile_factory_boilerplate(
-    spec: dict[str, Any], out_dir: str | Path, force_knowledge: bool = False
+    spec: dict[str, Any],
+    out_dir: str | Path,
+    force_knowledge: bool = False,
+    skill_bank: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compile a validated FactorySpec into a complete Scion factory directory.
 
@@ -2398,11 +2409,21 @@ def compile_factory_boilerplate(
         stale.unlink()
     _write("scripts/verify-factory.sh", _render_verify_factory_sh(spec), executable=True)
 
+    # 7. Optional role-scoped skill injection and strict Scion container delegation
+    import skill_curation
+    effective_bank = skill_bank or spec.get("skill_bank")
+    skill_warnings: list[str] = []
+    if effective_bank:
+        skill_warnings = skill_curation.inject_skills(spec, effective_bank, out)
+    for rel_settings in skill_curation.apply_strict_delegation(spec, out):
+        written_files.append(rel_settings)
+
     return {
         "out_dir": str(out),
         "files_written": len(written_files),
         "files": written_files,
         "preserved": skipped_files,
+        "warnings": skill_warnings,
     }
 
 
@@ -2577,8 +2598,19 @@ def main(argv: list[str] | None = None) -> int:
     p_compile = sub.add_parser("compile", help="Compile a validated FactorySpec into a complete boilerplate directory")
     p_compile.add_argument("spec_path", help="Path to factory.yaml")
     p_compile.add_argument("--out", required=True, help="Output directory for generated factory boilerplate")
+    p_compile.add_argument("--skill-bank", default=None,
+                           help="Optional directory of curated skills to inject per role (overrides spec.skill_bank)")
     p_compile.add_argument("--force-knowledge", action="store_true",
                            help="Reseed knowledge-plane/, backlog/, and eval-workspace/ even if they exist")
+
+    p_skills = sub.add_parser("audit-skills", help="Audit a skill bank directory for bloat, broken links, and stack conflicts")
+    p_skills.add_argument("skill_bank_dir", help="Path to skill bank directory")
+    p_skills.add_argument("--spec", default=None, help="Optional factory.yaml to check stack package-manager conflicts")
+    p_skills.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_topo = sub.add_parser("audit-topology", help="Audit FactorySpec workload balance, VM role sizing, and container checklist")
+    p_topo.add_argument("spec_path", help="Path to factory.yaml")
+    p_topo.add_argument("--json", action="store_true", help="Output JSON")
 
     p_git = sub.add_parser("enable-git", help="Switch a factory that started without Git to Git mode")
     p_git.add_argument("spec_path", help="Path to factory.yaml")
@@ -2649,11 +2681,47 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "compile":
         spec = load_spec(args.spec_path)
-        res = compile_factory_boilerplate(spec, args.out, force_knowledge=args.force_knowledge)
+        res = compile_factory_boilerplate(
+            spec,
+            args.out,
+            force_knowledge=args.force_knowledge,
+            skill_bank=args.skill_bank,
+        )
         print(f"Compiled {res['files_written']} boilerplate files into {res['out_dir']}")
-        if res["preserved"]:
+        if res.get("preserved"):
             print(f"Preserved {len(res['preserved'])} existing knowledge files (use --force-knowledge to reseed)")
+        for w in res.get("warnings") or []:
+            print(f"  - WARNING: {w}")
         return 0
+
+    if args.cmd == "audit-skills":
+        import skill_curation
+        spec_obj = load_spec(args.spec) if args.spec else None
+        report = skill_curation.audit_bank(args.skill_bank_dir, spec_obj)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"Audited {report['skills_checked']} skills (ok={report['ok']})")
+            for err in report["errors"]:
+                print(f"  - ERROR: {err}")
+            for warn in report["warnings"]:
+                print(f"  - WARNING: {warn}")
+        return 0 if report["ok"] else 1
+
+    if args.cmd == "audit-topology":
+        import topology_audit
+        spec_obj = load_spec(args.spec_path)
+        report = topology_audit.audit(spec_obj)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"Topology audit (warnings={len(report['warnings'])})")
+            for warn in report["warnings"]:
+                print(f"  - WARNING: {warn}")
+            print("Container & runtime readiness checklist:")
+            for item in report["checklist"]:
+                print(f"  [ ] {item}")
+        return 0 if report["ok"] else 1
 
     if args.cmd == "enable-git":
         try:
