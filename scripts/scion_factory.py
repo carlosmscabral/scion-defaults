@@ -888,6 +888,9 @@ def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     rt = spec.get("infrastructure", {}).get("runtime", "")
     if rt not in ("", "kubernetes", "docker"):
         missing.append(f"infrastructure.runtime is {rt!r} (must be kubernetes or docker)")
+    id_mode = spec.get("infrastructure", {}).get("gcp_identity_mode", "")
+    if id_mode not in ("", "assign", "passthrough", "block"):
+        missing.append(f"infrastructure.gcp_identity_mode is {id_mode!r} (must be assign, passthrough, or block)")
 
     missing.extend(kp.validate_knowledge_plane(spec))
     team_errors, warnings = _team_readiness(spec)
@@ -1323,7 +1326,44 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
 """
 
 
-def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is_eval: bool) -> str:
+def _load_env_map(env_file: str | Path | None) -> dict[str, str]:
+    """Parse key-value pairs from an optional factory.env file without mutating os.environ."""
+    if not env_file:
+        return {}
+    p = Path(env_file)
+    if not p.exists():
+        return {}
+    env_map: dict[str, str] = {}
+    for raw_line in p.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env_map[k.strip()] = v.strip().strip("'\"")
+    return env_map
+
+
+def _effective_gcp_identity_mode(spec: dict[str, Any], compile_env: dict[str, str] | None = None) -> str:
+    """Return the explicit GCP identity mode configured in the spec or factory.env.
+
+    If the mode is 'assign' on Docker, Scion mounts the GCE metadata sidecar.
+    Then scion start omits '--harness-auth vertex-ai' so env-gather does not require gcloud-adc.
+    """
+    infra = spec.get("infrastructure") or {}
+    env_map = compile_env or {}
+    return (
+        str(infra.get("gcp_identity_mode") or "").strip()
+        or env_map.get("GCP_IDENTITY_DEFAULT", "").strip()
+        or env_map.get("GCP_IDENTITY_MODE", "").strip()
+    )
+
+
+def _render_chain_of_command(
+    spec: dict[str, Any],
+    role_spec: dict[str, Any],
+    is_eval: bool,
+    compile_env: dict[str, str] | None = None,
+) -> str:
     """The PO starts only the two leads; each lead starts its team, so Scion records the lead as the team's parent.
 
     Scion keeps each agent's creator (ancestry root -> parent -> child): the Hub's tree view shows the lead on top, and
@@ -1346,11 +1386,14 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
 
 """
     vcs = spec.get("vcs", {}) or {}
+    rt = runtime_mode(spec)
     team_branch = (
         (vcs.get("eval_branch") if is_eval else vcs.get("build_branch"))
-        if runtime_mode(spec) == "kubernetes" and _vcs_enabled(spec)
+        if rt == "kubernetes" and _vcs_enabled(spec)
         else ""
     )
+    id_mode = _effective_gcp_identity_mode(spec, compile_env)
+    omit_vertex_harness_auth = rt == "docker" and id_mode == "assign"
     rows = []
     for r in team:
         if r["role"] == lead_role:
@@ -1358,14 +1401,18 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
         cmd = f'scion start {_agent(spec, r["role"])} -t {r["role"]}'
         if team_branch:
             cmd += f" -b {team_branch}"
-        cmd += " --harness-auth vertex-ai"
+        if not omit_vertex_harness_auth:
+            cmd += " --harness-auth vertex-ai"
         if r.get("gcp_identity"):
-            cmd += " --service-account <ID>"
+            cmd += ' ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}'
         rows.append(f'| `{_agent(spec, r["role"])}` | `{cmd} "Read your instructions, then run your wake-up steps."` |')
     table = "\n".join(rows)
     sa_note = (
-        "\n- `<ID>` is the deployer service account's ID in `scion project service-accounts list` (the PO registers it, "
-        "setup runbook step 6). Without one, ask the PO before you start that agent."
+        '\n- `SCION_DEPLOYER_SA_ID` is injected into your container environment by `scion-factory provision` '
+        "when a dedicated or `assign`-mode deployer service account is registered on the Hub. Before starting "
+        'that agent, check `echo "${SCION_DEPLOYER_SA_ID:-}"`. In `assign` mode, if it is empty, try '
+        "`scion project service-accounts list --json` (when supported by your `scion` CLI) and open a PO decision "
+        "issue before starting the deployer if neither resolves the UUID."
         if any(r.get("gcp_identity") for r in team if r["role"] != lead_role) else ""
     )
     return f"""## Chain of command
@@ -1514,12 +1561,17 @@ The digest is never a Scion message: a daily message would page the PO every day
 """
 
 
-def _render_role_system_prompt(spec: dict[str, Any], role_spec: dict[str, Any], is_eval: bool) -> str:
+def _render_role_system_prompt(
+    spec: dict[str, Any],
+    role_spec: dict[str, Any],
+    is_eval: bool,
+    compile_env: dict[str, str] | None = None,
+) -> str:
     text = _monorepo_paths(spec, _render_role_system_prompt_base(spec, role_spec, is_eval))
     # Every factory scopes its backlog with its `factory:<slug>` label (spec §7.2), not only monorepo factories.
     text = text.replace("--label status:ready`", f"--label status:ready --label {_factory_label(spec)}`")
     sections = (_render_role_protocol(spec, role_spec) + _render_focus(spec, role_spec)
-                + _render_chain_of_command(spec, role_spec, is_eval))
+                + _render_chain_of_command(spec, role_spec, is_eval, compile_env=compile_env))
     text = text.replace("## Operating Loop\n", sections + "## Operating Loop\n", 1)
     prefix, subdir = _monorepo(spec)
     if not subdir:
@@ -2297,7 +2349,10 @@ def _render_enable_git_sh(spec: dict[str, Any]) -> str:
 
 
 def compile_factory_boilerplate(
-    spec: dict[str, Any], out_dir: str | Path, force_knowledge: bool = False
+    spec: dict[str, Any],
+    out_dir: str | Path,
+    force_knowledge: bool = False,
+    env_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compile a validated FactorySpec into a complete Scion factory directory.
 
@@ -2309,6 +2364,7 @@ def compile_factory_boilerplate(
         raise ValueError(f"FactorySpec is not ready to compile: {readiness['missing_or_weak']}")
     # Older specs and presets get the missing default specialists; the kit's factory.yaml records the full roster.
     spec, roster_notes = normalize_team(spec)
+    compile_env = _load_env_map(env_file)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -2364,7 +2420,10 @@ def compile_factory_boilerplate(
         for role_spec in role_list:
             role = role_spec["role"]
             _write(f"templates/{role}/scion-agent.yaml", _render_scion_agent_yaml(role_spec, spec))
-            _write(f"templates/{role}/system-prompt.md", _render_role_system_prompt(spec, role_spec, is_eval))
+            _write(
+                f"templates/{role}/system-prompt.md",
+                _render_role_system_prompt(spec, role_spec, is_eval, compile_env=compile_env),
+            )
             _write(f"templates/{role}/agents.md", shared_md)
 
             if role_spec["harness"] == "opencode":
@@ -2577,6 +2636,8 @@ def main(argv: list[str] | None = None) -> int:
     p_compile = sub.add_parser("compile", help="Compile a validated FactorySpec into a complete boilerplate directory")
     p_compile.add_argument("spec_path", help="Path to factory.yaml")
     p_compile.add_argument("--out", required=True, help="Output directory for generated factory boilerplate")
+    p_compile.add_argument("--env", default=None,
+                           help="Optional factory.env path to align GCP_IDENTITY_DEFAULT / GCP_IDENTITY_MODE at compile time")
     p_compile.add_argument("--force-knowledge", action="store_true",
                            help="Reseed knowledge-plane/, backlog/, and eval-workspace/ even if they exist")
 
@@ -2649,7 +2710,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "compile":
         spec = load_spec(args.spec_path)
-        res = compile_factory_boilerplate(spec, args.out, force_knowledge=args.force_knowledge)
+        res = compile_factory_boilerplate(
+            spec,
+            args.out,
+            force_knowledge=args.force_knowledge,
+            env_file=args.env,
+        )
         print(f"Compiled {res['files_written']} boilerplate files into {res['out_dir']}")
         if res["preserved"]:
             print(f"Preserved {len(res['preserved'])} existing knowledge files (use --force-knowledge to reseed)")

@@ -129,6 +129,15 @@ def test_scion_factory_provision_dry_run_and_apply_against_gke_fake_hub(fake_hub
     assert fake_hub.project_settings[build_pid]["defaultGCPIdentityServiceAccountID"] == "sa-uuid-1"
     assert fake_hub.project_settings[build_pid]["defaultGCPIdentityServiceAccountIDByProfile"] == {"gke": "sa-uuid-1"}
 
+    # Verify dedicated deployer SA UUID and base64-encoded GitHub secrets are injected BEFORE lead starts
+    import base64
+    assert fake_hub.project_env[build_pid]["SCION_DEPLOYER_SA_ID"] == {
+        "value": "sa-uuid-2",
+        "injectionMode": "always",
+    }
+    assert base64.b64decode(fake_hub.project_secrets[build_pid]["GITHUB_TOKEN"]["value"]).decode("utf-8") == "gh_fake_pat_for_test"
+    assert base64.b64decode(fake_hub.project_secrets[build_pid]["GH_TOKEN"]["value"]).decode("utf-8") == "gh_fake_pat_for_test"
+
     # Verify shared-dirs uses snake_case read_only and skips existing scratchpad
     sdirs = {d["name"]: d for d in fake_hub.shared_dirs[build_pid]}
     assert sdirs["knowledge-plane"]["read_only"] is True
@@ -294,5 +303,151 @@ def test_provision_go_waits_for_tmux_session_before_sending_go_message(fake_hub,
     )
     msg_idx = req_paths.index("/api/v1/projects/pid-k8s-version/agents/k8s-version-lead/message")
     assert last_exec_idx < msg_idx
+    assert "SCION_DEPLOYER_SA_ID" not in getattr(fake_hub, "project_env", {}).get("pid-k8s-version", {})
+
+
+def test_single_vm_docker_provision_injects_shared_deployer_sa_uuid_and_handles_dry_run_factory_projects(fake_hub, tmp_path):
+    """Verify Single-VM Docker assign mode registers shared SA, injects SCION_DEPLOYER_SA_ID, and passes dry-run when FACTORY_PROJECTS pre-names new projects."""
+    spec = _starter()
+    spec["project"]["slug"] = "vm-app"
+    spec["project"]["eval_slug"] = "vm-app-eval"
+    spec["infrastructure"]["runtime"] = "docker"
+    spec["infrastructure"]["gcp_identity_mode"] = "assign"
+    spec["infrastructure"]["runtime_profile"] = ""
+    spec_path = tmp_path / "factory.yaml"
+    kit_dir = tmp_path / "kit"
+    scion_factory.save_spec(spec, spec_path)
+    scion_factory.compile_factory_boilerplate(spec, kit_dir)
+
+    env_file = tmp_path / "vm.env"
+    env_file.write_text(
+        f"HUB_URL={fake_hub.url}\n"
+        "SCION_HUB_TOKEN=fake-pat\n"
+        "GCP_IDENTITY_DEFAULT=assign\n"
+        "WORKER_SA_EMAIL=cabral-agent@single-vm-proj.iam.gserviceaccount.com\n"
+        "FACTORY_PROJECTS=vm-app,vm-app-eval\n"
+        "AGENT_START_TIMEOUT_SEC=5\n"
+        "AGENT_START_POLL_SEC=0.05\n"
+    )
+
+    # Dry-run must succeed even when FACTORY_PROJECTS already lists uncreated projects
+    r_dry = subprocess.run(
+        [
+            sys.executable,
+            "scripts/scion_factory.py",
+            "provision",
+            str(spec_path),
+            "--kit",
+            str(kit_dir),
+            "--env",
+            str(env_file),
+            "--json",
+        ],
+        cwd=ROOT,
+        env=fake_cli_env(tmp_path, fake_hub.url),
+        capture_output=True,
+        text=True,
+    )
+    assert r_dry.returncode == 0, r_dry.stderr + "\n" + r_dry.stdout
+    assert json.loads(r_dry.stdout)["ok"] is True
+
+    r_apply = subprocess.run(
+        [
+            sys.executable,
+            "scripts/scion_factory.py",
+            "provision",
+            str(spec_path),
+            "--kit",
+            str(kit_dir),
+            "--env",
+            str(env_file),
+            "--apply",
+            "--json",
+        ],
+        cwd=ROOT,
+        env=fake_cli_env(tmp_path, fake_hub.url),
+        capture_output=True,
+        text=True,
+    )
+    assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
+    build_pid = fake_hub.projects_by_slug["vm-app"]["id"]
+    eval_pid = fake_hub.projects_by_slug["vm-app-eval"]["id"]
+    assert fake_hub.project_settings[build_pid]["defaultGCPIdentityMode"] == "assign"
+    assert fake_hub.project_settings[build_pid]["defaultGCPIdentityServiceAccountID"] == "sa-uuid-1"
+    for pid in (build_pid, eval_pid):
+        assert fake_hub.project_env[pid]["SCION_DEPLOYER_SA_ID"] == {
+            "value": "sa-uuid-1",
+            "injectionMode": "always",
+        }
+    put_env_idx = next(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/SCION_DEPLOYER_SA_ID") and build_pid in r["path"]
+    )
+    start_lead_idx = next(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "POST" and r["path"] == f"/api/v1/projects/{build_pid}/agents"
+    )
+    assert put_env_idx < start_lead_idx
+
+
+def test_docker_passthrough_registers_explicit_deployer_sa_and_shell_expansion_handles_unset(fake_hub, tmp_path):
+    """Verify Docker passthrough mode registers explicit DEPLOYER_SA_EMAIL and bash expansion omits empty --service-account."""
+    spec = _starter()
+    spec["project"]["slug"] = "pass-app"
+    spec["project"]["eval_slug"] = "pass-app-eval"
+    spec["infrastructure"]["runtime"] = "docker"
+    spec["infrastructure"]["gcp_identity_mode"] = "passthrough"
+    spec_path = tmp_path / "factory.yaml"
+    kit_dir = tmp_path / "kit"
+    scion_factory.save_spec(spec, spec_path)
+    scion_factory.compile_factory_boilerplate(spec, kit_dir)
+
+    # Verify POSIX shell expansion: unset -> no --service-account flag; set -> --service-account <id>
+    unset_args = subprocess.check_output(
+        ["bash", "-c", 'unset SCION_DEPLOYER_SA_ID; printf "%s\\n" ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"} "prompt"'],
+        text=True,
+    ).splitlines()
+    assert unset_args == ["prompt"]
+    set_args = subprocess.check_output(
+        ["bash", "-c", 'SCION_DEPLOYER_SA_ID="sa-uuid-99"; printf "%s\\n" ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"} "prompt"'],
+        text=True,
+    ).splitlines()
+    assert set_args == ["--service-account", "sa-uuid-99", "prompt"]
+
+    env_file = tmp_path / "pass.env"
+    env_file.write_text(
+        f"HUB_URL={fake_hub.url}\n"
+        "SCION_HUB_TOKEN=fake-pat\n"
+        "GCP_IDENTITY_DEFAULT=passthrough\n"
+        "DEPLOYER_SA_EMAIL=deploy-only@single-vm-proj.iam.gserviceaccount.com\n"
+        "AGENT_START_TIMEOUT_SEC=5\n"
+        "AGENT_START_POLL_SEC=0.05\n"
+    )
+    r_apply = subprocess.run(
+        [
+            sys.executable,
+            "scripts/scion_factory.py",
+            "provision",
+            str(spec_path),
+            "--kit",
+            str(kit_dir),
+            "--env",
+            str(env_file),
+            "--apply",
+            "--json",
+        ],
+        cwd=ROOT,
+        env=fake_cli_env(tmp_path, fake_hub.url),
+        capture_output=True,
+        text=True,
+    )
+    assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
+    build_pid = fake_hub.projects_by_slug["pass-app"]["id"]
+    assert fake_hub.project_env[build_pid]["SCION_DEPLOYER_SA_ID"] == {
+        "value": "sa-uuid-1",
+        "injectionMode": "always",
+    }
+
+
 
 

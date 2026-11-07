@@ -286,6 +286,35 @@ class FakeHubHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"path": rel_path})
             return
 
+        if self.path.startswith("/api/v1/env/"):
+            parsed_url = urlparse(self.path)
+            key = urllib.parse.unquote(parsed_url.path.split("/api/v1/env/", 1)[1])
+            qs = urllib.parse.parse_qs(parsed_url.query)
+            scope_id = (qs.get("scopeId") or [""])[0]
+            data = json.loads(body.decode("utf-8")) if body else {}
+            self.server.__dict__.setdefault("project_env", {}).setdefault(scope_id, {})[key] = data
+            self._send_json(200, {"key": key, "scopeId": scope_id, **data})
+            return
+
+        if self.path.startswith("/api/v1/secrets/"):
+            import base64
+            parsed_url = urlparse(self.path)
+            name = urllib.parse.unquote(parsed_url.path.split("/api/v1/secrets/", 1)[1])
+            qs = urllib.parse.parse_qs(parsed_url.query)
+            scope_id = (qs.get("scopeId") or [""])[0]
+            data = json.loads(body.decode("utf-8")) if body else {}
+            val = data.get("value", "")
+            try:
+                raw_bytes = base64.b64decode(val.encode("ascii"), validate=True)
+                if base64.b64encode(raw_bytes).decode("ascii") != val:
+                    raise ValueError("non-canonical base64")
+            except Exception:
+                self._send_json(400, {"error": "value must be base64-encoded"})
+                return
+            self.server.__dict__.setdefault("project_secrets", {}).setdefault(scope_id, {})[name] = data
+            self._send_json(200, {"name": name, "scopeId": scope_id})
+            return
+
         self._send_json(200, {"status": "ok"})
 
     def do_PATCH(self):

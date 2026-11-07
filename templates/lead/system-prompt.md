@@ -51,7 +51,8 @@ Work the backlog without waiting for the PO:
    the table above that is missing, with its role as the template:
    `scion start ${BACKEND_AGENT} -t backend --harness-auth vertex-ai "Read your instructions, then run your wake-up steps."`
    (likewise `${FRONTEND_AGENT}` with `-t frontend` and `${REVIEWER_AGENT}` with `-t reviewer`; `${DEPLOYER_AGENT}`
-   with `-t deployer --service-account <ID>`, the ID from `scion project service-accounts list`). Start no other agents.
+   with `-t deployer ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}`, injected automatically by
+   `scion-factory provision`, or looked up via `scion project service-accounts list --json` when unset). Start no other agents.
 2. `gh issue list -R ${GITHUB_REPO} --state open --label ${BUILD_PROJECT} --limit 30`, and the latest comments on
    in-flight issues.
 3. Anyone you wait on has been silent for more than 30 minutes: `scion message` them and check for `Message delivered`.

@@ -1,3 +1,8 @@
+"""Deterministic 9-phase Scion Hub provisioning orchestrator for compiled factory kits.
+
+This module creates Hub projects, registers service accounts, and injects project secrets.
+Then it syncs shared directories, pushes templates, and starts lead schedules.
+"""
 import importlib.util
 import json
 import os
@@ -6,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from hub_client import HubClient
+from hub_client import HubAPIError, HubClient
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -97,6 +102,166 @@ def _build_project_payload(
     return body
 
 
+def _resolve_identity_config(spec: dict, eff_env: dict, runtime: str) -> dict:
+    """Resolve service-account emails, target GCP project, and Scion identity mode."""
+    infra = spec.get("infrastructure", {}) or {}
+    sandbox_project = eff_env.get("SANDBOX_PROJECT", "").strip()
+    worker_sa_name = eff_env.get("WORKER_SA_NAME") or infra.get("worker_sa_name") or "agent-worker"
+    control_sa_name = eff_env.get("CONTROL_SA_NAME", "factory-control")
+    deployer_sa_name = eff_env.get("DEPLOYER_SA_NAME", "").strip()
+    runtime_profile = eff_env.get("RUNTIME_PROFILE") or infra.get("runtime_profile", "")
+
+    worker_sa_email = eff_env.get("WORKER_SA_EMAIL", "").strip() or (
+        f"{worker_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if sandbox_project else ""
+    )
+    control_sa_email = eff_env.get("CONTROL_SA_EMAIL", "").strip() or (
+        f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if control_sa_name and sandbox_project else ""
+    )
+    deployer_sa_email = eff_env.get("DEPLOYER_SA_EMAIL", "").strip() or (
+        f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com" if deployer_sa_name and sandbox_project else ""
+    )
+
+    sa_gcp_project = sandbox_project or eff_env.get("HUB_PROJECT", "").strip()
+    if not sa_gcp_project:
+        for candidate_email in (worker_sa_email, deployer_sa_email, control_sa_email):
+            if ".iam.gserviceaccount.com" in candidate_email and "@" in candidate_email:
+                sa_gcp_project = candidate_email.split("@", 1)[1].split(".iam.", 1)[0]
+                break
+
+    id_mode = (
+        eff_env.get("GCP_IDENTITY_DEFAULT", "").strip()
+        or eff_env.get("GCP_IDENTITY_MODE", "").strip()
+        or str(infra.get("gcp_identity_mode") or "").strip()
+        or "assign"
+    )
+    explicit_docker_assign = bool(
+        eff_env.get("WORKER_SA_EMAIL")
+        or eff_env.get("GCP_IDENTITY_DEFAULT")
+        or eff_env.get("GCP_IDENTITY_MODE")
+        or infra.get("gcp_identity_mode") == "assign"
+    )
+    register_sas = runtime == "kubernetes" or (
+        runtime == "docker" and id_mode == "assign" and explicit_docker_assign and bool(worker_sa_email)
+    )
+    return {
+        "worker_sa_name": worker_sa_name,
+        "worker_sa_email": worker_sa_email,
+        "control_sa_email": control_sa_email,
+        "deployer_sa_name": deployer_sa_name,
+        "deployer_sa_email": deployer_sa_email,
+        "sa_gcp_project": sa_gcp_project,
+        "runtime_profile": runtime_profile,
+        "id_mode": id_mode,
+        "register_sas": register_sas,
+        "explicit_deployer_sa_id": eff_env.get("SCION_DEPLOYER_SA_ID", "").strip(),
+    }
+
+
+def _has_gcp_identity_role(spec: dict) -> bool:
+    """Return True if any build or eval role declares a dedicated gcp_identity."""
+    roles = [
+        *(spec.get("team", {}).get("build_roles") or []),
+        *(spec.get("team", {}).get("eval_roles") or []),
+    ]
+    return any(bool(r.get("gcp_identity")) for r in roles if isinstance(r, dict))
+
+
+def _provision_project_identity_and_secrets(
+    client: HubClient,
+    pid: str,
+    id_cfg: dict,
+    gh_token: str,
+    vcs_enabled: bool,
+    needs_deployer_sa: bool,
+) -> None:
+    """Register project service accounts and inject SCION_DEPLOYER_SA_ID and GitHub secrets.
+
+    Phase 5 runs before Phase 9 starts the lead containers.
+    Both leads boot with SCION_DEPLOYER_SA_ID, GITHUB_TOKEN, and GH_TOKEN already set.
+    """
+    deployer_sa_uuid = id_cfg["explicit_deployer_sa_id"]
+    if id_cfg["register_sas"]:
+        worker_rec = client.register_project_service_account(
+            pid,
+            id_cfg["worker_sa_email"],
+            id_cfg["sa_gcp_project"],
+            name=id_cfg["worker_sa_name"],
+        )
+        worker_sa_uuid = worker_rec.get("id", id_cfg["worker_sa_email"])
+        if not deployer_sa_uuid:
+            deployer_sa_uuid = worker_sa_uuid
+
+        if needs_deployer_sa and id_cfg["deployer_sa_email"]:
+            dep_name = id_cfg["deployer_sa_name"] or id_cfg["deployer_sa_email"].split("@", 1)[0]
+            dep_rec = client.register_project_service_account(
+                pid,
+                id_cfg["deployer_sa_email"],
+                id_cfg["sa_gcp_project"],
+                name=dep_name,
+            )
+            if not id_cfg["explicit_deployer_sa_id"]:
+                deployer_sa_uuid = dep_rec.get("id", id_cfg["deployer_sa_email"])
+
+        id_mode = id_cfg["id_mode"]
+        runtime_profile = id_cfg["runtime_profile"]
+        patch: dict = {"defaultGCPIdentityMode": id_mode}
+        if id_mode == "assign":
+            patch["defaultGCPIdentityServiceAccountID"] = worker_sa_uuid
+        if runtime_profile:
+            patch["activeProfile"] = runtime_profile
+            if id_mode == "assign":
+                patch["defaultGCPIdentityServiceAccountIDByProfile"] = {runtime_profile: worker_sa_uuid}
+        client.put_project_settings(pid, patch)
+
+        control_sa_email = id_cfg["control_sa_email"]
+        if control_sa_email:
+            try:
+                _, aroles_resp = client.request("GET", f"/api/v1/projects/{pid}/members/assignable-roles")
+                aroles = aroles_resp.get("items", []) if isinstance(aroles_resp, dict) else (aroles_resp or [])
+                role_id = next(
+                    (r.get("id") for r in aroles if isinstance(r, dict) and r.get("name") == "project-admin"),
+                    next((r.get("id") for r in aroles if isinstance(r, dict) and r.get("id")), ""),
+                )
+                if role_id:
+                    _, cur_m = client.request("GET", f"/api/v1/projects/{pid}/members")
+                    cur_items = cur_m.get("items", []) if isinstance(cur_m, dict) else (cur_m or [])
+                    already = any(
+                        isinstance(m, dict)
+                        and control_sa_email in (m.get("principalId"), m.get("email"), m.get("principalEmail"))
+                        for m in cur_items
+                    )
+                    if not already:
+                        client.request(
+                            "POST",
+                            f"/api/v1/projects/{pid}/members",
+                            body={
+                                "roleDefinitionId": role_id,
+                                "principalType": "user",
+                                "principalId": control_sa_email,
+                            },
+                        )
+            except HubAPIError as exc:
+                if exc.status not in (400, 403, 404, 409):
+                    raise
+    elif needs_deployer_sa and id_cfg["deployer_sa_email"] and id_cfg["sa_gcp_project"] and not deployer_sa_uuid:
+        # In Docker passthrough or block mode, still register an explicit DEPLOYER_SA when configured.
+        dep_name = id_cfg["deployer_sa_name"] or id_cfg["deployer_sa_email"].split("@", 1)[0]
+        dep_rec = client.register_project_service_account(
+            pid,
+            id_cfg["deployer_sa_email"],
+            id_cfg["sa_gcp_project"],
+            name=dep_name,
+        )
+        deployer_sa_uuid = dep_rec.get("id", id_cfg["deployer_sa_email"])
+
+    if needs_deployer_sa and deployer_sa_uuid:
+        client.put_project_env(pid, "SCION_DEPLOYER_SA_ID", deployer_sa_uuid)
+
+    if vcs_enabled and gh_token:
+        client.put_project_secret(pid, "GITHUB_TOKEN", gh_token)
+        client.put_project_secret(pid, "GH_TOKEN", gh_token)
+
+
 def provision_factory(
     spec: dict,
     kit_dir,
@@ -158,6 +323,7 @@ def provision_factory(
 
         # 1. preflight
         factory_projects = [p.strip() for p in eff_env.get("FACTORY_PROJECTS", "").split(",") if p.strip()]
+        existing_hub_projects: set[str] = set()
         if eff_env.get("HUB_URL"):
             hub_preflight = _load_hub_preflight()
             report = hub_preflight.build_api_report(
@@ -171,28 +337,33 @@ def provision_factory(
                 runtime=runtime,
                 k8s_ready=True,
             )
-            if report.get("existing_projects"):
+            existing_hub_projects = set(report.get("existing_projects") or [])
+            if existing_hub_projects:
                 factory_projects = list(dict.fromkeys(factory_projects + list(report["existing_projects"])))
             phases.append({"phase": "preflight", "ok": True})
         else:
+            existing_hub_projects = set(factory_projects)
             phases.append({"phase": "preflight", "ok": True, "local": True})
 
-        # 2. sandbox
-        sb_env = {**sub_base_env, "DRY_RUN": "0" if apply else "1"}
-        if gh_token:
-            sb_env["GITHUB_TOKEN"] = gh_token
-        r_sb = subprocess.run(
-            ["bash", "scripts/setup-sandbox.sh"],
-            cwd=ROOT_DIR,
-            env=sb_env,
-            capture_output=True,
-            text=True,
-        )
-        if r_sb.returncode == 0:
-            phases.append({"phase": "sandbox", "ok": True})
+        # 2. sandbox (skip when SANDBOX_PROJECT is unset or SKIP_SANDBOX=1)
+        if eff_env.get("SANDBOX_PROJECT") and eff_env.get("SKIP_SANDBOX") != "1":
+            sb_env = {**sub_base_env, "DRY_RUN": "0" if apply else "1"}
+            if gh_token:
+                sb_env["GITHUB_TOKEN"] = gh_token
+            r_sb = subprocess.run(
+                ["bash", "scripts/setup-sandbox.sh"],
+                cwd=ROOT_DIR,
+                env=sb_env,
+                capture_output=True,
+                text=True,
+            )
+            if r_sb.returncode == 0:
+                phases.append({"phase": "sandbox", "ok": True})
+            else:
+                phases.append({"phase": "sandbox", "ok": False, "stderr": r_sb.stderr})
+                return {"ok": False, "apply": apply, "phases": phases}
         else:
-            phases.append({"phase": "sandbox", "ok": False, "stderr": r_sb.stderr})
-            return {"ok": False, "apply": apply, "phases": phases}
+            phases.append({"phase": "sandbox", "ok": True, "skipped": True})
 
         # 3. seed_repo
         seed_script = kit_dir / "scripts" / "seed-github-waves.sh"
@@ -228,70 +399,29 @@ def provision_factory(
         phases.append({"phase": "projects", "ok": True})
 
         # 5. identity_and_profile
-        sandbox_project = eff_env.get("SANDBOX_PROJECT", "")
-        worker_sa_name = eff_env.get("WORKER_SA_NAME") or spec.get("infrastructure", {}).get("worker_sa_name") or "agent-worker"
-        control_sa_name = eff_env.get("CONTROL_SA_NAME", "factory-control")
-        deployer_sa_name = eff_env.get("DEPLOYER_SA_NAME", "")
-        runtime_profile = eff_env.get("RUNTIME_PROFILE") or spec.get("infrastructure", {}).get("runtime_profile", "")
+        id_cfg = _resolve_identity_config(spec, eff_env, runtime)
+        control_sa_email = id_cfg["control_sa_email"]
+        runtime_profile = id_cfg["runtime_profile"]
+        vcs = spec.get("vcs", {}) or {}
+        vcs_enabled = vcs.get("enabled", True) is not False and bool(vcs.get("repo") or eff_env.get("GITHUB_REPO"))
+        needs_deployer_sa = scion_factory.deploy_mode(spec) != "none" or _has_gcp_identity_role(spec)
 
-        worker_sa_email = f"{worker_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
-        control_sa_email = f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
-        deployer_sa_email = f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
-
-        if runtime == "kubernetes" and apply:
-            from hub_client import HubAPIError
-
-            id_mode = eff_env.get("GCP_IDENTITY_DEFAULT", "assign")
-            if control_sa_email and not client.find_user(control_sa_email):
+        if apply:
+            if id_cfg["register_sas"] and control_sa_email and not client.find_user(control_sa_email):
                 try:
                     client.request("POST", "/api/v1/users", body={"email": control_sa_email})
                 except HubAPIError as exc:
                     if exc.status not in (403, 409, 422):
                         raise
-
             for pid in (build_pid_id, eval_pid_id):
-                worker_sa_rec = client.register_project_service_account(pid, worker_sa_email, sandbox_project, name=worker_sa_name)
-                worker_sa_uuid = worker_sa_rec.get("id", worker_sa_email)
-                if scion_factory.deploy_mode(spec) != "none" and deployer_sa_name:
-                    client.register_project_service_account(pid, deployer_sa_email, sandbox_project, name=deployer_sa_name)
-
-                patch: dict = {"defaultGCPIdentityMode": id_mode}
-                if id_mode == "assign":
-                    patch["defaultGCPIdentityServiceAccountID"] = worker_sa_uuid
-                if runtime_profile:
-                    patch["activeProfile"] = runtime_profile
-                    if id_mode == "assign":
-                        patch["defaultGCPIdentityServiceAccountIDByProfile"] = {runtime_profile: worker_sa_uuid}
-                client.put_project_settings(pid, patch)
-
-                if control_sa_email:
-                    try:
-                        _, aroles_resp = client.request("GET", f"/api/v1/projects/{pid}/members/assignable-roles")
-                        aroles = aroles_resp.get("items", []) if isinstance(aroles_resp, dict) else (aroles_resp or [])
-                        role_id = next(
-                            (r.get("id") for r in aroles if isinstance(r, dict) and r.get("name") == "project-admin"),
-                            next((r.get("id") for r in aroles if isinstance(r, dict) and r.get("id")), ""),
-                        )
-                        if role_id:
-                            _, cur_m = client.request("GET", f"/api/v1/projects/{pid}/members")
-                            cur_items = cur_m.get("items", []) if isinstance(cur_m, dict) else (cur_m or [])
-                            already = any(
-                                isinstance(m, dict) and control_sa_email in (m.get("principalId"), m.get("email"), m.get("principalEmail"))
-                                for m in cur_items
-                            )
-                            if not already:
-                                client.request(
-                                    "POST",
-                                    f"/api/v1/projects/{pid}/members",
-                                    body={
-                                        "roleDefinitionId": role_id,
-                                        "principalType": "user",
-                                        "principalId": control_sa_email,
-                                    },
-                                )
-                    except HubAPIError as exc:
-                        if exc.status not in (400, 403, 404, 409):
-                            raise
+                _provision_project_identity_and_secrets(
+                    client,
+                    pid,
+                    id_cfg,
+                    gh_token,
+                    vcs_enabled=vcs_enabled,
+                    needs_deployer_sa=needs_deployer_sa,
+                )
         phases.append({"phase": "identity_and_profile", "ok": True})
 
         # 6. shared_dirs_and_kp
@@ -346,7 +476,7 @@ def provision_factory(
         for pid, roles_str in [(build_pid, b_roles), (eval_pid, e_roles)]:
             if not roles_str:
                 continue
-            if not apply and pid not in factory_projects:
+            if not apply and pid not in existing_hub_projects:
                 continue
             cmd_push = [
                 sys.executable,

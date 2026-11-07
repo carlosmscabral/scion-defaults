@@ -1,3 +1,8 @@
+"""Scion Hub REST client for local admin JWTs, Direct IAP transport, and project provisioning.
+
+HubClient wraps the Scion Hub HTTP API with standard-library urllib.
+Setup and provisioning scripts run without external Python packages.
+"""
 import http.client
 import urllib.request
 import urllib.parse
@@ -484,6 +489,41 @@ class HubClient:
                 if attempt + 1 < verify_retries:
                     time.sleep(verify_delay)
         return sa
+
+    def put_project_env(
+        self,
+        project_id: str,
+        key: str,
+        value: str,
+        injection_mode: str = "always",
+    ) -> dict:
+        """Write a project-scoped environment variable to the Hub.
+
+        If injection_mode is 'always', the Hub injects this variable into every container in the project.
+        """
+        enc_key = urllib.parse.quote(key, safe="")
+        enc_pid = urllib.parse.quote(project_id, safe="")
+        body = {"value": value, "injectionMode": injection_mode}
+        return self.request("PUT", f"/api/v1/env/{enc_key}?scope=project&scopeId={enc_pid}", body=body)[1]
+
+    def put_project_secret(
+        self,
+        project_id: str,
+        name: str,
+        raw_value: str,
+        injection_mode: str = "always",
+        secret_type: str = "environment",
+    ) -> dict:
+        """Encode a project-scoped secret as base64 and store it on the Hub.
+
+        The Hub API rejects plain UTF-8 strings on PUT /api/v1/secrets/* with HTTP 400.
+        This method converts raw_value to ASCII base64 before sending the request.
+        """
+        enc_name = urllib.parse.quote(name, safe="")
+        enc_pid = urllib.parse.quote(project_id, safe="")
+        b64_val = base64.b64encode(raw_value.encode("utf-8")).decode("ascii")
+        body = {"value": b64_val, "injectionMode": injection_mode, "type": secret_type}
+        return self.request("PUT", f"/api/v1/secrets/{enc_name}?scope=project&scopeId={enc_pid}", body=body)[1]
 
     def list_agents(self, project_id: str) -> list[dict]:
         res = self.request("GET", f"/api/v1/projects/{project_id}/agents")[1]
