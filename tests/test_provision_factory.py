@@ -223,18 +223,25 @@ def test_scion_factory_provision_monorepo_prefixes_lead_eval_lead_and_schedule(f
     assert "isolated `/workspace` clone" in shared_md
 
 
-def test_build_project_payload_defaults_shared_on_docker_and_per_agent_on_kubernetes():
+def test_build_project_payload_defaults_per_agent_for_git_and_shared_for_non_git_docker():
     import provision_factory
 
     spec = _starter()
-    docker_payload = provision_factory._build_project_payload(spec, "demo", "build_branch", {}, "tok", runtime="docker")
+    docker_git_payload = provision_factory._build_project_payload(spec, "demo", "build_branch", {}, "tok", runtime="docker")
     k8s_payload = provision_factory._build_project_payload(spec, "demo", "build_branch", {}, "tok", runtime="kubernetes")
     override_payload = provision_factory._build_project_payload(
         spec, "demo", "build_branch", {"WORKSPACE_MODE": "shared"}, "tok", runtime="kubernetes"
     )
-    assert docker_payload["workspaceMode"] == "shared"
+    non_git_spec = json.loads(json.dumps(spec))
+    non_git_spec["vcs"]["enabled"] = False
+    non_git_spec["vcs"]["repo"] = ""
+    docker_non_git_payload = provision_factory._build_project_payload(
+        non_git_spec, "demo-local", "build_branch", {}, "", runtime="docker"
+    )
+    assert docker_git_payload["workspaceMode"] == "per-agent"
     assert k8s_payload["workspaceMode"] == "per-agent"
     assert override_payload["workspaceMode"] == "shared"
+    assert docker_non_git_payload.get("workspaceMode") is None or docker_non_git_payload.get("workspaceMode") == "shared"
 
 
 def test_provision_go_waits_for_tmux_session_before_sending_go_message(fake_hub, tmp_path):
