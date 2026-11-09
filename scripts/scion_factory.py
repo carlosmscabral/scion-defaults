@@ -1669,6 +1669,12 @@ FIRESTORE_RULES = """rules_version = '2';
 // use IAM service accounts, which bypass these rules. Deny every client SDK request.
 service cloud.firestore {
   match /databases/{database}/documents {
+    match /factory_fleet/{doc} {
+      allow read, write: if false;
+    }
+    match /factory_fleet_snapshots/{doc} {
+      allow read, write: if false;
+    }
     match /{document=**} {
       allow read, write: if false;
     }

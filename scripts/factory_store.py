@@ -190,6 +190,46 @@ class FirestoreStore:
                 docs.append(decoded)
         return docs
 
+    def get_document(self, collection: str, doc_id: str) -> dict | None:
+        """Fetch and decode a single document. Return None on 404."""
+        try:
+            doc = self._request("GET", f"{self.api}/{self.doc_name(collection, doc_id)}")
+            return from_fields(doc.get("fields", {}))
+        except RuntimeError as err:
+            if "HTTP 404" in str(err):
+                return None
+            raise
+
+    def upsert_document(self, collection: str, doc_id: str, data: dict) -> None:
+        """Upsert a document, replacing entirely. 'REQUEST_TIME' values become server timestamps."""
+        fields = {}
+        transforms = []
+        for k, v in data.items():
+            if v == "REQUEST_TIME":
+                transforms.append({"fieldPath": k, "setToServerValue": "REQUEST_TIME"})
+            else:
+                fields[k] = v
+        writes = [{"update": {"name": self.doc_name(collection, doc_id), "fields": to_fields(fields)}}]
+        if transforms:
+            writes[0]["updateTransforms"] = transforms
+        self.commit(writes)
+
+    def list_documents(self, collection: str) -> list[dict]:
+        """List all documents in a collection, following pagination."""
+        docs = []
+        page_token = None
+        while True:
+            url = f"{self.api}/{self.root}/{collection}?pageSize=300"
+            if page_token:
+                url += f"&pageToken={page_token}"
+            resp = self._request("GET", url)
+            for doc in resp.get("documents", []):
+                docs.append(from_fields(doc.get("fields", {})))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return docs
+
 
 def store_from_env(dry_run: bool = False, project: str | None = None, database: str | None = None) -> FirestoreStore:
     project = project or os.environ.get("FIRESTORE_PROJECT") or os.environ.get("SANDBOX_PROJECT") \

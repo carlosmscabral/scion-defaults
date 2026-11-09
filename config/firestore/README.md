@@ -7,6 +7,8 @@ instance to size, and idle cost is zero. The factory never needs Cloud Spanner.
 |---|---|---|---|
 | `factory_agent_status` | `<project_slug>__<agent_name>` | [`scripts/sync-factory-agents.py`](../../scripts/sync-factory-agents.py) on the Hub VM, every minute | Eval agents, dashboard |
 | `eval_runs` | `<run_id>` | Eval agents, with [`scripts/factory_store.py`](../../scripts/factory_store.py) `put-eval-run` | Eval agents, dashboard |
+| `factory_fleet` | `<slug>` | `scripts/fleet_registry.py` | Control plane |
+| `factory_fleet_snapshots` | `<slug>` | `scripts/fleet_registry.py` | Control plane |
 
 - [`firestore.indexes.json`](firestore.indexes.json): composite indexes. [`setup-sandbox.sh`](../../scripts/setup-sandbox.sh)
   creates them.
