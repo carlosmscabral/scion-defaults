@@ -88,6 +88,13 @@ def test_bananacast_gke_preset_validates_all_roles_antigravity_gemini_4_argon_an
     compiled_spec = scion_factory.load_spec(kit_dir / "factory.yaml")
     jsonschema.validate(compiled_spec, schema)
 
+    # Every compiled role template must configure antigravity-factory, Gemini 4 Argon, and GOOGLE_CLOUD_LOCATION=global (Ruling R5)
+    for role_name in expected_roles:
+        agent_yaml = (kit_dir / "templates" / role_name / "scion-agent.yaml").read_text(encoding="utf-8")
+        assert 'GOOGLE_CLOUD_LOCATION: "global"' in agent_yaml, role_name
+        assert "default_harness_config: antigravity-factory" in agent_yaml, role_name
+        assert 'model: "Gemini 4 Argon"' in agent_yaml, role_name
+
 
 class _MockGitHubAndHubServer:
     """Deterministic local HTTP double for GitHub REST API and Scion Hub API."""
