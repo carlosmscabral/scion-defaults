@@ -336,3 +336,165 @@ def test_watchdog_api_mode_wakes_monorepo_prefixed_lead_and_reads_camel_case_cre
     assert len(alerts) == 1 and alerts[0][0] == "PO_ESCALATION"
 
 
+def test_watchdog_recovers_halted_evicted_specialist_and_lead(fake_hub, fake_firestore, monkeypatch):
+    fake_hub.projects_by_slug = {"demo": {"id": "uuid-demo", "slug": "demo"}}
+    fake_hub.agents_by_project = {
+        "uuid-demo": [
+            {"id": "ag-lead", "slug": "demo-lead", "template": "lead", "phase": "halted", "exit_reason": "evicted"},
+            {"id": "ag-be", "slug": "demo-backend", "template": "backend", "phase": "halted", "exit_reason": "evicted"},
+            {"id": "ag-fe", "slug": "demo-frontend", "template": "frontend", "phase": "stopped"},
+        ]
+    }
+    monkeypatch.setenv("FACTORY_PROJECTS", "demo")
+    client = hub_client.HubClient(base_url=fake_hub.url, token="tok-admin")
+    state = {"restarts": {}, "alerted": {}, "last_user_msg_ts": ""}
+
+    watchdog_mod.run_api_watchdog(client, state, apply=True, runtime="kubernetes", store=fake_firestore)
+
+    start_paths = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
+    assert "/api/v1/projects/uuid-demo/agents/demo-lead/start" in start_paths
+    assert "/api/v1/projects/uuid-demo/agents/demo-backend/start" in start_paths
+    assert "/api/v1/projects/uuid-demo/agents/demo-frontend/start" not in start_paths
+
+
+def test_watchdog_does_not_wake_lead_when_delta_marked_sleeping(fake_hub, fake_firestore, monkeypatch):
+    fake_hub.projects_by_slug = {"demo": {"id": "uuid-demo", "slug": "demo"}}
+    fake_hub.agents_by_project = {
+        "uuid-demo": [
+            {"id": "ag-lead", "slug": "demo-lead", "template": "lead", "phase": "stopped"},
+            {"id": "ag-be", "slug": "demo-backend", "template": "backend", "phase": "halted", "exit_reason": "evicted"},
+        ]
+    }
+    fake_firestore.upsert_document(
+        "factory_control_state",
+        "delta__demo",
+        {"lead_sleeping": True, "idle_since": 1000.0, "last_fingerprint": "fp-idle", "lead_turns_in_epoch": 0},
+    )
+    monkeypatch.setenv("HUB_URL", fake_hub.url)
+    monkeypatch.setenv("SCION_HUB_TOKEN", "tok-admin")
+    monkeypatch.setenv("FACTORY_PROJECTS", "demo")
+    monkeypatch.setenv("WATCHDOG_STATE_BACKEND", "firestore")
+    monkeypatch.setenv("SCION_HOME", "/nonexistent-scion-home")
+    monkeypatch.setattr(factory_store, "store_from_env", lambda dry_run=False, project=None, database=None: fake_firestore)
+    monkeypatch.setattr(sys, "argv", ["factory-watchdog.py", "--apply"])
+
+    watchdog_mod.main()
+
+    start_paths = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
+    assert start_paths == []
+
+    # Once delta controller clears lead_sleeping, watchdog resumes unhealthy/stopped lead & halted child
+    fake_firestore.upsert_document(
+        "factory_control_state",
+        "delta__demo",
+        {"lead_sleeping": False, "idle_since": 0.0, "last_fingerprint": "fp-active", "lead_turns_in_epoch": 1},
+    )
+    watchdog_mod.main()
+    start_paths_after = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
+    assert "/api/v1/projects/uuid-demo/agents/demo-lead/start" in start_paths_after
+    assert "/api/v1/projects/uuid-demo/agents/demo-backend/start" in start_paths_after
+
+
+def test_install_k8s_control_plane_enable_delta_renders_cronjob_and_github_secret(monkeypatch, tmp_path):
+    # Default render includes factory_delta.py in ConfigMap but omits scion-factory-delta CronJob
+    default_manifests = install_k8s.render_manifests(
+        namespace="scion-hub-prod",
+        hub_url="https://hub.example.com",
+        factory_projects="bananacast",
+        sandbox_project="my-sandbox",
+        firestore_project="my-sandbox",
+    )
+    default_cm = next(m for m in default_manifests if m["kind"] == "ConfigMap")
+    assert "factory_delta.py" in default_cm["data"]
+    assert not any(m["kind"] == "CronJob" and m["metadata"]["name"] == "scion-factory-delta" for m in default_manifests)
+
+    # enable_delta=True renders scion-factory-delta CronJob (*/2 * * * *) with expected env + secret ref
+    manifests = install_k8s.render_manifests(
+        namespace="scion-hub-prod",
+        hub_url="https://hub.example.com",
+        factory_projects="bananacast",
+        sandbox_project="my-sandbox",
+        firestore_project="my-sandbox",
+        enable_delta=True,
+        github_repo="duboc/bananacast",
+        issue_label="factory:bananacast-hc1",
+        lead_slug="bananacast-lead",
+        build_branch="factory/gke-hc1",
+        runtime_profile="remote",
+    )
+    delta_cj = next(m for m in manifests if m["kind"] == "CronJob" and m["metadata"]["name"] == "scion-factory-delta")
+    assert delta_cj["spec"]["schedule"] == "*/2 * * * *"
+    container = delta_cj["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    assert container["command"] == ["python3", "/opt/scion-factory/factory_delta.py", "--apply"]
+    env_by_name = {e["name"]: e for e in container["env"]}
+    assert env_by_name["GITHUB_REPO"]["value"] == "duboc/bananacast"
+    assert env_by_name["ISSUE_LABEL"]["value"] == "factory:bananacast-hc1"
+    assert env_by_name["LEAD_SLUG"]["value"] == "bananacast-lead"
+    assert env_by_name["BUILD_BRANCH"]["value"] == "factory/gke-hc1"
+    assert env_by_name["RUNTIME_PROFILE"]["value"] == "remote"
+    assert env_by_name["GITHUB_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "scion-factory-github-auth",
+        "key": "token",
+        "optional": True,
+    }
+
+    # CLI --apply writes scion-factory-github-auth Secret via stdin when GITHUB_TOKEN is set
+    fake_kubectl = tmp_path / "kubectl"
+    fake_kubectl.write_text(
+        "#!/bin/bash\n"
+        "echo \"$@\" >> fake_kubectl.log\n"
+        "cat - >> fake_kubectl_stdin.log\n"
+        "echo '' >> fake_kubectl_stdin.log\n"
+    )
+    fake_kubectl.chmod(0o755)
+    gh_secret_val = "fake-github-token-for-test"
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GITHUB_TOKEN", gh_secret_val)
+    monkeypatch.delenv("SCION_HUB_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "install-k8s-control-plane.py",
+            "--namespace",
+            "scion-hub-prod",
+            "--hub-url",
+            "https://hub.example.com",
+            "--factory-projects",
+            "bananacast",
+            "--sandbox-project",
+            "my-sandbox",
+            "--firestore-project",
+            "my-sandbox",
+            "--enable-delta",
+            "--github-repo",
+            "duboc/bananacast",
+            "--issue-label",
+            "factory:bananacast-hc1",
+            "--lead-slug",
+            "bananacast-lead",
+            "--build-branch",
+            "factory/gke-hc1",
+            "--runtime-profile",
+            "remote",
+            "--apply",
+        ],
+    )
+    old_cwd = os.getcwd()
+    os.chdir(str(tmp_path))
+    try:
+        install_k8s.main()
+    finally:
+        os.chdir(old_cwd)
+
+    kubectl_args = (tmp_path / "fake_kubectl.log").read_text()
+    assert gh_secret_val not in kubectl_args
+    stdin_payload = (tmp_path / "fake_kubectl_stdin.log").read_text()
+    import base64
+
+    assert "scion-factory-github-auth" in stdin_payload
+    assert base64.b64encode(gh_secret_val.encode("utf-8")).decode("ascii") in stdin_payload
+    assert "scion-factory-delta" in stdin_payload
+
+
+

@@ -901,7 +901,26 @@ def install_cron():
 # Main entrypoint
 # ---------------------------------------------------------------------------
 
-def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernetes") -> None:
+def _is_project_lead_sleeping(store, project_slug: str) -> bool:
+    if store is None or not project_slug or not hasattr(store, "get_document"):
+        return False
+    try:
+        doc = store.get_document("factory_control_state", f"delta__{project_slug}")
+    except Exception:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    if "lead_sleeping" in doc:
+        return bool(doc.get("lead_sleeping"))
+    if isinstance(doc.get("state_json"), str):
+        try:
+            return bool(json.loads(doc["state_json"]).get("lead_sleeping"))
+        except Exception:
+            return False
+    return False
+
+
+def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "kubernetes", store=None) -> None:
     alerted = state.get("alerted")
     if isinstance(alerted, list):
         alerted = {k: 0 for k in alerted}
@@ -934,6 +953,8 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
     # Check 3: Agent health + hung subprocess reaping
     for p in projects:
         pid = p.get("id") or p["slug"]
+        proj_slug = p.get("slug") or pid
+        lead_sleeping = _is_project_lead_sleeping(store, proj_slug)
         agents = client.list_agents(pid)
         for a in agents:
             slug = a.get("slug") or a.get("name")
@@ -950,7 +971,9 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
                                 client.exec_agent(pid, slug, ["kill", "-9", str(h["pid"])], timeout=5)
                 except Exception:
                     pass
-            elif phase in ("error", "stopped"):
+            elif phase in ("error", "halted", "stopped"):
+                if lead_sleeping:
+                    continue
                 if phase == "stopped" and not should_wake(slug, a.get("template", "")):
                     continue
                     
@@ -1056,7 +1079,7 @@ def main():
             else:
                 state = {"restarts": {}, "alerted": [], "last_user_msg_ts": ""}
                 
-        run_api_watchdog(client, state, apply=args.apply, runtime=os.environ.get("AGENT_RUNTIME", "kubernetes"))
+        run_api_watchdog(client, state, apply=args.apply, runtime=os.environ.get("AGENT_RUNTIME", "kubernetes"), store=store)
         
         if args.apply:
             if backend == "firestore":
