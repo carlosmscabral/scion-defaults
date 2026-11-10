@@ -415,9 +415,11 @@ Only the deployer writes this file, after every deploy and every rollback. Other
 
 def render_eval_golden_readme(spec: dict[str, Any]) -> str:
     l3 = spec["evaluation_pyramid"]["l3_domain_quality"]
+    proj = spec.get("project") or {}
+    eval_slug = proj.get("eval_slug") or proj.get("slug", "")
     return f"""# Golden data (evaluation team only)
 
-This directory belongs to the evaluation project (`{spec['project']['eval_slug']}`). Copy it into the evaluation
+This directory belongs to the evaluation project (`{eval_slug}`). Copy it into the evaluation
 workspace, never into the build workspace or the build knowledge plane, so the build team can't tune the product to
 the test set.
 

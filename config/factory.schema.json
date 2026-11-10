@@ -19,7 +19,6 @@
       "required": [
         "name",
         "slug",
-        "eval_slug",
         "mission",
         "non_goals"
       ],
@@ -86,8 +85,7 @@
       "then": {
         "required": [
           "repo",
-          "build_branch",
-          "eval_branch"
+          "build_branch"
         ],
         "properties": {
           "repo": {
@@ -328,7 +326,6 @@
       "then": {
         "required": [
           "serving_service",
-          "eval_service",
           "deployer_iam_roles"
         ]
       }
@@ -337,17 +334,16 @@
       "type": "object",
       "required": [
         "heartbeat_mode",
-        "heartbeat_cron",
         "max_wip",
-        "build_roles",
-        "eval_roles"
+        "build_roles"
       ],
       "properties": {
         "heartbeat_mode": {
           "type": "string",
           "enum": [
             "direct-lead",
-            "dedicated-sensor"
+            "dedicated-sensor",
+            "delta"
           ]
         },
         "heartbeat_cron": {
@@ -403,6 +399,23 @@
             "$ref": "#/$defs/role"
           }
         }
+      },
+      "if": {
+        "not": {
+          "required": [
+            "heartbeat_mode"
+          ],
+          "properties": {
+            "heartbeat_mode": {
+              "const": "delta"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "heartbeat_cron"
+        ]
       }
     },
     "evaluation_pyramid": {
@@ -495,32 +508,154 @@
       ]
     }
   },
-  "if": {
-    "not": {
-      "properties": {
-        "infrastructure": {
-          "required": [
-            "deploy"
-          ],
+  "allOf": [
+    {
+      "if": {
+        "not": {
           "properties": {
-            "deploy": {
-              "const": "none"
+            "infrastructure": {
+              "required": [
+                "deploy"
+              ],
+              "properties": {
+                "deploy": {
+                  "const": "none"
+                }
+              }
             }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evaluation_pyramid": {
+            "required": [
+              "l1_health",
+              "l5_latency_slo"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "project"
+        ],
+        "properties": {
+          "project": {
+            "required": [
+              "eval_slug"
+            ],
+            "properties": {
+              "eval_slug": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "team": {
+            "required": [
+              "eval_roles"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "project",
+          "vcs"
+        ],
+        "properties": {
+          "project": {
+            "required": [
+              "eval_slug"
+            ],
+            "properties": {
+              "eval_slug": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "vcs": {
+            "required": [
+              "enabled"
+            ],
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "vcs": {
+            "required": [
+              "eval_branch"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "allOf": [
+          {
+            "required": [
+              "project"
+            ],
+            "properties": {
+              "project": {
+                "required": [
+                  "eval_slug"
+                ],
+                "properties": {
+                  "eval_slug": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "infrastructure": {
+                  "required": [
+                    "deploy"
+                  ],
+                  "properties": {
+                    "deploy": {
+                      "const": "none"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "infrastructure": {
+            "required": [
+              "eval_service"
+            ]
           }
         }
       }
     }
-  },
-  "then": {
-    "properties": {
-      "evaluation_pyramid": {
-        "required": [
-          "l1_health",
-          "l5_latency_slo"
-        ]
-      }
-    }
-  },
+  ],
   "$defs": {
     "role": {
       "type": "object",

@@ -75,7 +75,7 @@ def test_library_role_entry_contents():
 def test_role_def_structure_and_counts():
     assert len(role_library.ALWAYS_BUILD) == 6
     assert len(role_library.ALWAYS_EVAL) == 2
-    assert len(role_library.ROLES) == 23
+    assert len(role_library.ROLES) == 24
     for r, d in role_library.ROLES.items():
         assert "team" in d
         assert "kind" in d
@@ -126,4 +126,34 @@ def test_lead_protocol_covers_coupled_co_commits_and_pending_patch_escalation():
     assert "decision rights" in proto.lower()
     assert "status:po-decision" not in proto  # VCS-agnostic: non-Git kits escalate via message, Git kits via PO inbox
 
+
+def test_evaluator_role_in_library_supports_service_and_deploy_none():
+    entry = role_library.library_role_entry("evaluator")
+    assert entry["role"] == "evaluator"
+    assert entry["harness"] == "antigravity"
+    assert entry["model"] == "Gemini 4 Argon"
+    assert entry["responsibility"].strip()
+
+    role_def = role_library.ROLES["evaluator"]
+    assert role_def["team"] == "build"
+    assert role_def["kind"] == "catalog"
+    assert role_def["default_kind"] == "evaluator"
+    assert role_def["needs_service"] is False
+
+    proto_service = role_library.role_protocol("evaluator", deploy="service")
+    proto_none = role_library.role_protocol("evaluator", deploy="none")
+    assert proto_service is not None and proto_none is not None
+    assert proto_service != proto_none
+
+    for proto in (proto_service, proto_none):
+        low = proto.lower()
+        assert "l1" in low and "l5" in low
+        assert "evidence" in low and "issue" in low
+        assert "pass" in low and "fail" in low
+        assert "lead" in low
+        assert "timeout" in low or "testclient" in low or "test_client" in low
+
+    assert "<build_branch>" in proto_none
+    for forbidden in ("user journeys", "payload validation", "cloud run", "health endpoint", "latency", "for the service"):
+        assert forbidden not in proto_none.lower(), forbidden
 
