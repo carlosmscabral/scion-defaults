@@ -2925,6 +2925,32 @@ def main(argv: list[str] | None = None) -> int:
     p_prov.add_argument("--go", action="store_true")
     p_prov.add_argument("--json", action="store_true")
 
+    p_gke_up = sub.add_parser("gke-up", help="One-command cold-start GKE Hub setup, kit compile, and factory provisioning")
+    p_gke_up.add_argument("spec_path", type=str, help="Path to factory.yaml")
+    p_gke_up.add_argument("--env", type=str, required=True, help="Path to factory.env (updated in place on --apply)")
+    p_gke_up.add_argument("--kit", type=str, default=None, help="Output directory for compiled kit (default: build/kit-<slug>)")
+    p_gke_up.add_argument("--create-project", action="store_true", help="Create HUB_PROJECT, link billing, and bootstrap VPC/APIs")
+    p_gke_up.add_argument("--scion-repo", type=str, default=None, help="Optional local Scion source checkout")
+    p_gke_up.add_argument("--apply", action="store_true", help="Execute live provisioning (default: dry-run)")
+    p_gke_up.add_argument("--dry-run", action="store_true", help="Run in dry-run mode without mutating cloud state")
+    p_gke_up.add_argument("--go", action="store_true", help="Send initial GO message after provisioning")
+    p_gke_up.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_gke_down = sub.add_parser(
+        "gke-down",
+        help="Archive GKE pod logs/transcripts, write scorecard.json, clean GitHub test artifacts, and optionally delete project",
+    )
+    p_gke_down.add_argument("spec_path", type=str, help="Path to factory.yaml")
+    p_gke_down.add_argument("--env", type=str, required=True, help="Path to factory.env")
+    p_gke_down.add_argument("--backup-root", type=str, default=None, help="Root directory for <project>-<ts> archive")
+    p_gke_down.add_argument("--cleanup-issue-label", type=str, default="", help="Close open GitHub test issues carrying this label")
+    p_gke_down.add_argument("--cleanup-branch", type=str, default="", help="Delete this remote GitHub test branch")
+    p_gke_down.add_argument("--delete-project", action="store_true", help="Delete HUB_PROJECT via gcloud projects delete --quiet")
+    p_gke_down.add_argument("--confirm-project", type=str, default="", help="Confirm deletion of a non-ephemeral HUB_PROJECT")
+    p_gke_down.add_argument("--apply", action="store_true", help="Execute archive, cleanup, and optional project deletion")
+    p_gke_down.add_argument("--dry-run", action="store_true", help="Preview teardown actions without mutating state")
+    p_gke_down.add_argument("--json", action="store_true", help="Output JSON")
+
     p_role = sub.add_parser("add-role", help="Add a library specialist (for example one discovery proposed) to a FactorySpec")
     p_role.add_argument("spec_path", help="Path to factory.yaml")
     p_role.add_argument("--role", required=True, help="Library role, e.g. security-auditor")
@@ -3014,6 +3040,57 @@ def main(argv: list[str] | None = None) -> int:
             for p in report["phases"]:
                 print(f"Phase {p['phase']}: {'OK' if p.get('ok') else 'SKIP'}")
         return 0 if report["ok"] else 1
+
+    if args.cmd == "gke-up":
+        import gke_lifecycle
+        eff_apply = bool(args.apply) and not bool(args.dry_run)
+        report = gke_lifecycle.gke_up(
+            args.spec_path,
+            env_file=args.env,
+            kit_dir=args.kit,
+            create_project=args.create_project,
+            scion_repo=args.scion_repo,
+            apply=eff_apply,
+            send_go=args.go,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(
+                f"gke-up ({'apply' if report.get('apply') else 'dry-run'}): ok={report.get('ok')} "
+                f"total={report.get('total_sec')}s (setup={report.get('setup_gke_sec')}s, "
+                f"compile={report.get('compile_sec')}s, provision={report.get('provision_sec')}s)"
+            )
+        return 0 if report.get("ok") else 1
+
+    if args.cmd == "gke-down":
+        import gke_lifecycle
+        eff_apply = bool(args.apply) and not bool(args.dry_run)
+        try:
+            report = gke_lifecycle.gke_down(
+                args.spec_path,
+                env_file=args.env,
+                backup_root=args.backup_root,
+                cleanup_issue_label=args.cleanup_issue_label,
+                cleanup_branch=args.cleanup_branch,
+                delete_project=args.delete_project,
+                confirm_project=args.confirm_project,
+                apply=eff_apply,
+            )
+        except ValueError as err:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(err)}, indent=2))
+            else:
+                print(f"error: {err}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(
+                f"gke-down ({'apply' if report.get('apply') else 'dry-run'}): ok={report.get('ok')} "
+                f"backup_dir={report.get('backup_dir')}"
+            )
+        return 0 if report.get("ok") else 1
 
     if args.cmd == "add-role":
         before = load_spec(args.spec_path)
