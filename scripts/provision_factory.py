@@ -485,7 +485,11 @@ def provision_factory(
             poll_sec = float(eff_env.get("AGENT_START_POLL_SEC", "2.0"))
             harness_auth = eff_env.get("HARNESS_AUTH", "vertex-ai" if runtime == "kubernetes" else "")
             lead_name = scion_factory._agent(spec, "lead")
-            build_kp_index = f"{scion_factory._ws(spec)}/knowledge-plane/INDEX.md"
+            build_kp_index = (
+                "/scion-volumes/knowledge-plane/INDEX.md"
+                if runtime == "kubernetes"
+                else f"{scion_factory._ws(spec)}/knowledge-plane/INDEX.md"
+            )
             vcs = spec.get("vcs", {}) or {}
             vcs_enabled = vcs.get("enabled", True) is not False and bool(vcs.get("repo") or eff_env.get("GITHUB_REPO"))
 

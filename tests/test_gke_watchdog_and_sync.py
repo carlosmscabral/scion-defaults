@@ -383,7 +383,8 @@ def test_watchdog_does_not_wake_lead_when_delta_marked_sleeping(fake_hub, fake_f
     start_paths = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
     assert start_paths == []
 
-    # Once delta controller clears lead_sleeping, watchdog resumes unhealthy/stopped lead & halted child
+    # Once delta controller clears lead_sleeping, watchdog resumes unhealthy/stopped lead ONLY
+    # and leaves halted/error non-lead specialists for factory_delta.py's */2 ABNORMAL_CHILDREN path.
     fake_firestore.upsert_document(
         "factory_control_state",
         "delta__demo",
@@ -392,7 +393,7 @@ def test_watchdog_does_not_wake_lead_when_delta_marked_sleeping(fake_hub, fake_f
     watchdog_mod.main()
     start_paths_after = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
     assert "/api/v1/projects/uuid-demo/agents/demo-lead/start" in start_paths_after
-    assert "/api/v1/projects/uuid-demo/agents/demo-backend/start" in start_paths_after
+    assert "/api/v1/projects/uuid-demo/agents/demo-backend/start" not in start_paths_after
 
 
 def test_install_k8s_control_plane_enable_delta_renders_cronjob_and_github_secret(monkeypatch, tmp_path):

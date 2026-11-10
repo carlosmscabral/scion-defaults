@@ -302,7 +302,15 @@ def _resolve_lead_slug(project_slug: str, explicit_lead_slug: str, agents: list[
     return "lead"
 
 
-def _wait_for_tmux(client: HubClient, pid: str, slug: str, wait_sec: float = 30.0, poll_sec: float = 1.0) -> bool:
+def _wait_for_tmux(
+    client: HubClient,
+    pid: str,
+    slug: str,
+    wait_sec: float | None = None,
+    poll_sec: float = 1.0,
+) -> bool:
+    if wait_sec is None:
+        wait_sec = float(os.environ.get("DELTA_TMUX_WAIT_SEC", "90.0"))
     deadline = time.time() + max(wait_sec, 0.1)
     while True:
         try:
@@ -496,7 +504,23 @@ def run_delta_tick(
                     force_resume=True,
                 )
 
-            _wait_for_tmux(client, pid, resolved_lead)
+            if not _wait_for_tmux(client, pid, resolved_lead):
+                if rotated_lead:
+                    _save_delta_state(store, project_slug, state)
+                return {
+                    "project_slug": project_slug,
+                    "lead_slug": resolved_lead,
+                    "action": "waiting_for_tmux",
+                    "woke_lead": False,
+                    "rotated_lead": rotated_lead,
+                    "auto_slept": False,
+                    "fingerprint": fingerprint,
+                    "actionable_count": len(actionable),
+                    "po_replies_count": len(po_replies),
+                    "waiting_po_count": len(classified["waiting_po"]),
+                    "abnormal_children_count": len(abnormal_children),
+                }
+
             msg = _format_delta_message(classified, abnormal_children, rotated=rotated_lead)
             client.request(
                 "POST",

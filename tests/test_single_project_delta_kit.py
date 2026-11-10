@@ -316,6 +316,25 @@ def test_compiled_delta_kit_uses_issue_branches_direct_reviewer_handoff_agent_co
     assert "before" in lead_prompt.lower() and "status:po-decision" in lead_prompt
     assert "state-change" in lead_prompt and "COMPLETED" in lead_prompt
 
+    # 5. Knowledge-plane shared-dir path first + conditional kp-check.py on K8s/delta
+    for text in (shared_agents, lead_prompt, backend_prompt, reviewer_prompt, evaluator_prompt):
+        assert "/scion-volumes/knowledge-plane/INDEX.md" in text
+        assert "/workspace/knowledge-plane/INDEX.md" in text
+    assert "writable" in shared_agents and "kp-check.py" in shared_agents
+
+    # 6. Specialist fresh-pod resume fallback checking STATE.json and briefs/* before going idle
+    for sp_prompt in (backend_prompt, reviewer_prompt, evaluator_prompt):
+        loop_sec = sp_prompt.split("## Operating Loop\n", 1)[1]
+        assert "/scion-volumes/scratchpad/STATE.json" in loop_sec
+        assert "/scion-volumes/scratchpad/briefs/" in loop_sec
+        assert "origin/factory/issue-" in loop_sec
+
+    # 7. Delta daily digest rule creates missing digest issue directly instead of opening status:po-decision
+    digest_sec = lead_prompt.split("## Daily digest\n", 1)[1].split("\n## ", 1)[0]
+    assert "gh issue create" in digest_sec
+    assert "--label digest --label factory:bananacast-hc1" in digest_sec
+    assert "scripts/seed-github-waves.sh" not in digest_sec
+
 
 def test_legacy_two_project_spec_compiles_unchanged(tmp_path):
     starter = scion_factory.load_spec(ROOT / "presets" / "starter-service.factory.yaml")

@@ -901,23 +901,29 @@ def install_cron():
 # Main entrypoint
 # ---------------------------------------------------------------------------
 
-def _is_project_lead_sleeping(store, project_slug: str) -> bool:
+def _project_delta_status(store, project_slug: str) -> tuple[bool, bool]:
     if store is None or not project_slug or not hasattr(store, "get_document"):
-        return False
+        return False, False
     try:
         doc = store.get_document("factory_control_state", f"delta__{project_slug}")
     except Exception:
-        return False
+        return False, False
     if not isinstance(doc, dict):
-        return False
+        return False, False
     if "lead_sleeping" in doc:
-        return bool(doc.get("lead_sleeping"))
+        return True, bool(doc.get("lead_sleeping"))
     if isinstance(doc.get("state_json"), str):
         try:
-            return bool(json.loads(doc["state_json"]).get("lead_sleeping"))
+            parsed = json.loads(doc["state_json"])
+            if isinstance(parsed, dict):
+                return True, bool(parsed.get("lead_sleeping"))
         except Exception:
-            return False
-    return False
+            pass
+    return True, False
+
+
+def _is_project_lead_sleeping(store, project_slug: str) -> bool:
+    return _project_delta_status(store, project_slug)[1]
 
 
 def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "kubernetes", store=None) -> None:
@@ -954,7 +960,7 @@ def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "k
     for p in projects:
         pid = p.get("id") or p["slug"]
         proj_slug = p.get("slug") or pid
-        lead_sleeping = _is_project_lead_sleeping(store, proj_slug)
+        delta_active, lead_sleeping = _project_delta_status(store, proj_slug)
         agents = client.list_agents(pid)
         for a in agents:
             slug = a.get("slug") or a.get("name")
@@ -974,7 +980,10 @@ def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "k
             elif phase in ("error", "halted", "stopped"):
                 if lead_sleeping:
                     continue
-                if phase == "stopped" and not should_wake(slug, a.get("template", "")):
+                is_lead_role = should_wake(slug, a.get("template", ""))
+                if delta_active and not is_lead_role:
+                    continue
+                if phase == "stopped" and not is_lead_role:
                     continue
                     
                 key = f"{pid}/{slug}"

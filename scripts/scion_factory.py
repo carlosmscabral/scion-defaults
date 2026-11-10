@@ -1218,11 +1218,23 @@ deployer, and no agent deploys anything. {grader} (section 7).
 """
 
     header_slugs = f"`{proj['slug']}` & `{proj['eval_slug']}`" if has_eval else f"`{proj['slug']}`"
-    kp_reader_line = (
-        f"- Build agents read `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`."
-        if has_eval
-        else "- Every agent reads `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, evaluating, or deploying."
-    )
+    use_shared_kp = runtime_mode(spec) == "kubernetes" or is_delta
+    if use_shared_kp:
+        kp_reader_line = (
+            f"- Build agents check `{kp.EVAL_KP_MOUNT}/INDEX.md` first (with fallback `/workspace/knowledge-plane/INDEX.md`) before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`."
+            if has_eval
+            else f"- Every agent checks `{kp.EVAL_KP_MOUNT}/INDEX.md` first (with fallback `/workspace/knowledge-plane/INDEX.md`) before planning, implementing, reviewing, evaluating, or deploying."
+        )
+        kp_check_line = (
+            "- Run `python3 /workspace/knowledge-plane/kp-check.py` only when `/workspace/knowledge-plane/kp-check.py` is writable in Git (skip when reading the mounted `/scion-volumes/knowledge-plane` shared-dir), and fix every problem it reports."
+        )
+    else:
+        kp_reader_line = (
+            f"- Build agents read `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`."
+            if has_eval
+            else "- Every agent reads `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, evaluating, or deploying."
+        )
+        kp_check_line = "- After you change the knowledge plane, run `python3 /workspace/knowledge-plane/kp-check.py` and fix every problem it reports."
     delta_comm_note = (
         "\n- **Ignore bare `state-change` (`COMPLETED`) notifications:** If woken solely by a bare system `state-change` "
         "(`COMPLETED`) event with no `DELTA:` payload or actionable peer message, run zero shell commands and immediately "
@@ -1246,7 +1258,7 @@ Every agent in this Scion software factory MUST follow these operational rules (
 - Open files through the paths in the index. Never guess a file name.
 - Cite `REQ-` and `ADR-` IDs in work items, reviews, and evaluation results. Record new decisions with `knowledge-plane/adr/_template.md`.
 - {live_rule} Evaluation golden datasets never go into the build knowledge plane.
-- After you change the knowledge plane, run `python3 /workspace/knowledge-plane/kp-check.py` and fix every problem it reports.
+{kp_check_line}
 
 {backlog}
 {integrate}
@@ -1395,6 +1407,11 @@ def _render_role_protocol(spec: dict[str, Any], role_spec: dict[str, Any]) -> st
     protocol = role_library.role_protocol(lib_role, deploy_mode(spec), wake_mode=wmode) if lib_role else None
     if not protocol:
         return ""
+    if runtime_mode(spec) == "kubernetes" or wmode == "delta":
+        protocol = protocol.replace(
+            "Run `python3 <knowledge plane>/kp-check.py`",
+            "When `<knowledge plane>/kp-check.py` is writable in Git, run `python3 <knowledge plane>/kp-check.py`",
+        )
     protocol = protocol.replace("<knowledge plane>", f"{_ws(spec)}/knowledge-plane")
     protocol = protocol.replace("factory:<slug>", _factory_label(spec))
     if "<build_branch>" in protocol or wmode == "delta":
@@ -1668,6 +1685,15 @@ Autonomy level: `{level}` (`team.autonomy` in factory.yaml; changing it means re
         if is_delta
         else ""
     )
+    missing_digest_bullet = (
+        f'- If `$n` is empty, create the digest issue yourself rather than opening a `status:po-decision` blocker:\n'
+        f'  `gh issue create -R {repo} --title "{digest}" --label digest --label {flabel} --body "<!-- scion-agent: {lead} -->\\nDaily digest for {flabel}."`'
+        if is_delta
+        else (
+            "- If `$n` is empty, the digest issue is missing: open a PO inbox issue asking the PO to run\n"
+            "  `DRY_RUN=0 scripts/seed-github-waves.sh` from the kit, and skip the digest until it exists."
+        )
+    )
     text = rights + f"""
 ## PO inbox
 A decision in the "Waits for the PO" column becomes one GitHub issue, and the PO answers on it.
@@ -1681,8 +1707,7 @@ A decision in the "Waits for the PO" column becomes one GitHub issue, and the PO
 ## Daily digest
 Once a day (UTC), add one comment to the pinned issue "{digest}" (labels `digest` and `{flabel}`):
 - `n=$(gh issue list -R {repo} --label digest --label {flabel} --state open --search "\\"{digest}\\" in:title" --json number --jq '.[0].number // empty')`
-- If `$n` is empty, the digest issue is missing: open a PO inbox issue asking the PO to run
-  `DRY_RUN=0 scripts/seed-github-waves.sh` from the kit, and skip the digest until it exists.
+{missing_digest_bullet}
 - Start the comment with the line `[{lead} digest <YYYY-MM-DD>]` (UTC date; the brackets keep one lead's line from
   matching another's). Post only when today's line isn't there yet, so frequent wake-ups don't repeat it:
   `gh issue view "$n" -R {repo} --comments | grep -qF "[{lead} digest $(date -u +%F)]" || gh issue comment "$n" -R {repo} --body-file /scion-volumes/scratchpad/digest-$(date -u +%F).md`
@@ -1763,7 +1788,13 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
 4. **L4 Safety & Grounding:** {'; '.join(pyramid['l4_safety_grounding']['invariants'])}
 5. **L5 Latency SLO:** `p50 <= {l5.get('p50_ms', 100)}ms`, `p95 <= {l5['p95_ms']}ms`, `p99 <= {l5.get('p99_ms', 500)}ms`"""
     vcs = spec.get("vcs") or {}
-    kp_index = f"{kp.EVAL_KP_MOUNT}/INDEX.md" if is_eval else "/workspace/knowledge-plane/INDEX.md"
+    use_shared_kp = runtime_mode(spec) == "kubernetes" or is_delta
+    if is_eval:
+        kp_ref = f"`{kp.EVAL_KP_MOUNT}/INDEX.md`"
+    elif use_shared_kp:
+        kp_ref = f"`{kp.EVAL_KP_MOUNT}/INDEX.md` (fallback `/workspace/knowledge-plane/INDEX.md`)"
+    else:
+        kp_ref = "`/workspace/knowledge-plane/INDEX.md`"
     team = (spec["team"].get("eval_roles") or []) if is_eval else spec["team"]["build_roles"]
     lead_role = _team_lead(team, "eval-lead" if is_eval else "lead")
     lead = _agent(spec, lead_role)
@@ -1796,7 +1827,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
             steps = [
                 "If woken solely by a bare system `state-change` (`COMPLETED`) notification with no `DELTA:` payload "
                 "and no actionable peer message, run **zero** shell commands and exit immediately.",
-                f"Read `/scion-volumes/scratchpad/STATE.json`, `{kp_index}`, and the incoming `DELTA:` or peer message "
+                f"Read `/scion-volumes/scratchpad/STATE.json`, {kp_ref}, and the incoming `DELTA:` or peer message "
                 f"(reconcile against {intake} or `--label status:po-decision --label {_factory_label(spec)}` when needed).",
                 "Size active issues, write briefs to `/scion-volumes/scratchpad/briefs/<N>-<agent>.md`, update "
                 "`/scion-volumes/scratchpad/STATE.json`, and start **only** the specialists required by active issues "
@@ -1810,19 +1841,19 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
             ]
             loop = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
         elif kind == "reviewer":
-            loop = f"""1. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (or a brief in `{BRIEFS_DIR}/<N>-{my_slug}.md`).
-2. Read `{kp_index}`, fetch `origin/{branch}` and `origin/factory/issue-<N>`, inspect `git diff origin/{branch}...origin/factory/issue-<N>`, and run `{stack['test_command']}` independently (never change product code).
+            loop = f"""1. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (or a brief in `{BRIEFS_DIR}/<N>-{my_slug}.md`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress review assignment on `origin/factory/issue-<N>` before going idle.
+2. Read {kp_ref}, fetch `origin/{branch}` and `origin/factory/issue-<N>`, inspect `git diff origin/{branch}...origin/factory/issue-<N>`, and run `{stack['test_command']}` independently (never change product code).
 3. On the first `FAIL`, message the writer directly with concrete `file:line` fixes (`{lead}` is NOT woken).
 4. On `PASS` (or second `FAIL`), write `{REPORTS_DIR}/<N>-review.md` and wake `{lead}` once with the verdict and commit SHA."""
         elif _role_writes(role_spec) and kind != "deployer":
-            loop = f"""1. Take work only from the brief file named in `{lead}`'s message (or a first-attempt `FAIL` fix request from `{reviewer_slug}`); never pick work from the backlog yourself.
-2. Read `{kp_index}` and the requirements and ADRs that the brief cites.
+            loop = f"""1. Take work from the brief file named in `{lead}`'s message (or a first-attempt `FAIL` fix request from `{reviewer_slug}`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Branch `factory/issue-<N>` from `origin/{branch}` (`git fetch origin {branch} && git checkout -B factory/issue-<N> origin/{branch}`) and implement your changes {how}, honoring `templates/_shared/agents.md`.
 4. Verify locally with `{stack['build_command']}` and `{stack['test_command']}`, stage explicit paths (`git add -- <files>`), commit, and push `origin/factory/issue-<N>` directly (no scratchpad `.patch` files, no commit-slot wait).
 5. Message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>)"`) without waking `{lead}`."""
         else:
-            loop = f"""1. Take work only from the brief file named in `{lead}`'s message; never pick work from the backlog yourself.
-2. Read `{kp_index}` and the requirements and ADRs that the brief cites.
+            loop = f"""1. Take work from the brief file named in `{lead}`'s message; if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Do your role {how} on `{branch}`, honoring `templates/_shared/agents.md` (never change product code).
 4. Write structured verification output to `{REPORTS_DIR}/<N>-eval.md` (or the report path in your brief) and prepend `<!-- scion-agent: {my_slug} -->` to any GitHub evidence comment.
 5. Report `PASS` or `FAIL` with the report path to `{lead}`."""
@@ -1835,7 +1866,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
                 "   Act on each answered issue. For one without a PO answer for 24 hours, comment a reminder on it and\n"
                 "   re-send `scion message user:<PO_USER>` with the issue URL. Once a day, post the digest (see Daily digest).")
         steps += [
-            f"Read `{kp_index}` and the requirements and ADRs that the work item cites.",
+            f"Read {kp_ref} and the requirements and ADRs that the work item cites.",
             "Size the work item, brief your team by file and accept their results (see Chain of command) while honoring\n"
             "   `templates/_shared/agents.md`. Never implement it yourself.",
             f"Before you give the {slot} or mark the work verified, check the evidence: `{stack['test_command']}` passes and\n"
@@ -1848,7 +1879,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
         result = write_step if _role_writes(role_spec) else (
             "You never change product code: write your result (report, verdict or measurement) where the brief says.")
         loop = f"""1. Take work only from the brief file named in `{lead}`'s message; never pick work from the backlog yourself.
-2. Read `{kp_index}` and the requirements and ADRs that the brief cites.
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Do your role {how}, honoring `templates/_shared/agents.md`.
 4. {result}
 5. Report the result's path and a one-line result only to `{lead}`."""

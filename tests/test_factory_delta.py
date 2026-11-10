@@ -115,7 +115,8 @@ class _DeltaHubHandler(BaseHTTPRequestHandler):
 
         m_exec = re.match(r"^/api/v1/projects/([^/]+)/agents/([^/]+)/exec$", self.path)
         if m_exec:
-            self._send_json(200, {"exitCode": 0, "output": ""})
+            code = getattr(self.server, "exec_exit_code", 0)
+            self._send_json(200, {"exitCode": code, "output": ""})
             return
 
         m_msg = re.match(r"^/api/v1/projects/([^/]+)/agents/([^/]+)/message$", self.path)
@@ -532,3 +533,80 @@ def test_github_fetcher_stdlib_and_cli_dry_run_never_leak_token(delta_hub):
     finally:
         gh_srv.shutdown()
         gh_srv.server_close()
+
+
+def test_delta_tick_waits_for_tmux_90s_default_and_defers_delivery_when_tmux_not_ready(delta_hub, monkeypatch):
+    store = FakeDeltaStore()
+    store.upsert_document(
+        "factory_control_state",
+        "delta__bananacast",
+        {"last_fingerprint": "fp-prev", "idle_since": 0.0, "lead_sleeping": True, "lead_turns_in_epoch": 2},
+    )
+    delta_hub.agents["uuid-bc"]["bananacast-lead"] = {
+        "id": "id-lead",
+        "slug": "bananacast-lead",
+        "name": "bananacast-lead",
+        "template": "lead",
+        "phase": "stopped",
+    }
+    issues = [
+        {
+            "number": 31,
+            "title": "Fix slow monorepo checkout race",
+            "labels": [{"name": "factory:bananacast-hc1"}, {"name": "status:ready"}],
+            "comments": 0,
+        }
+    ]
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-admin")
+
+    # 1. Verify default wait_sec is 90.0 when DELTA_TMUX_WAIT_SEC is unset
+    seen_deadlines: list[float] = []
+    fake_clock = [1000.0]
+    monkeypatch.delenv("DELTA_TMUX_WAIT_SEC", raising=False)
+    monkeypatch.setattr(factory_delta.time, "time", lambda: fake_clock[0])
+
+    def advance_clock(sec: float) -> None:
+        fake_clock[0] += float(sec)
+
+    monkeypatch.setattr(factory_delta.time, "sleep", advance_clock)
+    delta_hub.exec_exit_code = 1
+    assert factory_delta._wait_for_tmux(client, "uuid-bc", "bananacast-lead", poll_sec=30.0) is False
+    seen_deadlines.append(fake_clock[0] - 1000.0)
+    assert seen_deadlines[0] >= 90.0
+
+    # 2. When _wait_for_tmux returns False, run_delta_tick returns action="waiting_for_tmux", posts NO message, and keeps fingerprint/turns
+    monkeypatch.setenv("DELTA_TMUX_WAIT_SEC", "0.05")
+    res_wait = factory_delta.run_delta_tick(
+        client,
+        store,
+        project_slug="bananacast",
+        lead_slug="bananacast-lead",
+        apply=True,
+        now=2000.0,
+        github_fetcher=lambda *_: (issues, {}),
+    )
+    assert res_wait["action"] == "waiting_for_tmux"
+    assert res_wait["woke_lead"] is False
+    assert len(delta_hub.messages) == 0
+    saved_wait = store.get_document("factory_control_state", "delta__bananacast")
+    assert saved_wait["last_fingerprint"] == "fp-prev"
+    assert saved_wait["lead_turns_in_epoch"] == 2
+
+    # 3. Next */2 tick when tmux is ready delivers DELTA: and advances last_fingerprint and lead_turns_in_epoch
+    delta_hub.exec_exit_code = 0
+    res_ok = factory_delta.run_delta_tick(
+        client,
+        store,
+        project_slug="bananacast",
+        lead_slug="bananacast-lead",
+        apply=True,
+        now=2120.0,
+        github_fetcher=lambda *_: (issues, {}),
+    )
+    assert res_ok["woke_lead"] is True
+    assert len(delta_hub.messages) == 1
+    assert "#31" in delta_hub.messages[0]["body"]["message"]
+    saved_ok = store.get_document("factory_control_state", "delta__bananacast")
+    assert saved_ok["last_fingerprint"] == res_ok["fingerprint"]
+    assert saved_ok["lead_turns_in_epoch"] == 3
+

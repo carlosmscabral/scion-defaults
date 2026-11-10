@@ -445,6 +445,12 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     assert out["factory_projects"] == [build_pid]
     assert fake_hub.agents_by_project[build_pid] == ["lead"]
     assert all("eval-lead" not in agents for agents in fake_hub.agents_by_project.values())
+    lead_posts = [
+        json.loads(r["body"].decode("utf-8"))
+        for r in fake_hub.requests
+        if r["method"] == "POST" and r["path"] == f"/api/v1/projects/{build_pid}/agents"
+    ]
+    assert "/scion-volumes/knowledge-plane/INDEX.md" in lead_posts[0]["task"]
 
     # 2. Cloud telemetry env configured on GKE apply (HUB_PROJECT fallback to SANDBOX_PROJECT)
     env_puts = {}
