@@ -153,12 +153,20 @@ class _MockGitHubAndHubServer:
                 if path == "/repos/duboc/bananacast/issues":
                     qs = urllib.parse.parse_qs(parsed.query)
                     want_label = (qs.get("labels") or [""])[0]
-                    parent.issue_poll_count += 1
+                    seeded_task_count = sum(
+                        1
+                        for iss in parent.issues.values()
+                        if iss["number"] != parent.po_issue_num
+                        and "digest" not in {l["name"] for l in iss.get("labels") or []}
+                    )
+                    if seeded_task_count > 0:
+                        parent.issue_poll_count += 1
 
-                    # Advance Wave issues to status:verified on poll >= 2
+                    # Advance Wave issues to status:verified on poll >= 2 (never touch digest or PO drill issues)
                     if parent.issue_poll_count >= 2:
                         for num, iss in parent.issues.items():
-                            if num != parent.po_issue_num:
+                            cur_lbls = {l["name"] for l in iss["labels"]}
+                            if num != parent.po_issue_num and "digest" not in cur_lbls:
                                 lbls = [l["name"] for l in iss["labels"] if not l["name"].startswith("status:")]
                                 lbls.append("status:verified")
                                 iss["labels"] = [{"name": n} for n in lbls]
@@ -389,11 +397,23 @@ def test_run_hillclimb_wave_dry_run_and_mocked_lifecycle_preserves_main_and_runs
             )
             if srv.mutate_main_on_teardown:
                 srv.branch_shas["main"] = "9999999999999999999999999999999999999999"
+            bdir = tmp_path / "backup-hc"
+            if kwargs.get("apply"):
+                bdir.mkdir(parents=True, exist_ok=True)
+                sc_init = {
+                    "ok": True,
+                    "apply": True,
+                    "hub_project": parsed_env.get("HUB_PROJECT", ""),
+                    "backup_dir": str(bdir),
+                    "metrics": {"totals": {"input_tokens": 0}},
+                }
+                (bdir / "scorecard.json").write_text(json.dumps(sc_init), encoding="utf-8")
             return {
                 "ok": True,
                 "apply": bool(kwargs.get("apply")),
                 "hub_project": parsed_env.get("HUB_PROJECT", ""),
-                "backup_dir": str(tmp_path / "backup-hc"),
+                "backup_dir": str(bdir),
+                "metrics": {"totals": {"input_tokens": 0}},
                 "project_deleted": bool(kwargs.get("apply") and kwargs.get("delete_project")),
             }
 
@@ -456,6 +476,25 @@ def test_run_hillclimb_wave_dry_run_and_mocked_lifecycle_preserves_main_and_runs
                             ]
                         }
                     return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(pods), stderr="")
+                if "exec" in cmd:
+                    joined = " ".join(cmd)
+                    if "find /home/scion/.gemini" in joined:
+                        # Only report live transcript during PO drill after PO reply so idle soak sees 0 additional steps
+                        if srv.po_reply_posted and srv.po_polls_after_reply == 1:
+                            return subprocess.CompletedProcess(
+                                cmd,
+                                0,
+                                stdout="/home/scion/.gemini/jetski/brain/conv-po/.system_generated/logs/transcript_full.jsonl\n",
+                                stderr="",
+                            )
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    if "transcript_full.jsonl" in joined:
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            stdout='{"type":"PLANNER_RESPONSE","input_tokens":333,"output_tokens":44}\n',
+                            stderr="",
+                        )
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return real_run(cmd, *args, **kwargs)
 
@@ -499,9 +538,22 @@ def test_run_hillclimb_wave_dry_run_and_mocked_lifecycle_preserves_main_and_runs
             for r in srv.created_refs
         )
         assert len(res_w3["seeded_issues"]) == 3
+        assert "digest" in srv.labels
+        digest_issues = [
+            iss for iss in srv.issues.values() if iss.get("title") == "bananacast-hc3 digest"
+        ]
+        assert len(digest_issues) == 1
+        assert {l["name"] for l in digest_issues[0]["labels"]} == {"digest", "factory:bananacast-hc3"}
+        assert str(digest_issues[0]["body"]).startswith("<!-- scion-agent: seed -->")
         assert srv.po_issue_num is not None
         po_comments = srv.comments[srv.po_issue_num]
         assert any("<!-- scion-agent:" not in c["body"] for c in po_comments)
+
+        # Staged pod transcripts from PO drill merged into backup_dir, scorecard.json (0600), and down_report["metrics"]
+        assert res_w3["gke_down"]["metrics"]["per_agent"]["lead"]["input_tokens"] == 333
+        sc_disk = json.loads((tmp_path / "backup-hc" / "scorecard.json").read_text(encoding="utf-8"))
+        assert sc_disk["metrics"]["per_agent"]["lead"]["input_tokens"] == 333
+        assert ((tmp_path / "backup-hc" / "scorecard.json").stat().st_mode & 0o777) == 0o600
 
         # Specialist eviction drill + PO decision wake drill both passed
         assert deleted_pods == ["scion-backend-0"]

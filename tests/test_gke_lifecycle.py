@@ -164,6 +164,7 @@ def test_extract_pod_and_transcript_metrics_counts_errors_and_tokens_accurately(
     (backend_pod / "agent.log").write_text(
         "2026-11-10T20:01:00Z ERROR Failed to start telemetry: cloud telemetry enabled but destination is not configured\n"
         "2026-11-10T20:01:05Z ERROR Token refresh failed: status 401: Invalid IAP credentials: empty token\n"
+        "2026-11-10T20:01:10Z ERROR hub connection auth_lost: transport token rejected\n"
     )
 
     lead_steps = [
@@ -251,7 +252,7 @@ def test_extract_pod_and_transcript_metrics_counts_errors_and_tokens_accurately(
     (backend_logs / "transcript_full.jsonl").write_text("\n".join(json.dumps(s) for s in backend_steps) + "\n")
 
     metrics = gke_lifecycle.extract_pod_and_transcript_metrics(backup_dir)
-    assert metrics["iap_401_errors"] == 3
+    assert metrics["iap_401_errors"] == 4
     assert metrics["heartbeat_errors"] == 3
     assert metrics["telemetry_boot_errors"] == 2
 
@@ -474,12 +475,13 @@ def test_gke_down_refuses_non_ephemeral_project_without_confirm_and_cleans_githu
             assert secret_gh not in txt
             assert secret_hub not in txt
 
-    # GitHub cleanup: issues #21 and #22 closed with hillclimb-archive, PR #99 untouched, branch deleted
+    # GitHub cleanup: issues #21 and #22 closed with hillclimb-archive, PR #99 untouched, issue branches & wave branch deleted
     patched = gh_state["patched_issues"]
     assert set(patched.keys()) == {21, 22}  # type: ignore[union-attr]
     for num in (21, 22):
         assert patched[num]["state"] == "closed"  # type: ignore[index]
         assert "hillclimb-archive" in patched[num]["labels"]  # type: ignore[index]
+        assert f"/repos/example-org/bananacast/git/refs/heads/factory/issue-{num}" in gh_state["deleted_refs"]  # type: ignore[operator]
     assert "/repos/example-org/bananacast/git/refs/heads/factory/gke-hc1" in gh_state["deleted_refs"]  # type: ignore[operator]
 
     # GCP project deleted via gcloud projects delete <hub_project> --quiet
@@ -511,4 +513,160 @@ def test_gke_down_refuses_non_ephemeral_project_without_confirm_and_cleans_githu
     assert r_dry.returncode == 0, r_dry.stderr
     assert json.loads(r_dry.stdout)["apply"] is False
     assert not any("demo-long-lived-hub" in line for line in gcloud_log.read_text().splitlines())
+
+
+def test_gke_lifecycle_keys_pods_by_pod_name_dedups_mirrors_and_recovers_scratchpad_telemetry_when_zero_pods(
+    fake_hub, tmp_path, monkeypatch
+):
+    import gke_lifecycle
+
+    # 1. _archive_k8s_logs_and_transcripts keys by pods/<agent_slug>/<pod_name>/ so evicted pods are never overwritten
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    pod_generation = [1]
+    real_run = subprocess.run
+
+    def fake_k8s_exec(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "kubectl":
+            if cmd[1:3] == ["get", "pods"]:
+                pname = f"scion-backend-{pod_generation[0]}"
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {"name": pname, "labels": {"scion.dev/agent": "backend"}},
+                                    "status": {"phase": "Running"},
+                                }
+                            ]
+                        }
+                    ),
+                    stderr="",
+                )
+            if cmd[1] == "logs":
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"container gen {pod_generation[0]}\n", stderr="")
+            if cmd[1] == "exec":
+                joined = " ".join(cmd)
+                if "agent.log" in joined:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=f"agent log gen {pod_generation[0]}\n", stderr="")
+                if "find /home/scion/.gemini" in joined:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=f"/home/scion/.gemini/jetski/brain/conv-gen-{pod_generation[0]}/.system_generated/logs/transcript_full.jsonl\n",
+                        stderr="",
+                    )
+                if "transcript_full.jsonl" in joined:
+                    tok = 100 * pod_generation[0]
+                    line = json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": tok, "output_tokens": 10}) + "\n"
+                    return subprocess.CompletedProcess(cmd, 0, stdout=line, stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_k8s_exec)
+    eff_env = {"HUB_K8S_NAMESPACE": "tfha-prod"}
+    gke_lifecycle._archive_k8s_logs_and_transcripts(eff_env, stage_dir, [], [])
+    pod_generation[0] = 2
+    gke_lifecycle._archive_k8s_logs_and_transcripts(eff_env, stage_dir, [], [])
+
+    assert (stage_dir / "pods" / "backend" / "scion-backend-1" / "agent.log").read_text() == "agent log gen 1\n"
+    assert (stage_dir / "pods" / "backend" / "scion-backend-2" / "agent.log").read_text() == "agent log gen 2\n"
+
+    # Also write an older smaller periodic mirror of conv-gen-2 under another pod dir to verify deduplication!
+    dup_mirror = (
+        stage_dir
+        / "pods"
+        / "backend"
+        / "pod-mirror-stale"
+        / ".gemini"
+        / "jetski"
+        / "brain"
+        / "conv-gen-2"
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+    dup_mirror.parent.mkdir(parents=True, exist_ok=True)
+    dup_mirror.write_text('{"type":"PLANNER_RESPONSE","input_tokens":50,"output_tokens":5}\n')
+    # Make scion-backend-2's conv-gen-2 strictly larger (2 steps = 250 input_tokens total)
+    larger_conv2 = (
+        stage_dir
+        / "pods"
+        / "backend"
+        / "scion-backend-2"
+        / ".gemini"
+        / "jetski"
+        / "brain"
+        / "conv-gen-2"
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+    larger_conv2.write_text(
+        '{"type":"USER_INPUT","content":"resume #1"}\n'
+        '{"type":"PLANNER_RESPONSE","input_tokens":200,"output_tokens":20}\n'
+    )
+
+    stage_metrics = gke_lifecycle.extract_pod_and_transcript_metrics(stage_dir)
+    # conv-gen-1 (100 in, 10 out) + larger conv-gen-2 (200 in, 20 out) = 300 in, 30 out (stale mirror NOT double-counted!)
+    assert stage_metrics["per_agent"]["backend"]["input_tokens"] == 300
+    assert stage_metrics["per_agent"]["backend"]["output_tokens"] == 30
+
+    # 2. Standalone gke_down with 0 running pods recovers 100% of .telemetry/ from Hub shared-dir "scratchpad"
+    spec = _single_project_delta_gke_spec()
+    spec_path = tmp_path / "bananacast.factory.yaml"
+    scion_factory.save_spec(spec, spec_path)
+
+    fake_hub.projects_by_slug["bananacast-hc1"] = {"id": "pid-hc1", "slug": "bananacast-hc1"}
+    fake_hub.agents_by_project["pid-hc1"] = [{"id": "ag-lead", "slug": "lead", "phase": "stopped"}]
+    secret_tok = "gh_secret_in_telemetry_999"
+    fake_hub.shared_dir_files[("pid-hc1", "scratchpad")] = {
+        "STATE.json": '{"wave": 1}',
+        ".telemetry/lead/scion-lead-0/agent.log": (
+            f"2026-11-10T22:00:00Z INFO started with {secret_tok}\n"
+            "2026-11-10T22:01:00Z ERROR hub auth_lost during refresh\n"
+        ),
+        ".telemetry/lead/scion-lead-0/.gemini/jetski/brain/conv-lead/.system_generated/logs/transcript_full.jsonl": (
+            '{"type":"USER_INPUT","content":"DELTA: ACTIONABLE: #1"}\n'
+            '{"type":"PLANNER_RESPONSE","input_tokens":700,"cache_read_tokens":200,"output_tokens":80,"tool_calls":[{"name":"run_command","args":{"CommandLine":"scion start backend -t backend"}}]}\n'
+        ),
+        ".telemetry/reviewer/scion-reviewer-0/.gemini/jetski/brain/conv-rev/.system_generated/logs/transcript_full.jsonl": (
+            '{"type":"PLANNER_RESPONSE","input_tokens":400,"output_tokens":50}\n'
+        ),
+    }
+
+    def zero_pods_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "kubectl":
+            return subprocess.CompletedProcess(cmd, 0, stdout='{"items": []}', stderr="")
+        if isinstance(cmd, list) and cmd and cmd[0] == "gcloud":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", zero_pods_run)
+
+    env_file = tmp_path / "hc1.env"
+    env_file.write_text(
+        f"HUB_PROJECT=scion-gke-hc1-a1b2c3\n"
+        f"HUB_URL={fake_hub.url}\n"
+        f"HUB_K8S_NAMESPACE=tfha-prod\n"
+        f"SCION_HUB_TOKEN=tok-admin\n"
+        f"GITHUB_TOKEN={secret_tok}\n"
+    )
+    sc = gke_lifecycle.gke_down(
+        spec_path,
+        env_file=env_file,
+        backup_root=tmp_path / "backups",
+        delete_project=False,
+        apply=True,
+    )
+    assert sc["ok"] is True
+    assert sc["metrics"]["iap_401_errors"] == 1
+    assert sc["metrics"]["per_agent"]["lead"]["input_tokens"] == 700
+    assert sc["metrics"]["per_agent"]["reviewer"]["input_tokens"] == 400
+    bdir = Path(sc["backup_dir"])
+    archived_log = (bdir / "pods" / "lead" / "scion-lead-0" / "agent.log").read_text()
+    assert secret_tok not in archived_log
+    assert "[REDACTED]" in archived_log
+
 

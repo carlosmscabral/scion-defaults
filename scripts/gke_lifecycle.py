@@ -299,6 +299,16 @@ def _infer_agent_name(backup_dir: Path, file_path: Path) -> str:
     return file_path.stem
 
 
+def _transcript_dedup_key(backup_dir: Path, file_path: Path, agent_name: str) -> tuple[str, str]:
+    rel_parts = file_path.relative_to(backup_dir).parts
+    if ".gemini" in rel_parts:
+        idx = rel_parts.index(".gemini")
+        return agent_name, "/".join(rel_parts[idx:])
+    if len(rel_parts) >= 4 and rel_parts[0] == "pods":
+        return agent_name, "/".join(rel_parts[3:])
+    return agent_name, "/".join(rel_parts)
+
+
 def _is_lead_agent(agent_name: str) -> bool:
     name = agent_name.strip().lower()
     if name.endswith("eval-lead"):
@@ -396,14 +406,17 @@ def extract_pod_and_transcript_metrics(backup_dir: Path | str) -> dict[str, Any]
                 seen_logs.add(log_path)
                 for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
                     ll = line.lower()
-                    if "401" in ll and any(
-                        m in ll
-                        for m in (
-                            "iap",
-                            "token refresh failed",
-                            "proxy-authorization",
-                            "transport-token",
-                            "invalid credentials",
+                    if "auth_lost" in ll or (
+                        "401" in ll
+                        and any(
+                            m in ll
+                            for m in (
+                                "iap",
+                                "token refresh failed",
+                                "proxy-authorization",
+                                "transport-token",
+                                "invalid credentials",
+                            )
                         )
                     ):
                         iap_401_errors += 1
@@ -415,9 +428,19 @@ def extract_pod_and_transcript_metrics(backup_dir: Path | str) -> dict[str, Any]
                     ):
                         telemetry_boot_errors += 1
 
-        for tpath in sorted(bdir.rglob("transcript_full.jsonl")):
-            if not tpath.is_file():
+        deduped_transcripts: dict[tuple[str, str], tuple[tuple[int, int, str], Path]] = {}
+        for cand in sorted(bdir.rglob("transcript_full.jsonl")):
+            if not cand.is_file():
                 continue
+            ag_name = _infer_agent_name(bdir, cand)
+            dkey = _transcript_dedup_key(bdir, cand, ag_name)
+            st = cand.stat()
+            rank = (int(st.st_size), int(st.st_mtime_ns), str(cand))
+            prev = deduped_transcripts.get(dkey)
+            if prev is None or rank > prev[0]:
+                deduped_transcripts[dkey] = (rank, cand)
+
+        for _, tpath in sorted(deduped_transcripts.values(), key=lambda pair: str(pair[1])):
             agent_name = _infer_agent_name(bdir, tpath)
             stats = per_agent.setdefault(
                 agent_name,
@@ -583,6 +606,123 @@ def _archive_hub_agents(
     return hub_agents
 
 
+def _ensure_pod_dir(backup_dir: Path, agent_slug: str, pod_name: str) -> Path:
+    pods_root = backup_dir / "pods"
+    agent_dir = pods_root / agent_slug
+    pod_dir = agent_dir / pod_name
+    pod_dir.mkdir(parents=True, exist_ok=True)
+    for d in (pods_root, agent_dir, pod_dir):
+        os.chmod(d, 0o700)
+    return pod_dir
+
+
+def _write_pod_artifact_monotonic(dest_file: Path, content: str, mode: int = 0o600) -> None:
+    encoded_len = len(content.encode("utf-8"))
+    if dest_file.is_file() and dest_file.stat().st_size > encoded_len:
+        return
+    _write_private_file(dest_file, content, mode=mode)
+
+
+def _archive_hub_scratchpad_telemetry(
+    eff_env: dict[str, str],
+    spec: dict[str, Any],
+    backup_dir: Path,
+    secret_strings: list[str],
+    warnings: list[str],
+) -> None:
+    hub_url = (eff_env.get("HUB_URL") or "").strip()
+    if not hub_url:
+        return
+
+    try:
+        client = HubClient.from_env(eff_env)
+        _, proj_resp = client.request("GET", "/api/v1/projects", timeout=10)
+        proj_items = (
+            proj_resp.get("projects", proj_resp.get("items", []))
+            if isinstance(proj_resp, dict)
+            else (proj_resp if isinstance(proj_resp, list) else [])
+        )
+        by_slug = {
+            str(p.get("slug")): str(p.get("id") or p.get("slug"))
+            for p in proj_items
+            if isinstance(p, dict) and p.get("slug")
+        }
+
+        slugs = [str((spec.get("project") or {}).get("slug") or "")]
+        if scion_factory.has_eval_project(spec):
+            slugs.append(str((spec.get("project") or {}).get("eval_slug") or ""))
+
+        for slug in [s for s in slugs if s]:
+            pid = by_slug.get(slug, slug)
+            try:
+                qs = urllib.parse.urlencode({"q": r"^\.telemetry/", "limit": "2000"})
+                _, list_resp = client.request(
+                    "GET",
+                    f"/api/v1/projects/{pid}/shared-dirs/scratchpad/files?{qs}",
+                    timeout=20,
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    continue
+                warnings.append(_redact_secrets(f"Could not list scratchpad .telemetry for {slug}: {exc}", secret_strings))
+                continue
+
+            file_items = (
+                list_resp.get("files", list_resp.get("items", []))
+                if isinstance(list_resp, dict)
+                else (list_resp if isinstance(list_resp, list) else [])
+            )
+            for f_entry in file_items:
+                if not isinstance(f_entry, dict):
+                    continue
+                rel_path = str(f_entry.get("path") or f_entry.get("name") or "").strip().lstrip("/")
+                if not rel_path.startswith(".telemetry/"):
+                    continue
+                parts = Path(rel_path).parts
+                if len(parts) < 4 or any(seg in ("", ".", "..") for seg in parts[1:]):
+                    continue
+                _, agent_slug, pod_name, *rest = parts
+                quoted = urllib.parse.quote(rel_path, safe="/")
+                try:
+                    _, fetched = client.request(
+                        "GET",
+                        f"/api/v1/projects/{pid}/shared-dirs/scratchpad/files/{quoted}",
+                        timeout=30,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status", None) != 404:
+                        warnings.append(
+                            _redact_secrets(f"Failed downloading scratchpad {rel_path}: {exc}", secret_strings)
+                        )
+                    continue
+
+                if isinstance(fetched, str):
+                    raw_text = fetched
+                elif isinstance(fetched, bytes):
+                    raw_text = fetched.decode("utf-8", errors="replace")
+                elif isinstance(fetched, dict):
+                    if not fetched:
+                        raw_text = ""
+                    elif "content" in fetched and ("encoding" in fetched or "path" in fetched):
+                        raw_text = str(fetched.get("content") or "")
+                    else:
+                        raw_text = json.dumps(fetched) + "\n"
+                else:
+                    raw_text = str(fetched)
+
+                if not raw_text:
+                    continue
+                pod_dir = _ensure_pod_dir(backup_dir, agent_slug, pod_name)
+                dest_file = pod_dir.joinpath(*rest)
+                _write_pod_artifact_monotonic(
+                    dest_file,
+                    _redact_secrets(raw_text, secret_strings),
+                    mode=0o600,
+                )
+    except Exception as exc:
+        warnings.append(_redact_secrets(f"Hub unreachable while archiving scratchpad .telemetry: {exc}", secret_strings))
+
+
 def _archive_k8s_logs_and_transcripts(
     eff_env: dict[str, str],
     backup_dir: Path,
@@ -678,14 +818,11 @@ def _archive_k8s_logs_and_transcripts(
             or labels.get("app.kubernetes.io/instance")
             or pod_name
         )
-        pod_dir = backup_dir / "pods" / agent_slug
-        pod_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(pod_dir.parent, 0o700)
-        os.chmod(pod_dir, 0o700)
+        pod_dir = _ensure_pod_dir(backup_dir, agent_slug, pod_name)
 
         r_klog = _run_k8s(["kubectl", "logs", "-n", ns, pod_name], timeout=20)
         if r_klog is not None and r_klog.returncode == 0 and r_klog.stdout:
-            _write_private_file(
+            _write_pod_artifact_monotonic(
                 pod_dir / "container.log",
                 _redact_secrets(r_klog.stdout, secret_strings),
                 mode=0o600,
@@ -706,7 +843,7 @@ def _archive_k8s_logs_and_transcripts(
             timeout=20,
         )
         if r_alog is not None and r_alog.returncode == 0 and r_alog.stdout:
-            _write_private_file(
+            _write_pod_artifact_monotonic(
                 pod_dir / "agent.log",
                 _redact_secrets(r_alog.stdout, secret_strings),
                 mode=0o600,
@@ -735,7 +872,7 @@ def _archive_k8s_logs_and_transcripts(
                 if r_cat is not None and r_cat.returncode == 0 and r_cat.stdout:
                     rel_dest = remote_path.removeprefix("/home/scion/").lstrip("/")
                     dest_file = pod_dir / rel_dest
-                    _write_private_file(dest_file, _redact_secrets(r_cat.stdout, secret_strings), mode=0o600)
+                    _write_pod_artifact_monotonic(dest_file, _redact_secrets(r_cat.stdout, secret_strings), mode=0o600)
 
 
 def _cleanup_github_artifacts(
@@ -800,6 +937,60 @@ def _cleanup_github_artifacts(
                     closed_issues.append(num)
         except Exception as exc:
             warnings.append(_redact_secrets(f"GitHub issue cleanup failed: {exc}", secret_strings))
+
+        issue_nums_to_prune: set[int] = set(closed_issues)
+        try:
+            _, ref_items = _github_request(
+                "GET",
+                f"{base}/repos/{norm_repo}/git/matching-refs/heads/factory/issue-",
+                github_token=github_token,
+            )
+            if isinstance(ref_items, list):
+                for ref_obj in ref_items:
+                    if not isinstance(ref_obj, dict):
+                        continue
+                    ref_name = str(ref_obj.get("ref") or "")
+                    m_iss = re.match(r"^refs/heads/factory/issue-(\d+)$", ref_name)
+                    if not m_iss:
+                        continue
+                    cand_num = int(m_iss.group(1))
+                    if cand_num in issue_nums_to_prune:
+                        continue
+                    try:
+                        _, iss_obj = _github_request(
+                            "GET",
+                            f"{base}/repos/{norm_repo}/issues/{cand_num}",
+                            github_token=github_token,
+                        )
+                        if isinstance(iss_obj, dict):
+                            iss_labels = {
+                                str(l.get("name") if isinstance(l, dict) else l).strip()
+                                for l in (iss_obj.get("labels") or [])
+                            }
+                            if cleanup_issue_label in iss_labels:
+                                issue_nums_to_prune.add(cand_num)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        for num in sorted(issue_nums_to_prune):
+            issue_br = f"factory/issue-{num}"
+            if issue_br in PROTECTED_BRANCHES:
+                continue
+            try:
+                _github_request(
+                    "DELETE",
+                    f"{base}/repos/{norm_repo}/git/refs/heads/{issue_br}",
+                    github_token=github_token,
+                )
+            except urllib.error.HTTPError as err:
+                if err.code not in (404, 422):
+                    warnings.append(
+                        _redact_secrets(f"GitHub issue branch delete ({issue_br}) failed: HTTP {err.code}", secret_strings)
+                    )
+            except Exception as exc:
+                warnings.append(_redact_secrets(f"GitHub issue branch delete ({issue_br}) failed: {exc}", secret_strings))
 
     if cleanup_branch:
         quoted_branch = urllib.parse.quote(cleanup_branch.strip(), safe="/")
@@ -895,6 +1086,7 @@ def gke_down(
     warnings: list[str] = []
 
     hub_agents = _archive_hub_agents(eff_env, spec, backup_dir, secret_strings, warnings)
+    _archive_hub_scratchpad_telemetry(eff_env, spec, backup_dir, secret_strings, warnings)
     _archive_k8s_logs_and_transcripts(eff_env, backup_dir, secret_strings, warnings)
     metrics = extract_pod_and_transcript_metrics(backup_dir)
 

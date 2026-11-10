@@ -361,6 +361,32 @@ def _format_task_issue_body(wave_num: int, task: dict[str, Any]) -> str:
     )
 
 
+def _seed_digest_issue(
+    repo: str,
+    project_slug: str,
+    issue_label: str,
+    *,
+    github_token: str,
+    api_base: str,
+) -> int:
+    digest_title = f"{project_slug} digest"
+    existing = _list_open_wave_issues(repo, issue_label, github_token=github_token, api_base=api_base)
+    for item in existing:
+        if str(item.get("title") or "").strip() == digest_title and "digest" in _extract_issue_labels(item):
+            return int(item.get("number") or 0)
+    _, created = gke_lifecycle._github_request(
+        "POST",
+        f"{api_base}/repos/{repo}/issues",
+        github_token=github_token,
+        body={
+            "title": digest_title,
+            "body": f"<!-- scion-agent: seed -->\nDaily digest for `{project_slug}`.\n",
+            "labels": ["digest", issue_label],
+        },
+    )
+    return int((created or {}).get("number") or 0)
+
+
 def _seed_wave_issues(
     repo: str,
     wave_num: int,
@@ -574,7 +600,10 @@ def _merge_staged_pods_into_backup(
         dest_file = backup_dir / rel
         if not dest_file.exists() or src_file.stat().st_size > dest_file.stat().st_size:
             dest_file.parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(dest_file.parent, 0o700)
+            cur = dest_file.parent
+            while cur != backup_dir and backup_dir in cur.parents:
+                os.chmod(cur, 0o700)
+                cur = cur.parent
             content = src_file.read_text(encoding="utf-8", errors="replace")
             gke_lifecycle._write_private_file(
                 dest_file,
@@ -673,6 +702,8 @@ def _run_po_decision_drill(
     api_base: str,
     timeout_sec: int,
     poll_interval_sec: float,
+    stage_dir: Path | None = None,
+    secret_strings: list[str] | None = None,
 ) -> dict[str, Any]:
     po_wake_sla_sec = float(eff_env.get("PO_WAKE_SLA_SEC", "120"))
     drill_body = (
@@ -704,6 +735,8 @@ def _run_po_decision_drill(
         _list_open_wave_issues(repo, issue_label, github_token=github_token, api_base=api_base)
         lead_phase = _get_hub_lead_phase(eff_env, project_slug)
         running_pods = _list_running_agent_pods(eff_env)
+        if running_pods and stage_dir is not None:
+            gke_lifecycle._archive_k8s_logs_and_transcripts(eff_env, stage_dir, secret_strings or [], [])
         if lead_phase == "stopped" and len(running_pods) == 0:
             entered_sleep = True
             break
@@ -741,6 +774,8 @@ def _run_po_decision_drill(
 
         lead_phase = _get_hub_lead_phase(eff_env, project_slug)
         running_pods = _list_running_agent_pods(eff_env)
+        if running_pods and stage_dir is not None:
+            gke_lifecycle._archive_k8s_logs_and_transcripts(eff_env, stage_dir, secret_strings or [], [])
 
         if not woke and (
             lead_phase in ("running", "provisioning", "starting")
@@ -779,6 +814,8 @@ def _run_idle_soak(
     eff_env: dict[str, str],
     idle_soak_sec: int,
     poll_interval_sec: float,
+    stage_dir: Path | None = None,
+    secret_strings: list[str] | None = None,
 ) -> dict[str, Any]:
     grace_sec = int(eff_env.get("IDLE_STOP_GRACE_SEC", "600"))
     soak_start = _monotonic()
@@ -788,6 +825,8 @@ def _run_idle_soak(
     # Wait up to IDLE_STOP_GRACE_SEC (+ CronJob cadence buffer) for scale-to-zero if still winding down
     while _monotonic() < grace_deadline:
         running_pods = _list_running_agent_pods(eff_env)
+        if running_pods and stage_dir is not None:
+            gke_lifecycle._archive_k8s_logs_and_transcripts(eff_env, stage_dir, secret_strings or [], [])
         lead_phase = _get_hub_lead_phase(eff_env, project_slug)
         if len(running_pods) == 0 and lead_phase in ("stopped", ""):
             break
@@ -1004,6 +1043,7 @@ def run_wave(
                 repo,
                 [
                     (issue_label, "1d76db"),
+                    ("digest", "0052cc"),
                     ("status:ready", "0e8a16"),
                     ("status:in-progress", "fbca04"),
                     ("status:in-review", "5319e7"),
@@ -1011,6 +1051,13 @@ def run_wave(
                     ("status:blocked", "d93f0b"),
                     ("status:po-decision", "b60205"),
                 ],
+                github_token=gh_token,
+                api_base=api_base,
+            )
+            _seed_digest_issue(
+                repo,
+                project_slug,
+                issue_label,
                 github_token=gh_token,
                 api_base=api_base,
             )
@@ -1067,6 +1114,8 @@ def run_wave(
                     api_base=api_base,
                     timeout_sec=timeout_sec,
                     poll_interval_sec=poll_interval_sec,
+                    stage_dir=stage_dir,
+                    secret_strings=secret_strings,
                 )
                 drills_report = {
                     "eviction_recovery": ev_res,
@@ -1079,6 +1128,8 @@ def run_wave(
                 eff_env=eff_env,
                 idle_soak_sec=idle_soak_sec,
                 poll_interval_sec=poll_interval_sec,
+                stage_dir=stage_dir,
+                secret_strings=secret_strings,
             )
         except (TimeoutError, RuntimeError) as exc:
             operational_error = gke_lifecycle._redact_secrets(str(exc), secret_strings)
@@ -1093,11 +1144,28 @@ def run_wave(
                 delete_project=True,
                 apply=True,
             )
+            backup_dir_str = str(down_report.get("backup_dir") or "")
             _merge_staged_pods_into_backup(
                 stage_dir,
-                str(down_report.get("backup_dir") or ""),
+                backup_dir_str,
                 secret_strings,
             )
+            if backup_dir_str and Path(backup_dir_str).is_dir():
+                bdir_path = Path(backup_dir_str)
+                merged_metrics = gke_lifecycle.extract_pod_and_transcript_metrics(bdir_path)
+                down_report["metrics"] = merged_metrics
+                scorecard_path = bdir_path / "scorecard.json"
+                base_sc: dict[str, Any] = dict(down_report)
+                if scorecard_path.is_file():
+                    try:
+                        loaded_sc = json.loads(scorecard_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded_sc, dict):
+                            base_sc = loaded_sc
+                    except Exception:
+                        pass
+                base_sc["metrics"] = merged_metrics
+                safe_sc = gke_lifecycle._redact_secrets(base_sc, secret_strings)
+                gke_lifecycle._write_private_file(scorecard_path, json.dumps(safe_sc, indent=2) + "\n", mode=0o600)
 
             main_after = _get_branch_sha(repo, "main", github_token=gh_token, api_base=api_base, allow_missing=False)
             factory_main_after = _get_branch_sha(
