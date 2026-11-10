@@ -1,0 +1,197 @@
+project:
+  name: BananaCast AI Studio
+  slug: bananacast
+  mission: Deliver verified, security-hardened multi-app AI photo and video studio features across BananaCast's Flask backend, FastAPI frontend reverse proxy, and React/TypeScript UI on GKE in zero-idle ephemeral delta mode.
+  non_goals:
+  - Deploy public Cloud Run services during code-verification hillclimb waves (infrastructure.deploy is none)
+  - Mutate main or factory/main branches directly; all verified commits integrate onto vcs.build_branch
+vcs:
+  enabled: true
+  provider: github
+  repo: duboc/bananacast
+  build_branch: factory/gke-hc
+knowledge_plane:
+  root: knowledge-plane
+  sources:
+    requirements:
+    - README.md
+    - docs/campaign-compliance-audit.md
+    adrs:
+    - docs/backend-iam-lockdown.md
+    - docs/firestore-serializers.md
+    contracts:
+    - docs/backend.md
+    - docs/analytics.md
+    design:
+    - docs/architecture.md
+    - docs/frontend.md
+    guides:
+    - SETUP.md
+    - docs/security-audit-2026-04-30.md
+  requirements:
+  - id: REQ-001
+    title: Admin authentication and route access control
+    description: Enforce constant-time admin credential and IAP header checks across management endpoints without raising runtime NameErrors on public/user routes.
+    acceptance:
+    - is_admin_request() in src/backend/utils/admin_auth.py imports hmac and config cleanly and evaluates bearer headers in constant time
+    - Endpoints decorated with @require_admin reject unauthenticated callers when admin auth is configured and pass cd src/backend && pytest -q
+  - id: REQ-002
+    title: Frontend reverse proxy hardening and cross-app test isolation
+    description: Hide internal OpenAPI metadata, prevent static path traversal outside DIST_DIR in src/frontend/proxy.py, and validate untrusted URLs/assets on the client.
+    acceptance:
+    - src/frontend/proxy.py configures FastAPI(docs_url=None, redoc_url=None, openapi_url=None) and canonicalizes DIST_DIR static paths with .resolve().is_relative_to(DIST_DIR.resolve())
+    - Proxy tests guard optional FastAPI imports with pytest.importorskip("fastapi") so cd src/backend && pytest -q collects and passes cleanly
+  - id: REQ-003
+    title: Public campaign and session secret whitelisting
+    description: Project public campaign and performance responses strictly through whitelist serializers so internal prompts, safety policies, coupon codes, and upload tokens never leak.
+    acceptance:
+    - GET /api/config/<slug> strips scenes[].imagePrompt, safetyConfig, and raw conversion.couponCode
+    - Admin campaign routes and mobile upload token checks enforce header-based auth with regression coverage in src/backend/tests/
+  invariants:
+  - '`cd src/backend && pytest -q` passes offline using in-process Flask (`app.test_client()`) and ASGI test clients.'
+  - 'Tests importing optional frontend proxy dependencies guard imports with `pytest.importorskip("fastapi")` so primary backend test collection never fails.'
+  - 'Public routes project Firestore documents through whitelist serializers in `src/backend/utils/serializers.py` without exposing `imagePrompt`, `safetyConfig`, or raw `couponCode`.'
+  - 'Every GitHub issue body or comment posted by an agent starts with `<!-- scion-agent: <agent-slug> -->` on line 1, and zero secrets or `.env` files are staged.'
+  decisions:
+  - id: ADR-001
+    title: Single-project GKE ephemeral delta branch workflow
+    status: Accepted
+    requirements:
+    - REQ-001
+    - REQ-002
+    - REQ-003
+    context: Multi-agent pods on GKE each own an isolated /workspace clone and must drop to zero running pods and zero LLM token burn when idle.
+    decision: Run a single-project delta factory where writers push `origin/factory/issue-<N>`, hand off directly to `reviewer`, and `lead` merges PASS branches onto `vcs.build_branch` before stopping idle specialists.
+    consequences: Zero commit-slot contention, zero `.patch` file drift across pods, and automatic scale-to-zero after `IDLE_STOP_GRACE_SEC`.
+  - id: ADR-002
+    title: In-process WSGI/ASGI verification and guarded cross-app imports
+    status: Accepted
+    requirements:
+    - REQ-001
+    - REQ-002
+    context: BananaCast combines a Flask backend (`src/backend`) with a FastAPI SPA/API proxy (`src/frontend/proxy.py`) and React/TypeScript utilities.
+    decision: Verify HTTP behavior with in-process test clients (`app.test_client()`, `TestClient`) and guard optional secondary-app imports with `pytest.importorskip("fastapi")`.
+    consequences: Deterministic sub-second test execution without background server daemons or collection failures in minimal environments.
+  glossary:
+  - term: Campaign
+    definition: Whitelabel studio configuration document identified by slug, containing public branding/scene metadata alongside internal prompts and safety rules.
+  - term: Performance
+    definition: A single user photo/video generation session whose response shape differs between public/user proxy URLs and admin raw GCS storage paths.
+  - term: Frontend Proxy
+    definition: The FastAPI reverse proxy in src/frontend/proxy.py that serves the Vite SPA bundle and forwards /api/* and /assets/* with Cloud Run ID tokens.
+stack:
+  primary_language: python
+  framework: flask
+  build_command: python3 -m compileall -q src/backend
+  test_command: cd src/backend && pytest -q
+  lint_command: python3 -m compileall -q src/backend src/frontend/proxy.py
+  port: 8080
+infrastructure:
+  deploy: none
+  runtime: kubernetes
+  runtime_profile: remote
+  cloud_stores:
+  - firestore
+  - gcs
+  budget_usd: 50
+team:
+  heartbeat_mode: delta
+  watchdog_cron: '*/5 * * * *'
+  max_wip: 2
+  autonomy: standard
+  dropped_defaults:
+  - role: researcher
+    reason: Architecture, IAM lockdown, and security audit documentation already exist under docs/ in duboc/bananacast.
+  - role: doc-writer
+    reason: Specialists maintain inline docstrings and knowledge-plane notes directly on reviewed issue branches.
+  - role: investigator
+    reason: Backend and frontend specialists reproduce issues directly in-process with pytest before implementing fixes.
+  build_roles:
+  - role: lead
+    harness: antigravity
+    model: Gemini 4 Argon
+    default: true
+    responsibility: Sizes active issues on delta wakes, starts only required specialists, merges PASS issue branches onto build_branch, and stops idle pods.
+  - role: backend
+    harness: antigravity
+    model: Gemini 4 Argon
+    default: true
+    responsibility: Implements Flask route, serializer, and authentication fixes under src/backend/ with pytest regression coverage on factory/issue-<N>.
+    focus:
+      paths:
+      - src/backend/
+      commands:
+      - python3 -m compileall -q src/backend
+      - cd src/backend && pytest -q
+      docs:
+      - docs/backend.md
+      - docs/firestore-serializers.md
+  - role: frontend
+    harness: antigravity
+    model: Gemini 4 Argon
+    responsibility: Hardens src/frontend/proxy.py and React/TypeScript validation modules under src/frontend/ with guarded unit and proxy tests.
+    focus:
+      paths:
+      - src/frontend/
+      - src/backend/tests/
+      commands:
+      - python3 -m compileall -q src/frontend/proxy.py
+      - cd src/backend && pytest -q
+      docs:
+      - docs/frontend.md
+      - docs/security-audit-2026-04-30.md
+  - role: reviewer
+    harness: antigravity
+    model: Gemini 4 Argon
+    default: true
+    responsibility: Audits origin/<build_branch>...origin/factory/issue-<N> diffs against architecture invariants and runs pytest independently.
+  - role: security-auditor
+    harness: antigravity
+    model: Gemini 4 Argon
+    responsibility: Audits authentication, path canonicalization, header translation, and public serializer whitelisting for secret or PII leaks.
+  - role: evaluator
+    harness: antigravity
+    model: Gemini 4 Argon
+    default: true
+    responsibility: Executes the L1-L5 code verification pyramid in-project against build_branch and posts structured PASS/FAIL evidence.
+evaluation_pyramid:
+  l2_contract:
+    endpoints:
+    - GET /api/config/<slug>
+    - GET /api/performances/<id>
+    - GET /health
+    invariants:
+    - Public GET /api/config/<slug> responses omit scenes[].imagePrompt, safetyConfig, and raw conversion.couponCode
+    - Frontend proxy disables /openapi.json and keeps static file resolution strictly inside DIST_DIR
+  l3_domain_quality:
+    primary_metric: pytest_pass_rate
+    target_threshold: 1.0
+    probe_description: Run python3 -m compileall -q src/backend and cd src/backend && pytest -q and verify a 1.0 pass rate across all collected tests.
+  l4_safety_grounding:
+    invariants:
+    - Admin endpoints enforce constant-time credential or IAP identity checks without leaking stack traces or tokens
+    - Cross-app proxy tests guard optional FastAPI imports with pytest.importorskip("fastapi")
+waves:
+- wave: 1
+  title: Wave 1 — Admin Auth, Proxy Canonicalization, and Campaign Whitelist Gates
+  issues:
+  - title: 'Wave 1.1: Fix admin_auth NameError and enforce @require_admin with performance route tests'
+    owner_role: backend
+    acceptance_criteria:
+    - Import hmac and config in src/backend/utils/admin_auth.py so is_admin_request() never raises NameError on GET /api/performances/<id>
+    - Enforce @require_admin when config.ADMIN_PASSWORD is set and verify with regression tests via cd src/backend && pytest -q
+    requirements:
+    - REQ-001
+  - title: 'Wave 1.2: Disable /openapi.json and canonicalize DIST_DIR paths in src/frontend/proxy.py'
+    owner_role: frontend
+    acceptance_criteria:
+    - Configure FastAPI(docs_url=None, redoc_url=None, openapi_url=None) and canonicalize static paths with .resolve().is_relative_to(DIST_DIR.resolve()) on /..%2f
+    - Add proxy unit tests guarding FastAPI imports with pytest.importorskip("fastapi")
+    requirements:
+    - REQ-002
+  - title: 'Wave 1.3: Enforce @require_admin on campaign management routes and pin GET /api/config/<slug> whitelist'
+    owner_role: backend
+    acceptance_criteria:
+    - Protect admin campaign endpoints in src/backend/routes/campaigns.py and verify public field whitelisting in src/backend/tests/test_get_config_route.py
+    requirements:
+    - REQ-003
