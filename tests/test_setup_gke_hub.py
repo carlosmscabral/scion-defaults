@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -660,6 +661,439 @@ def test_setup_gke_hub_patches_shared_project_clone_per_agent_idempotently(tmp_p
     assert "ClaimName: claim,\n\t\t\t\t}" in patched_k8s_rt
     assert "SubPath:   sdSubPath,\n\t\t\tReadOnly:  sd.ReadOnly," in patched_k8s_rt
     assert "ClaimName: pvcName,\n\t\t\t\tReadOnly:  sd.ReadOnly," in patched_k8s_rt
+
+
+def test_setup_gke_hub_auto_clones_scion_when_scion_repo_omitted(tmp_path):
+    template_scion = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-autoclone"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_log = tmp_path / "calls.log"
+
+    (fake_bin / "git").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "git $*" >> "{calls_log}"\n'
+        'if [[ "$1" == "clone" ]]; then\n'
+        '  dest="${@: -1}"\n'
+        '  mkdir -p "$dest/.git"\n'
+        f'  cp -R "{template_scion}/." "$dest/"\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    (fake_bin / "git").chmod(0o755)
+
+    for tool in ("gcloud", "terraform", "kubectl"):
+        (fake_bin / tool).write_text(
+            '#!/usr/bin/env bash\n'
+            f'echo "{tool} $*" >> "{calls_log}"\n'
+            'exit 0\n'
+        )
+        (fake_bin / tool).chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DRY_RUN": "0",
+        "HUB_PROJECT": "demo-hub-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "prod",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--work-dir",
+            str(work_dir),
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    calls = calls_log.read_text()
+    expected_src = str((work_dir / "scion-src").resolve())
+    assert "git clone --depth 1 https://github.com/GoogleCloudPlatform/scion.git" in calls
+    assert expected_src in calls
+    assert (work_dir / "scion-src" / ".git").is_dir()
+    assert f"-chdir={expected_src}/deploy/terraform/configurations/shared-infra" in calls
+
+    # Second run reuses existing clone without re-cloning
+    res2 = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--work-dir",
+            str(work_dir),
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res2.returncode == 0, res2.stdout + res2.stderr
+    assert calls_log.read_text().count("git clone --depth 1") == 1
+
+    # SCION_REF passes -b <ref> on fresh work_dir
+    work_dir_ref = tmp_path / "work-autoclone-ref"
+    res3 = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--work-dir",
+            str(work_dir_ref),
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env={**env, "SCION_REF": "v0.9.1"},
+        capture_output=True,
+        text=True,
+    )
+    assert res3.returncode == 0, res3.stdout + res3.stderr
+    assert "git clone --depth 1 -b v0.9.1 https://github.com/GoogleCloudPlatform/scion.git" in calls_log.read_text()
+
+
+def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal_sql(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-create-proj"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_log = tmp_path / "calls.log"
+    proj_created = tmp_path / "proj_created"
+    net_created = tmp_path / "net_created"
+    sa_created = tmp_path / "sa_created"
+
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "gcloud $*" >> "{calls_log}"\n'
+        'case "$*" in\n'
+        '  *"config get-value project"*) echo "seed-existing-proj" ;;\n'
+        '  *"projects describe seed-existing-proj"*) printf "folder\\t987654\\n" ;;\n'
+        '  *"projects describe demo-new-proj"*)\n'
+        f'    if [[ -f "{proj_created}" ]]; then exit 0; fi\n'
+        '    exit 1\n'
+        '    ;;\n'
+        '  *"projects create demo-new-proj"*)\n'
+        f'    touch "{proj_created}"\n'
+        '    exit 0\n'
+        '    ;;\n'
+        '  *"billing accounts list"*) echo "billingAccounts/0123-ABCD" ;;\n'
+        '  *"compute networks describe default"*)\n'
+        f'    if [[ -f "{net_created}" ]]; then exit 0; fi\n'
+        '    exit 1\n'
+        '    ;;\n'
+        '  *"compute networks create default"*)\n'
+        f'    touch "{net_created}"\n'
+        '    exit 0\n'
+        '    ;;\n'
+        '  *"iam service-accounts describe factory-operator@demo-new-proj.iam.gserviceaccount.com"*)\n'
+        f'    if [[ -f "{sa_created}" ]]; then exit 0; fi\n'
+        '    exit 1\n'
+        '    ;;\n'
+        '  *"iam service-accounts create factory-operator"*)\n'
+        f'    touch "{sa_created}"\n'
+        '    exit 0\n'
+        '    ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+
+    for tool in ("terraform", "kubectl"):
+        (fake_bin / tool).write_text(
+            '#!/usr/bin/env bash\n'
+            f'echo "{tool} $*" >> "{calls_log}"\n'
+            'exit 0\n'
+        )
+        (fake_bin / tool).chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DRY_RUN": "0",
+        "USE_OPERATOR_SA": "1",
+        "HUB_PROJECT": "demo-new-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "prod",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--create-project",
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    calls = calls_log.read_text()
+    assert "projects create demo-new-proj --folder=987654" in calls
+    assert "billing projects link demo-new-proj --billing-account=0123-ABCD" in calls
+    assert "compute networks create default --project=demo-new-proj --subnet-mode=auto" in calls
+    assert "firestore.googleapis.com" in calls
+    assert "cloudtrace.googleapis.com" in calls
+    assert "logging.googleapis.com" in calls
+    assert "monitoring.googleapis.com" in calls
+    assert "serviceusage.googleapis.com" in calls
+    assert "cloudresourcemanager.googleapis.com" in calls
+
+    shared_tfvars = (work_dir / "shared-infra.tfvars").read_text()
+    assert 'sql_availability_type = "ZONAL"' in shared_tfvars
+
+    hub_tfvars = (work_dir / "hub.tfvars").read_text()
+    assert "factory-operator@demo-new-proj.iam.gserviceaccount.com" in hub_tfvars
+    assert "serviceAccount:factory-operator@demo-new-proj.iam.gserviceaccount.com" in hub_tfvars
+    assert "HUB_IMPERSONATE_SA=factory-operator@demo-new-proj.iam.gserviceaccount.com" in out
+
+    # Single folder under single org fallback + explicit SQL_AVAILABILITY_TYPE override + DRY_RUN=1
+    work_dir_org = tmp_path / "work-create-org-fallback"
+    fake_bin_org = tmp_path / "bin-org"
+    fake_bin_org.mkdir()
+    (fake_bin_org / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"config get-value project"*) echo "(unset)" ;;\n'
+        '  *"projects describe demo-org-proj"*) exit 1 ;;\n'
+        '  *"organizations list"*) echo "organizations/111222" ;;\n'
+        '  *"resource-manager folders list --organization=111222"*) echo "folders/333444" ;;\n'
+        '  *"compute networks describe default"*) exit 1 ;;\n'
+        '  *"iam service-accounts describe"*) exit 1 ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin_org / "gcloud").chmod(0o755)
+    res_org = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--create-project",
+            "--billing-account",
+            "9999-EEEE",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir_org),
+            "--harnesses",
+            "antigravity",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        env={
+            **env,
+            "PATH": f"{fake_bin_org}:{os.environ['PATH']}",
+            "HUB_PROJECT": "demo-org-proj",
+            "SQL_AVAILABILITY_TYPE": "REGIONAL",
+        },
+        capture_output=True,
+        text=True,
+    )
+    out_org = res_org.stdout + res_org.stderr
+    assert res_org.returncode == 0, out_org
+    assert "+ gcloud projects create demo-org-proj --folder=333444" in out_org
+    assert "+ gcloud billing projects link demo-org-proj --billing-account=9999-EEEE" in out_org
+    assert 'sql_availability_type = "REGIONAL"' in (work_dir_org / "shared-infra.tfvars").read_text()
+
+
+def test_setup_gke_hub_write_env_merges_existing_keys_and_sets_0600(tmp_path, fake_hub):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-write-env"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_log = tmp_path / "calls.log"
+    env_file = tmp_path / "factory.env"
+    env_file.write_text(
+        "# comment\n"
+        "PO_EMAIL=admin@example.com\n"
+        "GITHUB_TOKEN=fake_tok_123\n"
+        "HUB_URL=https://old\n"
+    )
+    env_file.chmod(0o644)
+
+    build_script = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+    )
+    build_script.chmod(0o755)
+
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "gcloud $*" >> "{calls_log}"\n'
+        'case "$*" in\n'
+        '  *"builds get-default-service-account"*) echo "projects/demo/serviceAccounts/123-compute@developer.gserviceaccount.com" ;;\n'
+        '  *"builds submit"*) echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]." ;;\n'
+        '  *"builds describe"*) echo "SUCCESS" ;;\n'
+        '  *"artifacts docker images describe"*) echo "sha256:deadbeef" ;;\n'
+        '  *"oauth-brands list"*) echo "projects/123456/brands/123456" ;;\n'
+        '  *"oauth-clients list"*) echo "projects/123456/brands/123456/identityAwareProxyClients/123456-abcdef.apps.googleusercontent.com" ;;\n'
+        '  *"run services describe tfha-e2e"*) printf "\\t[\\"https://tfha-e2e-123456.us-east1.run.app\\"]\\n" ;;\n'
+        '  *"print-identity-token"*) echo "fake-oidc" ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+
+    (fake_bin / "terraform").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "terraform $*" >> "{calls_log}"\n'
+        'if [[ "$*" == *"output -raw hub_url"* ]]; then\n'
+        '  echo "https://tfha-e2e-123456.us-east1.run.app"\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    (fake_bin / "terraform").chmod(0o755)
+
+    (fake_bin / "kubectl").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "kubectl $*" >> "{calls_log}"\n'
+        'exit 0\n'
+    )
+    (fake_bin / "kubectl").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DRY_RUN": "0",
+        "SKIP_EXISTING_IMAGES": "1",
+        "BUILD_POLL_SEC": "0.05",
+        "HUB_PROJECT": "demo-hub-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "tfha-e2e",
+        "HUB_API_BASE_URL": fake_hub.url,
+        "HUB_TRANSPORT_TOKEN": "fake-iap-tok",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--env",
+            str(env_file),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+            "--approve-apply",
+            "--write-env",
+            str(env_file),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert (env_file.stat().st_mode & 0o777) == 0o600
+
+    written = env_file.read_text()
+    lines = written.splitlines()
+    assert lines[0] == "# comment"
+    assert lines[1] == "PO_EMAIL=admin@example.com"
+    assert lines[2] == "GITHUB_TOKEN=fake_tok_123"
+    assert lines[3] == "HUB_URL=https://tfha-e2e-123456.us-east1.run.app"
+    assert "HUB_URL=https://old" not in written
+    assert "HUB_PROJECT=demo-hub-proj" in lines
+    assert "SANDBOX_PROJECT=demo-hub-proj" in lines
+    assert "HUB_NAME=tfha-e2e" in lines
+    assert "HUB_REGION=us-east1" in lines
+    assert "HUB_IAP_AUDIENCE=123456-abcdef.apps.googleusercontent.com" in lines
+    assert "AGENT_RUNTIME=kubernetes" in lines
+    assert "RUNTIME_PROFILE=remote" in lines
+    assert "HUB_K8S_CLUSTER=tfha-agents" in lines
+    assert "HUB_K8S_NAMESPACE=tfha-e2e" in lines
+    assert "IMAGE_REGISTRY=us-east1-docker.pkg.dev/demo-hub-proj/tfha-scion" in lines
+    assert "VERTEX_LOCATION=global" in lines
+
+    env_puts = {
+        r["path"].rsplit("/", 1)[-1]: json.loads(r["body"].decode("utf-8"))
+        for r in fake_hub.requests
+        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/")
+    }
+    assert env_puts["GOOGLE_CLOUD_PROJECT"]["value"] == "demo-hub-proj"
+    assert env_puts["GOOGLE_CLOUD_REGION"]["value"] == "global"
+    assert env_puts["GOOGLE_CLOUD_LOCATION"]["value"] == "global"
+    assert env_puts["SCION_TELEMETRY_ENABLED"]["value"] == "true"
+    assert env_puts["SCION_TELEMETRY_CLOUD_ENABLED"]["value"] == "true"
+    assert env_puts["SCION_TELEMETRY_CLOUD_PROVIDER"]["value"] == "gcp"
+    assert env_puts["SCION_GCP_PROJECT_ID"]["value"] == "demo-hub-proj"
+
+    # DRY_RUN=1 never mutates --write-env outside WORK_DIR
+    untouched = tmp_path / "untouched.env"
+    untouched.write_text("PO_EMAIL=admin@example.com\nHUB_URL=https://keep-me\n")
+    res_dry = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(tmp_path / "work-dry-write"),
+            "--harnesses",
+            "antigravity",
+            "--dry-run",
+            "--write-env",
+            str(untouched),
+        ],
+        cwd=ROOT,
+        env={**env, "PO_EMAIL": "admin@example.com"},
+        capture_output=True,
+        text=True,
+    )
+    assert res_dry.returncode == 0, res_dry.stdout + res_dry.stderr
+    assert untouched.read_text() == "PO_EMAIL=admin@example.com\nHUB_URL=https://keep-me\n"
+
 
 
 
