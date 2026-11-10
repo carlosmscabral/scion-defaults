@@ -1095,5 +1095,270 @@ def test_setup_gke_hub_write_env_merges_existing_keys_and_sets_0600(tmp_path, fa
     assert untouched.read_text() == "PO_EMAIL=admin@example.com\nHUB_URL=https://keep-me\n"
 
 
+def test_setup_gke_hub_create_project_defaults_us_east1_operator_sa_and_fails_on_iam_bind_exhaustion(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+
+    # 1. Without --create-project and without HUB_REGION/SANDBOX_REGION -> keeps legacy us-central1 fallback
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("HUB_REGION", "HUB_ZONE", "SANDBOX_REGION", "USE_OPERATOR_SA", "HUB_IMPERSONATE_SA")
+    }
+    res_legacy = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(tmp_path / "work-legacy-region"),
+            "--harnesses",
+            "antigravity",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        env={**clean_env, "HUB_PROJECT": "demo-legacy-proj", "PO_EMAIL": "admin@example.com"},
+        capture_output=True,
+        text=True,
+    )
+    assert res_legacy.returncode == 0, res_legacy.stdout + res_legacy.stderr
+    assert "HUB_REGION=us-central1" in res_legacy.stdout
+    assert "HUB_IMPERSONATE_SA=" not in res_legacy.stdout
+
+    # 2. With --create-project (cloudrun) and no HUB_REGION/SANDBOX_REGION/USE_OPERATOR_SA -> defaults us-east1 + USE_OPERATOR_SA=1 + persists HUB_IMPERSONATE_SA
+    fake_bin = tmp_path / "bin-ok"
+    fake_bin.mkdir()
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"projects describe scion-gke-hc1-aabbcc"*) exit 0 ;;\n'
+        '  *"billing accounts list"*) echo "billingAccounts/0123-ABCD" ;;\n'
+        '  *"compute networks describe default"*) exit 0 ;;\n'
+        '  *"iam service-accounts describe"*) exit 0 ;;\n'
+        '  *"iam service-accounts add-iam-policy-binding"*) exit 0 ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+    for tool in ("terraform", "kubectl"):
+        (fake_bin / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin / tool).chmod(0o755)
+
+    write_env_path = tmp_path / "hc1.env"
+    res_cp = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--create-project",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(tmp_path / "work-cp-defaults"),
+            "--harnesses",
+            "antigravity",
+            "--write-env",
+            str(write_env_path),
+        ],
+        cwd=ROOT,
+        env={
+            **clean_env,
+            "PATH": f"{fake_bin}:{clean_env.get('PATH', '')}",
+            "DRY_RUN": "0",
+            "BUILD_POLL_SEC": "0.01",
+            "HUB_PROJECT": "scion-gke-hc1-aabbcc",
+            "PO_EMAIL": "admin@example.com",
+        },
+        capture_output=True,
+        text=True,
+    )
+    out_cp = res_cp.stdout + res_cp.stderr
+    assert res_cp.returncode == 0, out_cp
+    assert "HUB_REGION=us-east1" in res_cp.stdout
+    assert "HUB_IMPERSONATE_SA=factory-operator@scion-gke-hc1-aabbcc.iam.gserviceaccount.com" in res_cp.stdout
+    written_lines = write_env_path.read_text().splitlines()
+    assert "HUB_REGION=us-east1" in written_lines
+    assert "SANDBOX_REGION=us-east1" in written_lines
+    assert "HUB_IMPERSONATE_SA=factory-operator@scion-gke-hc1-aabbcc.iam.gserviceaccount.com" in written_lines
+
+    # 3. Exhausting all 5 IAM binding attempts on OPERATOR_SA_EMAIL must exit 1 with a clear stderr message
+    fake_bin_fail = tmp_path / "bin-fail"
+    fake_bin_fail.mkdir()
+    bind_tries = tmp_path / "bind_tries.log"
+    (fake_bin_fail / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"projects describe scion-gke-hc1-fail00"*) exit 0 ;;\n'
+        '  *"billing accounts list"*) echo "billingAccounts/0123-ABCD" ;;\n'
+        '  *"compute networks describe default"*) exit 0 ;;\n'
+        '  *"iam service-accounts describe"*) exit 0 ;;\n'
+        '  *"iam service-accounts add-iam-policy-binding"*)\n'
+        f'    echo "try" >> "{bind_tries}"\n'
+        '    exit 1\n'
+        '    ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin_fail / "gcloud").chmod(0o755)
+    for tool in ("terraform", "kubectl"):
+        (fake_bin_fail / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin_fail / tool).chmod(0o755)
+
+    res_fail = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--create-project",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(tmp_path / "work-cp-fail"),
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env={
+            **clean_env,
+            "PATH": f"{fake_bin_fail}:{clean_env.get('PATH', '')}",
+            "DRY_RUN": "0",
+            "BUILD_POLL_SEC": "0.01",
+            "HUB_PROJECT": "scion-gke-hc1-fail00",
+            "PO_EMAIL": "admin@example.com",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert res_fail.returncode == 1
+    assert len(bind_tries.read_text().splitlines()) == 5
+    assert "serviceAccountTokenCreator" in res_fail.stderr
+
+
+def test_setup_gke_hub_patches_handlers_agents_core_to_skip_direct_iap_refresh_mint_idempotently(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    agents_core_go = scion_repo / "pkg" / "hub" / "handlers_agents_core.go"
+    agents_core_go.parent.mkdir(parents=True, exist_ok=True)
+    original_go = (
+        "package hub\n\n"
+        "import (\n"
+        '\t"context"\n'
+        '\t"time"\n'
+        ")\n\n"
+        "func (s *Server) handleAgentTokenRefresh() {\n"
+        '\ttransportError := ""\n'
+        '\tif s.transportMinter != nil && s.transportAudience != "" {\n'
+        "\t\t_ = 1\n"
+        "\t}\n"
+        "\t_ = transportError\n"
+        "}\n"
+    )
+    agents_core_go.write_text(original_go)
+
+    work_dir = tmp_path / "work-agents-core"
+    base_env = {
+        **os.environ,
+        "HUB_PROJECT": "demo-hub-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "tfha-e2e",
+        "PO_EMAIL": "admin@example.com",
+    }
+
+    # DRY_RUN=1 leaves handlers_agents_core.go untouched
+    r_dry = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--harnesses",
+            "antigravity",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        env=base_env,
+        capture_output=True,
+        text=True,
+    )
+    assert r_dry.returncode == 0
+    assert agents_core_go.read_text() == original_go
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    patched_before_build = tmp_path / "agents_core_patched_before_build"
+    build_script = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+    )
+    build_script.chmod(0o755)
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"builds get-default-service-account"*) echo "projects/demo/serviceAccounts/123-compute@developer.gserviceaccount.com" ;;\n'
+        '  *"builds submit"*)\n'
+        f'    if grep -q "369001918367-" "{agents_core_go}"; then touch "{patched_before_build}"; fi\n'
+        '    echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]."\n'
+        '    ;;\n'
+        '  *"builds describe"*) echo "SUCCESS" ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+    for tool in ("terraform", "kubectl"):
+        (fake_bin / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin / tool).chmod(0o755)
+
+    for _ in range(2):
+        r_apply = subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/setup-gke-hub.sh"),
+                "--tier",
+                "terraform-ha",
+                "--hub-mode",
+                "cloudrun",
+                "--scion-repo",
+                str(scion_repo),
+                "--work-dir",
+                str(work_dir),
+                "--image-tag",
+                "v20261110",
+                "--harnesses",
+                "antigravity",
+                "--approve-apply",
+            ],
+            cwd=ROOT,
+            env={
+                **base_env,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DRY_RUN": "0",
+                "BUILD_POLL_SEC": "0.01",
+                "IAP_OAUTH_CLIENT_ID": "369001918367-abc.apps.googleusercontent.com",
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert r_apply.returncode == 0, r_apply.stdout + r_apply.stderr
+
+    assert patched_before_build.exists()
+    patched = agents_core_go.read_text()
+    assert (
+        'if s.transportMinter != nil && s.transportAudience != "" && !strings.HasPrefix(s.transportAudience, "369001918367-") {'
+        in patched
+    )
+    assert patched.count('"369001918367-"') == 1
+    assert patched.count('"strings"') == 1
+
+
+
 
 

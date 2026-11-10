@@ -543,8 +543,9 @@ def test_factory_cd_switches_google_managed_direct_iap_to_metadata_access_token(
         assert res.returncode == 0, res.stderr
         got = json.loads(res.stdout.strip())
         assert got["boot"] is None
-        assert got["file"] == str(home / ".scion" / "transport-token")
+        assert got["file"] == str(home / ".scion" / "iap-access-token")
         assert Path(got["file"]).read_text().strip() == "ya29-pod-direct-iap-token"
+        assert (home / ".scion" / "transport-token").read_text().strip() == "ya29-pod-direct-iap-token"
     finally:
         srv.shutdown()
 

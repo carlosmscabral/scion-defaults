@@ -72,8 +72,8 @@ raise SystemExit(1)
 PY
         fi
       }
-      if _refresh_direct_iap_token && [ -s "${HOME}/.scion/transport-token" ]; then
-        export SCION_TRANSPORT_TOKEN_FILE="${HOME}/.scion/transport-token"
+      if _refresh_direct_iap_token && [ -s "${HOME}/.scion/iap-access-token" ]; then
+        export SCION_TRANSPORT_TOKEN_FILE="${HOME}/.scion/iap-access-token"
         unset SCION_TRANSPORT_TOKEN
         _iap_refresh="${FACTORY_CD_IAP_REFRESH_SEC:-1500}"
         if [ "$_iap_refresh" -gt 0 ] 2>/dev/null; then
@@ -89,11 +89,71 @@ PY
       ;;
   esac
 fi
+
+# Persist container-local ~/.scion/agent.log and ~/.gemini/**/transcript_full.jsonl onto the durable scratchpad
+# shared-dir (/scion-volumes/scratchpad/.telemetry/<agent_slug>/<pod_name>/) periodically and on EXIT/TERM so
+# KubernetesRuntime.Stop pod deletion or preemption never loses telemetry.
+_telem_scratch="${SCION_SCRATCHPAD_DIR:-/scion-volumes/scratchpad}"
+_persist_telemetry() {
+  [ -d "$_telem_scratch" ] && [ -n "${HOME:-}" ] || return 0
+  if [ -x "${HOME}/.scion/hooks/pre-stop.d/10-persist-telemetry" ]; then
+    SCION_SCRATCHPAD_DIR="$_telem_scratch" "${HOME}/.scion/hooks/pre-stop.d/10-persist-telemetry" >/dev/null 2>&1 || true
+    return 0
+  fi
+  _ag_slug="${SCION_AGENT_SLUG:-${SCION_AGENT_NAME:-unknown}}"
+  _pod_nm="${HOSTNAME:-$(hostname 2>/dev/null || echo pod)}"
+  [ -n "$_pod_nm" ] || _pod_nm="pod"
+  _dst_root="${_telem_scratch}/.telemetry/${_ag_slug}/${_pod_nm}"
+  _cp_telem() {
+    [ -f "$1" ] || return 0
+    mkdir -p "$(dirname "$2")" 2>/dev/null || return 0
+    _t="${2}.$$.tmp"
+    if cp "$1" "$_t" 2>/dev/null; then
+      chmod 600 "$_t" 2>/dev/null || true
+      mv -f "$_t" "$2" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
+    else
+      rm -f "$_t" 2>/dev/null || true
+    fi
+  }
+  _cp_telem "${HOME}/.scion/agent.log" "${_dst_root}/agent.log"
+  if [ -d "${HOME}/.gemini" ]; then
+    find "${HOME}/.gemini" -type f -name "transcript_full.jsonl" 2>/dev/null | while IFS= read -r _tf; do
+      [ -n "$_tf" ] || continue
+      _cp_telem "$_tf" "${_dst_root}/${_tf#"${HOME}"/}"
+    done
+  fi
+}
+
+_run_harness() {
+  if [ ! -d "$_telem_scratch" ]; then
+    exec "$@"
+  fi
+  _persist_telemetry
+  _telem_bg_pid=""
+  _telem_sync_sec="${FACTORY_CD_TELEMETRY_SYNC_SEC:-30}"
+  if [ "$_telem_sync_sec" -gt 0 ] 2>/dev/null; then
+    _h_pid="$$"
+    (
+      trap '_persist_telemetry; exit 0' TERM INT HUP
+      while sleep "$_telem_sync_sec"; do
+        kill -0 "$_h_pid" 2>/dev/null || { _persist_telemetry; exit 0; }
+        _persist_telemetry
+      done
+    ) </dev/null >/dev/null 2>&1 &
+    _telem_bg_pid="$!"
+  fi
+  trap '_rc=$?; [ -n "${_telem_bg_pid:-}" ] && kill "$_telem_bg_pid" 2>/dev/null || true; _persist_telemetry; exit $_rc' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  "$@"
+  exit $?
+}
+
 sub="${FACTORY_SUBDIR:-}"
 sub="${sub#./}"
 sub="${sub%/}"
 if [ -z "$sub" ] || [ "$sub" = "." ]; then
-  exec "$@"
+  _run_harness "$@"
 fi
 
 case "/$sub/" in
@@ -173,4 +233,4 @@ update(os.path.join(home, ".gemini", "antigravity-cli", "settings.json"), antigr
 PY
 fi
 
-exec "$@"
+_run_harness "$@"

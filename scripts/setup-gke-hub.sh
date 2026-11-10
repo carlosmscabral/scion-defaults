@@ -107,13 +107,16 @@ if [[ -z "$HUB_PROJECT" || -z "$PO_EMAIL" ]]; then
   exit 1
 fi
 
-HUB_REGION="${HUB_REGION:-${SANDBOX_REGION:-us-central1}}"
-HUB_ZONE="${HUB_ZONE:-${HUB_REGION}-b}"
 if [[ "$CREATE_PROJECT" == "1" ]]; then
+  _DEFAULT_HUB_REGION="us-east1"
   SQL_AVAILABILITY_TYPE="${SQL_AVAILABILITY_TYPE:-ZONAL}"
 else
+  _DEFAULT_HUB_REGION="us-central1"
   SQL_AVAILABILITY_TYPE="${SQL_AVAILABILITY_TYPE:-REGIONAL}"
 fi
+HUB_REGION="${HUB_REGION:-${SANDBOX_REGION:-$_DEFAULT_HUB_REGION}}"
+HUB_ZONE="${HUB_ZONE:-${HUB_REGION}-b}"
+USE_OPERATOR_SA="${USE_OPERATOR_SA:-$([[ "$CREATE_PROJECT" == "1" && "$HUB_MODE" == "cloudrun" ]] && echo 1 || echo 0)}"
 STATE_BUCKET="${STATE_BUCKET:-${HUB_PROJECT}-${SHARED_PREFIX}-tfstate}"
 BUILD_POLL_SEC="${BUILD_POLL_SEC:-10}"
 SKIP_EXISTING_IMAGES="${SKIP_EXISTING_IMAGES:-0}"
@@ -420,15 +423,21 @@ if [[ "$CREATE_PROJECT" == "1" ]]; then
       --member="user:${PO_EMAIL}" \
       --role="roles/iam.serviceAccountTokenCreator"
   else
+    _sa_bound=0
     for _sa_try in 1 2 3 4 5; do
       if gcloud iam service-accounts add-iam-policy-binding "$OPERATOR_SA_EMAIL" \
         --project="$HUB_PROJECT" \
         --member="user:${PO_EMAIL}" \
         --role="roles/iam.serviceAccountTokenCreator" >/dev/null 2>&1; then
+        _sa_bound=1
         break
       fi
       [[ $_sa_try -lt 5 ]] && sleep "${BUILD_POLL_SEC}"
     done
+    if [[ "$_sa_bound" == "0" ]]; then
+      echo "Failed to bind roles/iam.serviceAccountTokenCreator on ${OPERATOR_SA_EMAIL} for user:${PO_EMAIL} after 5 attempts." >&2
+      exit 1
+    fi
   fi
   if [[ ",${EXTRA_ADMIN_EMAILS:-}," != *",${OPERATOR_SA_EMAIL},"* ]]; then
     EXTRA_ADMIN_EMAILS="${EXTRA_ADMIN_EMAILS:+${EXTRA_ADMIN_EMAILS},}${OPERATOR_SA_EMAIL}"
@@ -571,6 +580,23 @@ pat = re.compile(
 )
 updated, count = pat.subn(r'\1', src, count=1)
 if count == 1:
+    p.write_text(updated)
+PY
+  fi
+  if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/pkg/hub/handlers_agents_core.go" ]]; then
+    python3 - "${SCION_REPO}/pkg/hub/handlers_agents_core.go" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+old = 'if s.transportMinter != nil && s.transportAudience != "" {'
+new = 'if s.transportMinter != nil && s.transportAudience != "" && !strings.HasPrefix(s.transportAudience, "369001918367-") {'
+if new not in src and old in src:
+    updated = src.replace(old, new, 1)
+    if not re.search(r'(?m)^\s*"strings"\s*$', updated) and 'import "strings"' not in updated:
+        if re.search(r'(?m)^import\s*\(\n', updated):
+            updated = re.sub(r'(?m)^(import\s*\(\n)', r'\1\t"strings"\n', updated, count=1)
+        elif re.search(r'(?m)^package\s+\w+\s*$', updated):
+            updated = re.sub(r'(?m)^(package\s+\w+\s*)$', r'\1\n\nimport "strings"', updated, count=1)
     p.write_text(updated)
 PY
   fi
