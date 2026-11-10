@@ -31,10 +31,22 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER_SRC = os.path.join(os.path.dirname(HERE), "config", "harness", "home", ".local", "bin", "factory-cd.sh")
 EMBEDDED_LAUNCHER = None  # base64 of factory-cd.sh; --via-hub fills it in, because run-on-hub.sh ships one file only
+
+PRE_START_IAP_SRC = os.path.join(os.path.dirname(HERE), "config", "harness", "home", ".scion", "hooks", "pre-start.d", "10-direct-iap-token")
+EMBEDDED_PRE_START_IAP = None
 LAUNCHER = ["sh", "/home/scion/.local/bin/factory-cd.sh"]
 HARNESSES = ("claude", "antigravity", "opencode", "hermes")
 SUFFIX = "-factory"
 BASE_LINE = re.compile(r"^(?P<indent>[ \t]+)base:[ \t]*(?P<list>\[.*\])[ \t]*$", re.M)
+
+
+
+def pre_start_iap_bytes():
+    import base64
+    if EMBEDDED_PRE_START_IAP is not None:
+        return base64.b64decode(EMBEDDED_PRE_START_IAP)
+    with open(PRE_START_IAP_SRC, "rb") as f:
+        return f.read()
 
 
 def harness_vars(subdir, runtime="docker"):
@@ -92,6 +104,10 @@ def build(scion_home, harness, apply):
     with open(launcher, "wb") as f:
         f.write(launcher_bytes())
     os.chmod(launcher, 0o755)
+    os.makedirs(os.path.join(dst, "home", ".scion", "hooks", "pre-start.d"), exist_ok=True)
+    with open(os.path.join(dst, "home", ".scion", "hooks", "pre-start.d", "10-direct-iap-token"), "wb") as f:
+        f.write(pre_start_iap_bytes())
+    os.chmod(os.path.join(dst, "home", ".scion", "hooks", "pre-start.d", "10-direct-iap-token"), 0o755)
     return dst
 
 
@@ -108,6 +124,8 @@ def via_hub(argv):
         source = f.read()
     embedded = base64.b64encode(launcher_bytes()).decode()
     source = source.replace("EMBEDDED_LAUNCHER = None", f"EMBEDDED_LAUNCHER = {embedded!r}", 1)
+    embedded_iap = base64.b64encode(pre_start_iap_bytes()).decode()
+    source = source.replace("EMBEDDED_PRE_START_IAP = None", f"EMBEDDED_PRE_START_IAP = {embedded_iap!r}", 1)
     runner = os.environ.get("RUN_ON_HUB", os.path.join(HERE, "run-on-hub.sh"))
     with tempfile.TemporaryDirectory() as tmp:
         script = os.path.join(tmp, "make_factory_harness_configs_remote.py")
@@ -161,6 +179,7 @@ def via_api(client, harnesses, apply):
         new_text, changed = prefix_command_base(config_text)
         files["config.yaml"] = new_text.encode("utf-8")
         files["home/.local/bin/factory-cd.sh"] = launcher_bytes()
+        files["home/.scion/hooks/pre-start.d/10-direct-iap-token"] = pre_start_iap_bytes()
         
         print(f"{harness} -> {harness + SUFFIX}: download from API, command.base = {json.dumps(LAUNCHER)} + bundled base")
         

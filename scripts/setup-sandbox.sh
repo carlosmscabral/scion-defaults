@@ -317,7 +317,7 @@ if [[ "$IS_GKE_MODE" == 1 ]]; then
     run gcloud iam service-accounts create "$WORKER_SA_NAME" --project="$P" \
       --description="Identity for Scion agents running in GKE" --display-name="Agent Worker"
   fi
-  for role in roles/aiplatform.user roles/datastore.user roles/serviceusage.serviceUsageConsumer; do
+  for role in roles/aiplatform.user roles/datastore.user roles/serviceusage.serviceUsageConsumer roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
     bind_project "serviceAccount:$WORKER_SA" "$role"
   done
   if [[ -n "${DATA_BUCKET:-}" ]]; then

@@ -22,17 +22,35 @@
 if [ "${SCION_TRANSPORT_MODE:-}" = "iap" ]; then
   case "${SCION_TRANSPORT_AUDIENCE:-}" in
     369001918367-*)
-      _iap_tok_file="${HOME}/.scion/iap-access-token"
       _refresh_direct_iap_token() {
-        command -v python3 >/dev/null 2>&1 || return 1
-        SCION_IAP_TOK_OUT="$_iap_tok_file" python3 - <<'PY' >/dev/null 2>&1
-import json, os, urllib.request
-out = os.environ["SCION_IAP_TOK_OUT"]
-os.makedirs(os.path.dirname(out), exist_ok=True)
-bases = [os.environ.get("SCION_METADATA_URL", "").rstrip("/"), "http://169.254.169.254", "http://metadata.google.internal"]
+        if [ -x "${HOME}/.scion/hooks/pre-start.d/10-direct-iap-token" ]; then
+          "${HOME}/.scion/hooks/pre-start.d/10-direct-iap-token" >/dev/null 2>&1
+        else
+          command -v python3 >/dev/null 2>&1 || return 1
+          python3 - <<'PY' >/dev/null 2>&1
+import json, os, urllib.request, time
+def _write_atomic(path, content):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.replace(tmp, path)
+home = os.environ.get("HOME", "")
+if not home: raise SystemExit(1)
+out1 = os.path.join(home, ".scion", "transport-token")
+out2 = os.path.join(home, ".scion", "iap-access-token")
+os.makedirs(os.path.dirname(out1), exist_ok=True)
+meta_url = os.environ.get("SCION_METADATA_URL", "").rstrip("/")
+fallbacks = os.environ.get("SCION_METADATA_FALLBACKS", "")
+if fallbacks == "0":
+    bases = [meta_url] if meta_url else []
+else:
+    bases = [meta_url, "http://169.254.169.254", "http://metadata.google.internal"]
+bases = [b for b in bases if b]
 scopes = "https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,openid"
-for base in [b for b in bases if b]:
-    for _ in range(2):
+sleep_sec = float(os.environ.get("SCION_IAP_RETRY_SLEEP_SEC", "1.0"))
+for base in bases:
+    for attempt in range(3):
         try:
             req = urllib.request.Request(
                 f"{base}/computeMetadata/v1/instance/service-accounts/default/token?scopes={scopes}",
@@ -41,21 +59,21 @@ for base in [b for b in bases if b]:
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 tok = (json.loads(resp.read().decode("utf-8", errors="replace")).get("access_token") or "").strip()
             if tok:
-                tmp = f"{out}.{os.getpid()}.tmp"
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w") as f:
-                    f.write(tok)
-                os.replace(tmp, out)
+                _write_atomic(out1, tok)
+                _write_atomic(out2, tok)
                 raise SystemExit(0)
         except SystemExit:
             raise
         except Exception:
             pass
+        if attempt < 2:
+            time.sleep(sleep_sec)
 raise SystemExit(1)
 PY
+        fi
       }
-      if _refresh_direct_iap_token && [ -s "$_iap_tok_file" ]; then
-        export SCION_TRANSPORT_TOKEN_FILE="$_iap_tok_file"
+      if _refresh_direct_iap_token && [ -s "${HOME}/.scion/transport-token" ]; then
+        export SCION_TRANSPORT_TOKEN_FILE="${HOME}/.scion/transport-token"
         unset SCION_TRANSPORT_TOKEN
         _iap_refresh="${FACTORY_CD_IAP_REFRESH_SEC:-1500}"
         if [ "$_iap_refresh" -gt 0 ] 2>/dev/null; then
@@ -71,7 +89,6 @@ PY
       ;;
   esac
 fi
-
 sub="${FACTORY_SUBDIR:-}"
 sub="${sub#./}"
 sub="${sub%/}"

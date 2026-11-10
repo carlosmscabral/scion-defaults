@@ -174,3 +174,16 @@ def test_setup_sandbox_kubernetes_mode_creates_worker_sa_and_keeps_docker_deploy
     # K8s Role + RoleBinding allowing Hub SA to list/get serviceaccounts for discoverAssignKSA
     assert 'resources: ["serviceaccounts"]' in calls
     assert "name: scion-prod-hub@hub-proj.iam.gserviceaccount.com" in calls
+
+def test_setup_sandbox_gke_mode_grants_cloud_telemetry_writer_roles(tmp_path):
+    k8s_env = (
+        "AGENT_RUNTIME=kubernetes\nSANDBOX_PROJECT=sandbox\nSANDBOX_REGION=us-central1\n"
+        "HUB_PROJECT=hub-proj\nHUB_REGION=us-east1\nHUB_URL=https://scion-prod-123456.us-east1.run.app\n"
+        "HUB_K8S_NAMESPACE=scion-prod\nHUB_SA=scion-prod-hub\nDATA_BUCKET=sandbox-data\n"
+        "DEPLOYER_SA_NAME=agent-deployer\nRUNTIME_SA_NAME=app-serving\n"
+    )
+    res, calls = _sandbox_with_kubectl(tmp_path, k8s_env, "0")
+    assert res.returncode == 0, res.stdout + res.stderr
+    out = res.stdout + res.stderr
+    for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
+        assert f"--member=serviceAccount:agent-worker@sandbox.iam.gserviceaccount.com --role={role}" in calls
