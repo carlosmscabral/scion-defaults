@@ -476,6 +476,26 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     # Idempotent: a second pass leaves the files unchanged
     assert provision_factory._inject_cloud_telemetry(kit_dir / "templates", "my-hub") == []
 
+    # 2b. Vertex AI env the Hub requires before it starts a vertex-ai agent is written at project scope
+    #     by provisioning itself and read back (hillclimb Run 1, fourth attempt: 422 missing_env_vars).
+    project_env = fake_hub.env_vars[("project", build_pid)]
+    assert project_env == {
+        "GOOGLE_CLOUD_PROJECT": "my-hub",
+        "GOOGLE_CLOUD_LOCATION": "global",
+        "GOOGLE_CLOUD_REGION": "global",
+    }
+    env_reads = [r for r in fake_hub.requests if r["method"] == "GET" and r["path"].startswith("/api/v1/env?")]
+    assert any(f"scopeId={build_pid}" in r["path"] for r in env_reads)
+    first_agent_post = next(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "POST" and r["path"] == f"/api/v1/projects/{build_pid}/agents"
+    )
+    last_env_put = max(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/GOOGLE_CLOUD_")
+    )
+    assert last_env_put < first_agent_post
+
     # 3. Delta mode skips Scion LLM schedule creation completely
     assert fake_hub.schedules.get(build_pid, []) == []
     assert not any(r["method"] == "POST" and r["path"].endswith("/schedules") for r in fake_hub.requests)
@@ -494,3 +514,25 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
 
 
 
+
+
+def test_ensure_vertex_env_fails_fast_when_hub_drops_project_env_and_warns_on_hub_scope_denial(fake_hub):
+    import provision_factory
+    from hub_client import HubClient
+
+    client = HubClient(base_url=fake_hub.url, token="tok-admin")
+
+    # Hub scope refused (caller is not an unscoped admin): project scope still lands, with a warning
+    fake_hub.deny_hub_scope_env = True
+    warnings = provision_factory._ensure_vertex_env(client, ["proj-a"], "my-hub", "global")
+    assert len(warnings) == 3 and all("hub-scope" in w and "403" in w for w in warnings)
+    assert fake_hub.env_vars[("project", "proj-a")]["GOOGLE_CLOUD_LOCATION"] == "global"
+    assert ("hub", "") not in fake_hub.env_vars
+
+    # Hub accepts the write but does not keep it: fail before any agent is started
+    fake_hub.drop_env_writes = True
+    with pytest.raises(RuntimeError, match="missing Vertex AI env.*GOOGLE_CLOUD_PROJECT"):
+        provision_factory._ensure_vertex_env(client, ["proj-b"], "my-hub", "global")
+
+    with pytest.raises(RuntimeError, match="both empty"):
+        provision_factory._ensure_vertex_env(client, ["proj-c"], "", "global")

@@ -37,6 +37,13 @@ class FakeHubHandler(BaseHTTPRequestHandler):
 
         
         import re
+        if self.path.startswith("/api/v1/env?"):
+            q = urllib.parse.parse_qs(urlparse(self.path).query)
+            store_key = ((q.get("scope") or ["user"])[0], (q.get("scopeId") or [""])[0])
+            rows = self.server.__dict__.setdefault("env_vars", {}).get(store_key, {})
+            self._send_json(200, {"envVars": [{"key": k, "value": v} for k, v in rows.items()], "scope": store_key[0], "scopeId": store_key[1]})
+            return
+
         m_gcp_sa = re.match(r"/api/v1/projects/([^/]+)/gcp-service-accounts", self.path)
         if m_gcp_sa:
             pid = m_gcp_sa.group(1)
@@ -255,6 +262,23 @@ class FakeHubHandler(BaseHTTPRequestHandler):
         })
         
         
+        m_env = re.match(r"/api/v1/env/([^/?]+)$", self.path)
+        if m_env:
+            b = json.loads(body.decode("utf-8")) if body else {}
+            key = m_env.group(1)
+            if key.startswith("SCION_") or key.startswith("GCE_METADATA_"):
+                self._send_json(400, {"error": {"code": "validation_error", "message": "target is reserved"}})
+                return
+            scope = b.get("scope") or "user"
+            if scope == "hub" and getattr(self.server, "deny_hub_scope_env", False):
+                self._send_json(403, {"error": "hub scope requires an unscoped local admin"})
+                return
+            store_key = (scope, b.get("scopeId") or "")
+            if not getattr(self.server, "drop_env_writes", False):
+                self.server.__dict__.setdefault("env_vars", {}).setdefault(store_key, {})[key] = b.get("value")
+            self._send_json(200, {"envVar": {"key": key, "value": b.get("value")}, "created": True})
+            return
+
         if "/api/v1/templates" in self.path:
             self._send_json(200, {"items": []})
             return

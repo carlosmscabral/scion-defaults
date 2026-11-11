@@ -43,6 +43,63 @@ def _inject_cloud_telemetry(tpl_root: Path, gcp_project: str) -> list[str]:
     return changed
 
 
+VERTEX_ENV_KEYS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION")
+
+
+def _ensure_vertex_env(client, pids: list[str], gcp_project: str, location: str) -> list[str]:
+    """Give every factory project the Vertex AI env the Hub requires before it starts an agent.
+
+    With `--harness-auth vertex-ai` the Hub answers 422 `missing_env_vars` unless it can resolve
+    GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION for the agent (hillclimb Run 1, fourth attempt).
+    setup-gke-hub.sh writes them at hub scope, but that call needs a Hub admin and only warns on
+    failure. Project scope is written here, by the caller that owns the projects, and read back so
+    a missing value fails provisioning with a clear message instead of a 422 at agent start.
+    Returns warnings for the optional steps (hub scope, read-back unavailable).
+    """
+    from hub_client import HubAPIError
+
+    warnings: list[str] = []
+    if not gcp_project:
+        raise RuntimeError("Cannot set Vertex AI env: HUB_PROJECT and SANDBOX_PROJECT are both empty.")
+    wanted = {
+        "GOOGLE_CLOUD_PROJECT": gcp_project,
+        "GOOGLE_CLOUD_LOCATION": location,
+        "GOOGLE_CLOUD_REGION": location,
+    }
+    for key, val in wanted.items():
+        try:
+            client.request(
+                "PUT",
+                f"/api/v1/env/{key}",
+                body={"value": val, "scope": "hub", "injectionMode": "always"},
+            )
+        except HubAPIError as exc:
+            warnings.append(f"hub-scope {key} not set (HTTP {exc.status}); relying on project scope")
+    for pid in pids:
+        for key, val in wanted.items():
+            client.request(
+                "PUT",
+                f"/api/v1/env/{key}",
+                body={"value": val, "scope": "project", "scopeId": pid, "injectionMode": "always"},
+            )
+        try:
+            _, listed = client.request("GET", f"/api/v1/env?scope=project&scopeId={pid}")
+        except HubAPIError as exc:
+            warnings.append(f"could not read back project env for {pid} (HTTP {exc.status})")
+            continue
+        if not isinstance(listed, dict) or not isinstance(listed.get("envVars"), list):
+            warnings.append(f"project env read-back for {pid} returned no envVars list")
+            continue
+        have = {str(e.get("key")): str(e.get("value")) for e in listed["envVars"] if isinstance(e, dict)}
+        missing = [k for k, v in wanted.items() if have.get(k) != v]
+        if missing:
+            raise RuntimeError(
+                f"Hub project {pid} is missing Vertex AI env after write: {', '.join(missing)}. "
+                "Agents would fail to start with 422 missing_env_vars."
+            )
+    return warnings
+
+
 def _load_env(env_file) -> dict:
     env_file = Path(env_file)
     env = {}
@@ -291,6 +348,7 @@ def provision_factory(
         control_sa_email = f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
         deployer_sa_email = f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
 
+        vertex_env_warnings: list[str] = []
         if runtime == "kubernetes" and apply:
             from hub_client import HubAPIError
 
@@ -305,6 +363,15 @@ def provision_factory(
             # Cloud telemetry is not set through the Hub env API: the Hub rejects SCION_* names with
             # 400 (reserved control-plane namespace). Phase 7 writes it into each template's
             # scion-agent.yaml `telemetry:` block instead (see _inject_cloud_telemetry).
+            vertex_env_warnings = _ensure_vertex_env(
+                client,
+                list(target_pids),
+                eff_env.get("HUB_PROJECT") or sandbox_project,
+                eff_env.get("VERTEX_LOCATION") or eff_env.get("GOOGLE_CLOUD_LOCATION") or "global",
+            )
+            for w in vertex_env_warnings:
+                print(f"Warning: {w}", file=sys.stderr)
+
             for pid in target_pids:
                 worker_sa_rec = client.register_project_service_account(pid, worker_sa_email, sandbox_project, name=worker_sa_name)
                 worker_sa_uuid = worker_sa_rec.get("id", worker_sa_email)
@@ -348,7 +415,10 @@ def provision_factory(
                     except HubAPIError as exc:
                         if exc.status not in (400, 403, 404, 409):
                             raise
-        phases.append({"phase": "identity_and_profile", "ok": True})
+        phase_identity: dict = {"phase": "identity_and_profile", "ok": True}
+        if runtime == "kubernetes" and apply and vertex_env_warnings:
+            phase_identity["warnings"] = vertex_env_warnings
+        phases.append(phase_identity)
 
         # 6. shared_dirs_and_kp
         if apply:

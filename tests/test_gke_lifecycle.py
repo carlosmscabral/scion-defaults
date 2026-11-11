@@ -69,7 +69,12 @@ def test_gke_up_chains_setup_compile_and_provision_with_phase_timers(fake_hub, t
                     + "RUNTIME_PROFILE=remote\n"
                 )
                 we_path.chmod(0o600)
-            return subprocess.CompletedProcess(cmd, 0, stdout="setup ok\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="setup ok\n",
+                stderr="Warning: could not set hub-scope env automatically (token fake-pat)\n+ terraform apply\n",
+            )
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
@@ -89,6 +94,12 @@ def test_gke_up_chains_setup_compile_and_provision_with_phase_timers(fake_hub, t
     )
     assert res_dry["ok"] is True, res_dry
     assert res_dry["apply"] is False
+    # Bootstrap warnings survive a successful setup, with secrets redacted, so a later failure
+    # can be traced after the ephemeral project is deleted.
+    assert len(res_dry["setup_warnings"]) == 1
+    assert res_dry["setup_warnings"][0].startswith("Warning: could not set hub-scope env")
+    assert "fake-pat" not in json.dumps(res_dry["setup_warnings"]) + res_dry["setup_stderr_tail"]
+    assert "terraform apply" in res_dry["setup_stderr_tail"]
     assert "--create-project" in seen_setup_cmds[0]
     assert "--dry-run" in seen_setup_cmds[0]
     assert "--approve-apply" not in seen_setup_cmds[0]

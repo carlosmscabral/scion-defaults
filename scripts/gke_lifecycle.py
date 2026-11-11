@@ -222,6 +222,18 @@ def gke_up(
             "total_sec": total_sec,
         }
 
+    # setup-gke-hub.sh downgrades some failures to warnings (for example the hub-scope env write).
+    # Keep them, and the tail of its output, so a later failure can be traced after the ephemeral
+    # project is gone (hillclimb Run 1, fourth attempt).
+    setup_secrets = _collect_secret_strings(_load_lifecycle_env(env_path))
+    setup_output = f"{r_setup.stdout or ''}\n{r_setup.stderr or ''}"
+    setup_warnings = [
+        _redact_secrets(line.strip(), setup_secrets)
+        for line in setup_output.splitlines()
+        if line.lstrip().lower().startswith("warning")
+    ][-40:]
+    setup_stderr_tail = _redact_secrets((r_setup.stderr or "")[-4000:], setup_secrets)
+
     t1 = time.monotonic()
     compile_res = scion_factory.compile_factory_boilerplate(spec, resolved_kit)
     compile_sec = round(time.monotonic() - t1, 4)
@@ -285,6 +297,8 @@ def gke_up(
             "provision_sec": provision_sec,
             "total_sec": total_sec,
         },
+        "setup_warnings": setup_warnings,
+        "setup_stderr_tail": setup_stderr_tail,
         "compile": compile_res,
         "provision": prov_res,
     }
