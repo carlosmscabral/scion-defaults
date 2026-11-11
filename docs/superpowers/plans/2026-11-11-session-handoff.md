@@ -87,9 +87,10 @@ We are empirically improving core `duboc/scion-defaults` on GKE Autopilot + Clou
    - Create `docs/gke-hillclimb-report.md` (anonymized IDs only per `AGENTS.md` Rule 1) with Run 1 / Run 2 / Run 3 scorecard vs. previous baselines.
    - Add `L34+` lessons to `docs/lessons-learned.md`; update `docs/gke-setup-runbook.md`, `README.md` (must satisfy `tests/test_docs_contract.py` ASD-STE100 rules), `AGENTS.md`, and add `test_docs_cover_gke_hillclimb_delta_orchestration_and_l34` in `tests/test_docs_contract.py`.
    - Run final whole-branch code review (`2fc4bb1..HEAD`) before merging to `main`.
-4. **Deferred Non-Blocking Minors (for final review triage):**
+4. **Deferred Non-Blocking Minors & Env-Parsing Note (for Run 1 / final review):**
    - `scripts/make-factory-harness-configs.py`: redundant local `import base64` inside `pre_start_iap_bytes()`.
    - `scripts/gke_lifecycle.py`: `_cleanup_github_artifacts` fetches `per_page=100` without pagination.
+   - `scripts/gke_lifecycle.py` (`_parse_env_file`): values with trailing inline `#` comments after single quotes (e.g. `FIRESTORE_DATABASE='(default)'   # ...` in `config/factory.env.example`) retain the trailing `# ...` without a closing quote when serialized into temp wave env files; keep `config/hc*.env` free of inline `#` comments on value lines (or shell-quote / strip inline comments cleanly before Run 1).
 5. **Sibling Paused Workstream (`feat/multi-project-factory`):**
    - Stage 1 Tasks 1–15 + whole-branch review (`0cceeec..083d660`, `520 passed`) are complete locally in `.worktrees/docs-multi-project-factory` (`origin/feat/multi-project-factory` is still at `0cceeec`). Wait until `feat/gke-factory-hillclimb` finishes Task 7, then rebase/merge and execute Stage 1 Task 16 (`docs/plans/2026-11-06-multi-project-factory-stage1.md`).
    - *(Operator note on `main`: commit `2fc4bb1` sits on `main` / `origin/main` from an earlier Stage 1 wrong-checkout commit; leave untouched or clean up only with explicit operator approval.)*
