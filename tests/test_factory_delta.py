@@ -115,6 +115,9 @@ class _DeltaHubHandler(BaseHTTPRequestHandler):
 
         m_exec = re.match(r"^/api/v1/projects/([^/]+)/agents/([^/]+)/exec$", self.path)
         if m_exec:
+            if getattr(self.server, "exec_denied", False):
+                self._send_json(403, {"error": "active bindings do not include permission \"agent.attach\""})
+                return
             code = getattr(self.server, "exec_exit_code", 0)
             self._send_json(200, {"exitCode": code, "output": ""})
             return
@@ -610,3 +613,22 @@ def test_delta_tick_waits_for_tmux_90s_default_and_defers_delivery_when_tmux_not
     assert saved_ok["last_fingerprint"] == res_ok["fingerprint"]
     assert saved_ok["lead_turns_in_epoch"] == 3
 
+
+
+def test_wait_for_tmux_falls_back_to_hub_reported_activity_when_exec_is_denied(delta_hub, monkeypatch):
+    # Current Scion keeps agent.attach (exec) for project-owner, and the control-plane identity is
+    # project-admin: exec answers 403. The controller must not report waiting_for_tmux forever
+    # (hillclimb Run 1, sixth attempt); it reads readiness from the agent record instead.
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-control")
+    delta_hub.exec_denied = True
+    monkeypatch.setattr(factory_delta.time, "sleep", lambda _s: None)
+    lead = {"id": "id-lead", "slug": "bananacast-lead", "name": "bananacast-lead", "phase": "running",
+            "containerStatus": "Running", "activity": "completed"}
+    delta_hub.agents["uuid-bc"]["bananacast-lead"] = lead
+    assert factory_delta._wait_for_tmux(client, "uuid-bc", "bananacast-lead", wait_sec=0.05) is True
+    exec_calls = [r for r in delta_hub.requests if r["method"] == "POST" and r["path"].endswith("/exec")]
+    assert len(exec_calls) == 1  # no retry storm once exec is known to be denied
+
+    # A running pod whose harness has not reported any activity yet is not ready
+    lead["activity"] = ""
+    assert factory_delta._wait_for_tmux(client, "uuid-bc", "bananacast-lead", wait_sec=0.05) is False

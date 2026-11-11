@@ -312,16 +312,42 @@ def _wait_for_tmux(
     if wait_sec is None:
         wait_sec = float(os.environ.get("DELTA_TMUX_WAIT_SEC", "90.0"))
     deadline = time.time() + max(wait_sec, 0.1)
+    exec_denied = False
     while True:
-        try:
-            rc, _ = client.exec_agent(pid, slug, ["tmux", "has-session", "-t", "scion"], timeout=10)
-            if rc == 0:
-                return True
-        except Exception:
-            pass
+        if not exec_denied:
+            try:
+                rc, _ = client.exec_agent(pid, slug, ["tmux", "has-session", "-t", "scion"], timeout=10)
+                if rc == 0:
+                    return True
+            except HubAPIError as err:
+                # The control-plane identity is project-admin, and current Scion keeps `agent.attach`
+                # (exec) for project-owner. Without this fallback the controller answered
+                # waiting_for_tmux forever and never woke lead (hillclimb Run 1, sixth attempt).
+                exec_denied = err.status == 403
+            except Exception:
+                pass
+        if exec_denied and _agent_session_reported_ready(client, pid, slug):
+            return True
         if time.time() >= deadline:
             return False
         time.sleep(poll_sec)
+
+
+def _agent_session_reported_ready(client: HubClient, pid: str, slug: str) -> bool:
+    """Readiness from what the Hub reports, for callers that may not exec into the agent.
+
+    The harness runs inside the tmux session, so a running agent that has reported an activity has
+    a session the Hub can deliver a message into.
+    """
+    try:
+        agent = client.get_agent(pid, slug)
+    except Exception:
+        return False
+    if not isinstance(agent, dict):
+        return False
+    phase = str(agent.get("phase") or agent.get("status") or "").lower()
+    container = str(agent.get("containerStatus") or "running").lower()
+    return phase == "running" and container == "running" and bool(str(agent.get("activity") or "").strip())
 
 
 def _call_github_fetcher(fetcher, github_repo: str, issue_label: str, github_token: str) -> tuple[list[dict], dict[int, list[dict]]]:
