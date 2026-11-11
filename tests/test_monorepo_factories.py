@@ -548,3 +548,35 @@ def test_factory_cd_switches_google_managed_direct_iap_to_metadata_access_token(
     finally:
         srv.shutdown()
 
+
+def test_make_factory_harness_configs_hardens_antigravity_vertex_ai_and_timeouts(tmp_path):
+    home = tmp_path / ".scion"
+    hc = home / "harness-configs" / "antigravity"
+    (hc / "home").mkdir(parents=True)
+    (hc / "config.yaml").write_text(
+        "harness: antigravity\n"
+        "command:\n"
+        "  base: [\"agy\", \"--dangerously-skip-permissions\"]\n"
+        "auth:\n"
+        "  default_type: gemini-api-key\n"
+        "provisioner:\n"
+        "  timeout: 10s\n"
+    )
+    (hc / "provision.py").write_text(
+        "def _get_agy_version():\n"
+        "    return subprocess.run(['agy', '--version'], timeout=5)\n"
+    )
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "make-factory-harness-configs.py"),
+            "--scion-home", str(home), "--harness", "antigravity", "--apply", "--no-sync",
+        ],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    out_cfg = (home / "harness-configs" / "antigravity-factory" / "config.yaml").read_text()
+    assert "default_type: vertex-ai" in out_cfg
+    assert "timeout: 60s" in out_cfg
+    out_prov = (home / "harness-configs" / "antigravity-factory" / "provision.py").read_text()
+    assert "timeout=25" in out_prov
