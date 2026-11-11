@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1382,3 +1383,39 @@ def test_setup_gke_hub_patches_handlers_agents_core_to_skip_direct_iap_refresh_m
 
 
 
+
+
+def test_patch_scion_shared_dir_volume_handles_new_and_old_scion_and_fails_on_unknown_shape(tmp_path):
+    script = ROOT / "scripts" / "patch_scion_shared_dir_volume.py"
+
+    def run(text):
+        f = tmp_path / "k8s_runtime.go"
+        f.write_text(text)
+        r = subprocess.run([sys.executable, str(script), str(f)], capture_output=True, text=True)
+        return r, f.read_text()
+
+    # Current Scion: the pod volume comes from sharedDirPodVolume(..., sd.ReadOnly, ...). Only the
+    # volume goes read-write; the init-mount call and the volumeMount keep sd.ReadOnly.
+    new_style = (
+        "\tif config.SharedDirStorage.Shared() {\n"
+        "\t\tsdVolume, sdSubPath, err := sharedDirPodVolume(config.SharedDirStorage, i, sd.Name, sd.ReadOnly, target)\n"
+        "\t\t\tSubPath:   sdSubPath,\n\t\t\tReadOnly:  sd.ReadOnly,\n\t}\n"
+        "\t_, subPath, err := sharedDirPodVolume(config.SharedDirStorage, i, sd.Name, sd.ReadOnly, target)\n"
+    )
+    r, out = run(new_style)
+    assert r.returncode == 0 and "patched" in r.stderr
+    assert "sdVolume, sdSubPath, err := sharedDirPodVolume(config.SharedDirStorage, i, sd.Name, false, target)" in out
+    assert "_, subPath, err := sharedDirPodVolume(config.SharedDirStorage, i, sd.Name, sd.ReadOnly, target)" in out
+    assert "SubPath:   sdSubPath,\n\t\t\tReadOnly:  sd.ReadOnly," in out
+    r2, out2 = run(out)
+    assert r2.returncode == 0 and "already" in r2.stderr and out2 == out
+
+    # Upstream renamed the code again: fail the bootstrap instead of skipping silently
+    # (the silent skip cost hillclimb Run 1 its fifth attempt).
+    unknown = "\tif config.SharedDirStorage.Shared() {\n\t\tvol := buildSharedVolume(sd, sd.ReadOnly)\n\t}\n"
+    r3, out3 = run(unknown)
+    assert r3.returncode == 1 and "does not recognise" in r3.stderr and out3 == unknown
+
+    # A file with no shared-dir claim code is left alone
+    r4, _ = run("package runtime\n")
+    assert r4.returncode == 0

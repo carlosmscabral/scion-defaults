@@ -586,19 +586,8 @@ if new not in src and old in src:
 PY
   fi
   if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/pkg/runtime/k8s_runtime.go" ]]; then
-    python3 - "${SCION_REPO}/pkg/runtime/k8s_runtime.go" <<'PY'
-import pathlib, re, sys
-p = pathlib.Path(sys.argv[1])
-src = p.read_text()
-pat = re.compile(
-    r'(if config\.SharedDirStorage\.Shared\(\) \{[\s\S]*?PersistentVolumeClaim:\s*&corev1\.PersistentVolumeClaimVolumeSource\{\n'
-    r'[ \t]*ClaimName:\s*claim,\n)'
-    r'[ \t]*ReadOnly:\s*sd\.ReadOnly,\n'
-)
-updated, count = pat.subn(r'\1', src, count=1)
-if count == 1:
-    p.write_text(updated)
-PY
+    # Fails the bootstrap when upstream renamed the code, instead of silently skipping the patch.
+    python3 "${SCRIPT_DIR}/patch_scion_shared_dir_volume.py" "${SCION_REPO}/pkg/runtime/k8s_runtime.go"
   fi
   if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/pkg/hub/handlers_agents_core.go" ]]; then
     python3 - "${SCION_REPO}/pkg/hub/handlers_agents_core.go" <<'PY'
