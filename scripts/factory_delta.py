@@ -31,6 +31,7 @@ import factory_store  # noqa: E402
 from hub_client import HubAPIError, HubClient  # noqa: E402
 
 AGENT_COMMENT_MARKER = "<!-- scion-agent:"
+IDLE_TICK_JITTER_SEC = 5.0
 CONTROL_STATE_COLLECTION = "factory_control_state"
 
 _SKIP_LABELS = frozenset({"digest", "hillclimb-archive", "status:verified"})
@@ -581,7 +582,11 @@ def run_delta_tick(
             state_dirty = True
 
         elapsed_idle = now_ts - float(state["idle_since"])
-        if elapsed_idle >= idle_grace_sec:
+        # Ticks land a fraction of a second apart from an exact multiple of the cron period, so a
+        # strict comparison misses the grace by milliseconds and costs a whole extra tick
+        # (599.86s against 600s in hillclimb Run 1).
+        if elapsed_idle + IDLE_TICK_JITTER_SEC >= idle_grace_sec:
+            cleanup_warnings: list[str] = []
             if apply:
                 for ch in child_agents:
                     ch_slug = str(ch.get("slug") or ch.get("name") or "")
@@ -597,7 +602,12 @@ def run_delta_tick(
                     try:
                         client.request("DELETE", f"/api/v1/projects/{pid}/agents/{ch_slug}")
                     except HubAPIError as err:
-                        if err.status != 404:
+                        # The control-plane identity is project-admin, which may stop agents but
+                        # not delete them. A stopped agent holds no pod, so leave it and go on to
+                        # stop lead; raising here kept lead running forever (hillclimb Run 1).
+                        if err.status == 403:
+                            cleanup_warnings.append(f"could not delete stopped agent {ch_slug} (HTTP 403)")
+                        elif err.status != 404:
                             raise
 
                 lead_phase = str((lead_agent or {}).get("phase") or (lead_agent or {}).get("status") or "").lower()
@@ -630,6 +640,7 @@ def run_delta_tick(
                 "fingerprint": fingerprint,
                 "idle_elapsed_sec": elapsed_idle,
                 "waiting_po_count": len(classified["waiting_po"]),
+                "cleanup_warnings": cleanup_warnings,
             }
 
         if apply and state_dirty:

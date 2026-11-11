@@ -140,6 +140,9 @@ class _DeltaHubHandler(BaseHTTPRequestHandler):
         m_agent = re.match(r"^/api/v1/projects/([^/]+)/agents/([^/]+)$", self.path)
         if m_agent:
             pid, slug = m_agent.group(1), m_agent.group(2)
+            if getattr(self.server, "delete_denied", False):
+                self._send_json(403, {"error": {"code": "forbidden", "message": "insufficient permission for this agent action"}})
+                return
             self.server.agents.get(pid, {}).pop(slug, None)
             self._send_json(200, {"status": "deleted"})
             return
@@ -632,3 +635,29 @@ def test_wait_for_tmux_falls_back_to_hub_reported_activity_when_exec_is_denied(d
     # A running pod whose harness has not reported any activity yet is not ready
     lead["activity"] = ""
     assert factory_delta._wait_for_tmux(client, "uuid-bc", "bananacast-lead", wait_sec=0.05) is False
+
+
+def test_delta_auto_sleep_stops_lead_when_agent_delete_is_denied_and_tolerates_tick_jitter(delta_hub):
+    # project-admin may stop agents but not delete them. In hillclimb Run 1 the 403 on deleting a
+    # stopped specialist crashed every tick before lead was stopped, so the factory never slept.
+    store = FakeDeltaStore()
+    store.upsert_document(
+        "factory_control_state",
+        "delta__bananacast",
+        {"last_fingerprint": "fp-old", "idle_since": 1000.0, "lead_sleeping": False, "lead_turns_in_epoch": 3},
+    )
+    delta_hub.delete_denied = True
+    delta_hub.agents["uuid-bc"]["bananacast-lead"] = {"id": "l", "slug": "bananacast-lead", "name": "bananacast-lead", "template": "lead", "phase": "running"}
+    delta_hub.agents["uuid-bc"]["bananacast-frontend"] = {"id": "f", "slug": "bananacast-frontend", "name": "bananacast-frontend", "template": "frontend", "phase": "stopped"}
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-control")
+
+    # 599.86s idle: the tick that lands milliseconds short of the 600s grace still sleeps
+    res = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="bananacast-lead",
+        apply=True, now=1599.86, github_fetcher=lambda *_: ([], {}),
+    )
+    assert res["auto_slept"] is True
+    assert res["cleanup_warnings"] == ["could not delete stopped agent bananacast-frontend (HTTP 403)"]
+    assert delta_hub.agents["uuid-bc"]["bananacast-lead"]["phase"] == "stopped"
+    saved = store.get_document("factory_control_state", "delta__bananacast")
+    assert saved["lead_sleeping"] is True and saved["lead_turns_in_epoch"] == 0
