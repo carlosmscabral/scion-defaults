@@ -680,6 +680,32 @@ def test_run_hillclimb_wave_teardown_runs_in_finally_on_poll_timeout_and_catches
         assert seen_down[0]["cleanup_issue_label"] == "factory:bananacast-hc2"
         assert seen_down[0]["cleanup_branch"] == "factory/gke-hc2"
 
+        # --keep-on-failure: a failed wave skips teardown and leaves the project, issues and branch for
+        # debugging, with the env and spec copied out of the temp dir and the teardown command reported.
+        kept_res = run_hillclimb_wave.run_wave(
+            3,
+            env_file=env_file,
+            idle_soak_sec=60,
+            timeout_sec=5,
+            backup_root=tmp_path / "bk",
+            apply=True,
+            keep_on_failure=True,
+        )
+        assert kept_res["ok"] is False and kept_res["kept_for_debug"] is True
+        assert len(seen_down) == 1  # gke_down was NOT called again
+        kept = kept_res["gke_down"]
+        assert kept["skipped_teardown"] is True and kept["project_deleted"] is False
+        kept_env = Path(kept["env_file"])
+        assert kept_env.parent == tmp_path / "bk" / f"kept-{kept_res['hub_project']}"
+        assert kept_env.is_file() and (kept_env.stat().st_mode & 0o777) == 0o600
+        assert (kept_env.parent.stat().st_mode & 0o777) == 0o700
+        assert f"HUB_PROJECT={kept_res['hub_project']}" in kept_env.read_text()
+        assert Path(kept["spec_file"]).is_file()
+        assert "--delete-project" in kept["teardown_command"]
+        assert "--cleanup-issue-label factory:bananacast-hc3" in kept["teardown_command"]
+        assert "--cleanup-branch factory/gke-hc3" in kept["teardown_command"]
+        assert "gh_fake_token" not in json.dumps(kept_res)
+
         # Verify protected branch mutation raises RuntimeError AFTER gke_down runs
         monkeypatch.setattr(run_hillclimb_wave, "_poll_issues_until_verified", orig_poll)
         srv.lead_phase = "stopped"

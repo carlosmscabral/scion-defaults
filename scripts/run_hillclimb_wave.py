@@ -938,6 +938,41 @@ def _prepare_wave_files(
     return wave_spec_path, wave_env_path, project_slug, build_branch, issue_label, hub_project
 
 
+def _keep_project_for_debug(
+    *,
+    wave_spec_path: Path,
+    wave_env_path: Path,
+    backup_root: Path | str | None,
+    hub_project: str,
+    issue_label: str,
+    build_branch: str,
+) -> dict[str, Any]:
+    """Copy the wave env and spec out of the temp work dir and describe how to tear down later."""
+    root = Path(backup_root).expanduser() if backup_root else Path.home() / "scion-backups"
+    kept_dir = root / f"kept-{hub_project}"
+    kept_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(kept_dir, 0o700)
+    kept_env = kept_dir / "factory.env"
+    kept_spec = kept_dir / wave_spec_path.name
+    gke_lifecycle._write_private_file(kept_env, wave_env_path.read_text(encoding="utf-8"), mode=0o600)
+    gke_lifecycle._write_private_file(kept_spec, wave_spec_path.read_text(encoding="utf-8"), mode=0o600)
+    teardown = (
+        f"python3 scripts/scion_factory.py gke-down {kept_spec} --env {kept_env} --delete-project "
+        f"--cleanup-issue-label {issue_label} --cleanup-branch {build_branch} --apply --json"
+    )
+    return {
+        "ok": False,
+        "apply": True,
+        "skipped_teardown": True,
+        "kept_for_debug": True,
+        "hub_project": hub_project,
+        "project_deleted": False,
+        "env_file": str(kept_env),
+        "spec_file": str(kept_spec),
+        "teardown_command": teardown,
+    }
+
+
 def run_wave(
     wave_num: int,
     *,
@@ -949,8 +984,14 @@ def run_wave(
     preset_path: Path | str | None = None,
     backup_root: Path | str | None = None,
     apply: bool = False,
+    keep_on_failure: bool = False,
 ) -> dict[str, Any]:
-    """Execute or dry-run a single-project `bananacast` GKE hillclimb wave."""
+    """Execute or dry-run a single-project `bananacast` GKE hillclimb wave.
+
+    With `keep_on_failure`, a failed wave skips teardown: the GCP project, the GitHub wave issues and
+    the wave branch stay, and the wave env and spec are copied out of the temp dir so the failure can
+    be debugged in place. The operator must run the reported `teardown_command` afterwards.
+    """
     if wave_num not in WAVE_CATALOG:
         raise ValueError(f"Unsupported wave_num {wave_num!r}; expected one of {sorted(WAVE_CATALOG)}")
 
@@ -1134,16 +1175,28 @@ def run_wave(
         except (TimeoutError, RuntimeError) as exc:
             operational_error = gke_lifecycle._redact_secrets(str(exc), secret_strings)
         finally:
-            # 6. Always archive, clean up GitHub wave artifacts, delete ephemeral GCP project, and verify main SHAs
-            down_report = gke_lifecycle.gke_down(
-                wave_spec_path,
-                env_file=wave_env_path,
-                backup_root=backup_root,
-                cleanup_issue_label=issue_label,
-                cleanup_branch=build_branch,
-                delete_project=True,
-                apply=True,
-            )
+            # 6. Archive, clean up GitHub wave artifacts, delete ephemeral GCP project, and verify main SHAs.
+            #    Always, unless the wave failed and the operator asked to keep it for debugging.
+            kept_alive = bool(keep_on_failure) and (bool(operational_error) or not up_report.get("ok"))
+            if kept_alive:
+                down_report = _keep_project_for_debug(
+                    wave_spec_path=wave_spec_path,
+                    wave_env_path=wave_env_path,
+                    backup_root=backup_root,
+                    hub_project=hub_project,
+                    issue_label=issue_label,
+                    build_branch=build_branch,
+                )
+            else:
+                down_report = gke_lifecycle.gke_down(
+                    wave_spec_path,
+                    env_file=wave_env_path,
+                    backup_root=backup_root,
+                    cleanup_issue_label=issue_label,
+                    cleanup_branch=build_branch,
+                    delete_project=True,
+                    apply=True,
+                )
             backup_dir_str = str(down_report.get("backup_dir") or "")
             _merge_staged_pods_into_backup(
                 stage_dir,
@@ -1205,6 +1258,8 @@ def run_wave(
         }
         if operational_error:
             result["error"] = operational_error
+        if down_report.get("kept_for_debug"):
+            result["kept_for_debug"] = True
         return gke_lifecycle._redact_secrets(result, secret_strings)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1244,6 +1299,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional backup root directory for archived logs, transcripts, and scorecard.json",
     )
+    parser.add_argument(
+        "--keep-on-failure",
+        action="store_true",
+        help="If the wave fails, skip teardown and keep the GCP project, issues and branch for debugging "
+        "(the report prints the gke-down command to run afterwards)",
+    )
     parser.add_argument("--apply", action="store_true", help="Execute live cloud/GitHub wave (default: dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="Preview wave plan without mutating cloud/GitHub state")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON report")
@@ -1258,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_sec=args.timeout_sec,
         backup_root=Path(args.backup_root) if args.backup_root else None,
         apply=eff_apply,
+        keep_on_failure=args.keep_on_failure,
     )
     if args.json:
         print(json.dumps(report, indent=2))
