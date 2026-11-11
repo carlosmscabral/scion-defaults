@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+export PATH="${PATH}:${HOME}/.local/bin"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -12,7 +13,42 @@ IMAGE_TAG="${IMAGE_TAG:-v$(date -u +%Y%m%d%H%M%S)}"
 WORK_DIR="build/gke-hub"
 APPROVE_APPLY=0
 DRY_RUN="${DRY_RUN:-0}"
+SKIP_SHARED_INFRA="${SKIP_SHARED_INFRA:-0}"
+CLI_GKE_PROJECT=""
+CLI_GKE_CLUSTER=""
+CLI_GKE_REGION=""
+COPY_IMAGES_FROM="${COPY_IMAGES_FROM:-}"
+COPY_IMAGES_TAG="${COPY_IMAGES_TAG:-}"
+SPOT_WORKERS="${SPOT_WORKERS:-0}"
+SHARED_GCS_BUCKET="${SHARED_GCS_BUCKET:-}"
+DEFAULT_SCRATCHPAD="${DEFAULT_SCRATCHPAD:-}"
 ENV_FILE=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --env <file>               Load environment variables from file
+  --tier <tier>              Provisioning tier: terraform-ha (default) or hybrid-gke
+  --hub-mode <mode>          Hub deployment mode: cloudrun (default) or gke
+  --scion-repo <dir>         Path to Scion repository checkout (required)
+  --harnesses <list>         Comma-separated harnesses to build (default: claude,antigravity)
+  --image-tag <tag>          Container image tag (default: UTC timestamp)
+  --work-dir <dir>           Working directory for tfvars and build configs (default: build/gke-hub)
+  --skip-shared-infra        Skip configurations/shared-infra and reuse the existing GKE cluster
+  --gke-project <id>         GCP project hosting the GKE cluster (default: HUB_PROJECT)
+  --gke-cluster <name>       Existing GKE cluster name override (default: <SHARED_PREFIX>-agents)
+  --gke-region <region>      GKE cluster region/location override (default: HUB_REGION)
+  --copy-images-from <reg>   Fast-path: copy hub/base/harness images via crane from source AR registry
+  --spot-workers             Configure GKE Autopilot 'spot' profile and set as default runtime profile
+  --no-spot-workers          Keep 'remote' on-demand as default profile
+  --shared-gcs-bucket <name> Configure GCS FUSE volume (/scion-volumes/shared, disk=4Gi) and disable PVC scratchpad
+  --approve-apply            Execute Terraform apply, Cloud Build, and IAM changes
+  --dry-run                  Print commands without mutating GCP or local files (or DRY_RUN=1)
+  -h, --help                 Show this help message
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,9 +59,17 @@ while [[ $# -gt 0 ]]; do
     --harnesses) HARNESSES="$2"; shift 2 ;;
     --image-tag) IMAGE_TAG="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --skip-shared-infra) SKIP_SHARED_INFRA=1; shift 1 ;;
+    --gke-project) CLI_GKE_PROJECT="$2"; shift 2 ;;
+    --gke-cluster) CLI_GKE_CLUSTER="$2"; shift 2 ;;
+    --gke-region) CLI_GKE_REGION="$2"; shift 2 ;;
+    --copy-images-from) COPY_IMAGES_FROM="$2"; shift 2 ;;
+    --spot-workers) SPOT_WORKERS=1; shift 1 ;;
+    --no-spot-workers) SPOT_WORKERS=0; shift 1 ;;
+    --shared-gcs-bucket) SHARED_GCS_BUCKET="$2"; shift 2 ;;
     --approve-apply) APPROVE_APPLY=1; shift 1 ;;
     --dry-run) DRY_RUN=1; shift 1 ;;
-    -h|--help) echo "Usage: $0 [options]"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -54,6 +98,13 @@ STATE_BUCKET="${STATE_BUCKET:-${HUB_PROJECT}-${SHARED_PREFIX}-tfstate}"
 BUILD_POLL_SEC="${BUILD_POLL_SEC:-10}"
 SKIP_EXISTING_IMAGES="${SKIP_EXISTING_IMAGES:-0}"
 
+if [[ -n "$COPY_IMAGES_FROM" && "${SKIP_EXISTING_IMAGES:-0}" == "0" ]]; then
+  SKIP_EXISTING_IMAGES=1
+fi
+if [[ -n "$SHARED_GCS_BUCKET" && -z "$DEFAULT_SCRATCHPAD" ]]; then
+  DEFAULT_SCRATCHPAD="false"
+fi
+
 if [[ "$TIER" == "terraform-ha" ]]; then
   if [[ "$HUB_NAME" != "${SHARED_PREFIX}-"* ]]; then
     HUB_NAME="${SHARED_PREFIX}-${HUB_NAME}"
@@ -63,13 +114,21 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   else
     HUB_TF_DIR="hub-gke"
   fi
-  CLUSTER_NAME="${SHARED_PREFIX}-agents"
+  DEFAULT_CLUSTER_NAME="${SHARED_PREFIX}-agents"
   HUB_K8S_NAMESPACE="${HUB_NAME}"
   IMAGE_REGISTRY="${IMAGE_REGISTRY:-${HUB_REGION}-docker.pkg.dev/${HUB_PROJECT}/${SHARED_PREFIX}-scion}"
 else
-  CLUSTER_NAME="scion-hub-${HUB_NAME}"
+  DEFAULT_CLUSTER_NAME="scion-hub-${HUB_NAME}"
   HUB_K8S_NAMESPACE="scion-hub-${HUB_NAME}"
   IMAGE_REGISTRY="${IMAGE_REGISTRY:-${HUB_REGION}-docker.pkg.dev/${HUB_PROJECT}/scion}"
+fi
+
+HUB_GKE_PROJECT="${CLI_GKE_PROJECT:-${HUB_GKE_PROJECT:-${EXTERNAL_GKE_PROJECT_ID:-$HUB_PROJECT}}}"
+HUB_GKE_REGION="${CLI_GKE_REGION:-${HUB_GKE_REGION:-${HUB_GKE_LOCATION:-$HUB_REGION}}}"
+CLUSTER_NAME="${CLI_GKE_CLUSTER:-${HUB_GKE_CLUSTER:-${EXTERNAL_GKE_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}}"
+USE_EXTERNAL_GKE=0
+if [[ "$HUB_GKE_PROJECT" != "$HUB_PROJECT" || "$CLUSTER_NAME" != "$DEFAULT_CLUSTER_NAME" ]]; then
+  USE_EXTERNAL_GKE=1
 fi
 
 run() {
@@ -251,11 +310,34 @@ EOF
   if [[ -n "$iap_cid" ]]; then
     echo "iap_oauth_client_id = \"${iap_cid}\"" >> "$out_file"
   fi
+  if [[ "$USE_EXTERNAL_GKE" == "1" && "${HAS_HUB_EXTERNAL_GKE_TF:-0}" == "1" ]]; then
+    cat >> "$out_file" <<EOF
+external_gke_project_id   = "${HUB_GKE_PROJECT}"
+external_gke_cluster_name = "${CLUSTER_NAME}"
+EOF
+  fi
 }
 
 if [[ -z "$SCION_REPO" ]]; then
   echo "--scion-repo is required to build images and run Terraform." >&2
   exit 1
+fi
+
+HAS_SHARED_EXTERNAL_GKE_TF=0
+HAS_HUB_EXTERNAL_GKE_TF=0
+if [[ "$TIER" == "terraform-ha" ]]; then
+  SHARED_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/shared-infra"
+  HUB_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/${HUB_TF_DIR}"
+  if grep -q 'variable "external_gke_project_id"' "${SHARED_TF_PATH}/variables.tf" 2>/dev/null; then
+    HAS_SHARED_EXTERNAL_GKE_TF=1
+  fi
+  if grep -q 'variable "external_gke_project_id"' "${HUB_TF_PATH}/variables.tf" 2>/dev/null; then
+    HAS_HUB_EXTERNAL_GKE_TF=1
+  fi
+  if [[ "$USE_EXTERNAL_GKE" == "1" && "$HAS_HUB_EXTERNAL_GKE_TF" == "0" ]]; then
+    echo "Cross-project or custom-named GKE (${HUB_GKE_PROJECT}/${CLUSTER_NAME}) requires 'variable \"external_gke_project_id\"' support in ${HUB_TF_PATH}/variables.tf (e.g. scion-extensions)." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$WORK_DIR"
@@ -279,22 +361,36 @@ if [[ "$TIER" == "terraform-ha" ]]; then
     run gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
   fi
 
-  echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX})"
-  cat > "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
+  if [[ "$SKIP_SHARED_INFRA" == "1" ]]; then
+    echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX}) [skipped — reusing ${HUB_GKE_PROJECT}/${CLUSTER_NAME}]"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      run gcloud container clusters describe "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION"
+    else
+      gcloud container clusters describe "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION" --format='value(name)' >/dev/null
+    fi
+  else
+    echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX})"
+    cat > "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
 project_id            = "${HUB_PROJECT}"
 region                = "${HUB_REGION}"
 zone                  = "${HUB_ZONE}"
 name_prefix           = "${SHARED_PREFIX}"
 sql_availability_type = "${SQL_AVAILABILITY_TYPE}"
 EOF
+    if [[ "$USE_EXTERNAL_GKE" == "1" && "$HAS_SHARED_EXTERNAL_GKE_TF" == "1" ]]; then
+      cat >> "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
+external_gke_project_id   = "${HUB_GKE_PROJECT}"
+external_gke_cluster_name = "${CLUSTER_NAME}"
+EOF
+    fi
 
-  SHARED_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/shared-infra"
-  run terraform -chdir="${SHARED_TF_PATH}" init -reconfigure \
-    -backend-config="bucket=${STATE_BUCKET}" \
-    -backend-config="prefix=${SHARED_PREFIX}/shared-infra"
-  run terraform -chdir="${SHARED_TF_PATH}" plan -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
-  if [[ "$APPROVE_APPLY" == 1 && "$DRY_RUN" == 0 ]]; then
-    run terraform -chdir="${SHARED_TF_PATH}" apply -auto-approve -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    run terraform -chdir="${SHARED_TF_PATH}" init -reconfigure \
+      -backend-config="bucket=${STATE_BUCKET}" \
+      -backend-config="prefix=${SHARED_PREFIX}/shared-infra"
+    run terraform -chdir="${SHARED_TF_PATH}" plan -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    if [[ "$APPROVE_APPLY" == 1 && "$DRY_RUN" == 0 ]]; then
+      run terraform -chdir="${SHARED_TF_PATH}" apply -auto-approve -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    fi
   fi
 
   # Grant Cloud Build default SA builder + push access (modern GCP orgs disable automatic grants on default compute SA)
@@ -321,6 +417,18 @@ EOF
         --project="$HUB_PROJECT" --location="$REPO_LOC" \
         --member="serviceAccount:${CB_SA}" --role="roles/artifactregistry.writer" >/dev/null
     fi
+    if [[ "$USE_EXTERNAL_GKE" == "1" ]]; then
+      EXT_GKE_NODE_SA="${GKE_NODE_SA:-}"
+      if [[ -z "$EXT_GKE_NODE_SA" ]]; then
+        EXT_GKE_NUM="$(gcloud projects describe "$HUB_GKE_PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+        [[ -n "$EXT_GKE_NUM" ]] && EXT_GKE_NODE_SA="${EXT_GKE_NUM}-compute@developer.gserviceaccount.com"
+      fi
+      if [[ -n "$EXT_GKE_NODE_SA" ]]; then
+        gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+          --project="$HUB_PROJECT" --location="$REPO_LOC" \
+          --member="serviceAccount:${EXT_GKE_NODE_SA}" --role="roles/artifactregistry.reader" >/dev/null || true
+      fi
+    fi
   fi
 else
   REPO_NAME="$(basename "$IMAGE_REGISTRY")"
@@ -335,6 +443,67 @@ else
 fi
 
 echo "== 3. Build Hub & Multi-Arch Harness Images"
+if [[ -n "$COPY_IMAGES_FROM" ]]; then
+  SRC_REG="${COPY_IMAGES_FROM%/}"
+  SRC_TAG="${COPY_IMAGES_TAG:-$IMAGE_TAG}"
+  CRANE_CFG="${ABS_WORK_DIR}/cloudbuild-crane-copy.yaml"
+  cat > "$CRANE_CFG" <<EOF
+steps:
+  - name: 'gcr.io/go-containerregistry/crane:latest'
+    id: 'copy-core-base'
+    waitFor: ['-']
+    args: ['copy', '${SRC_REG}/core-base:${SRC_TAG}', '${IMAGE_REGISTRY}/core-base:${IMAGE_TAG}']
+  - name: 'gcr.io/go-containerregistry/crane:latest'
+    id: 'copy-scion-base'
+    waitFor: ['-']
+    args: ['copy', '${SRC_REG}/scion-base:${SRC_TAG}', '${IMAGE_REGISTRY}/scion-base:${IMAGE_TAG}']
+EOF
+  if [[ "$TIER" == "terraform-ha" && "$HUB_MODE" == "cloudrun" ]]; then
+    cat >> "$CRANE_CFG" <<EOF
+  - name: 'gcr.io/go-containerregistry/crane:latest'
+    id: 'copy-hub'
+    waitFor: ['-']
+    args: ['copy', '${SRC_REG}/hub:${SRC_TAG}', '${IMAGE_REGISTRY}/hub:${IMAGE_TAG}']
+EOF
+  fi
+  IFS=',' read -ra _CH_ARR <<< "$HARNESSES"
+  for _raw_h in "${_CH_ARR[@]}"; do
+    [[ -z "$_raw_h" ]] && continue
+    if [[ "$_raw_h" == "all" || "$_raw_h" == "harnesses" ]]; then
+      continue
+    fi
+    _step_target="$(resolve_harness_step "$_raw_h")"
+    cat >> "$CRANE_CFG" <<EOF
+  - name: 'gcr.io/go-containerregistry/crane:latest'
+    id: 'copy-${_step_target}-tag'
+    waitFor: ['-']
+    args: ['copy', '${SRC_REG}/${_step_target}:${SRC_TAG}', '${IMAGE_REGISTRY}/${_step_target}:${IMAGE_TAG}']
+  - name: 'gcr.io/go-containerregistry/crane:latest'
+    id: 'copy-${_step_target}-latest'
+    waitFor: ['-']
+    args: ['copy', '${SRC_REG}/${_step_target}:latest', '${IMAGE_REGISTRY}/${_step_target}:latest']
+EOF
+  done
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run gcloud builds submit --no-source --project="$HUB_PROJECT" --region="$HUB_REGION" --config="$CRANE_CFG"
+  elif [[ "$APPROVE_APPLY" == 1 ]]; then
+    SRC_LOC="${SRC_REG%%-docker.pkg.dev/*}"
+    SRC_PATH="${SRC_REG#*/}"
+    SRC_PROJ="${SRC_PATH%%/*}"
+    SRC_REPO="${SRC_PATH#*/}"
+    HUB_NUM_CB="$(gcloud projects describe "$HUB_PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+    for _cb_m in "${CB_SA:-}" "${HUB_NUM_CB:+${HUB_NUM_CB}@cloudbuild.gserviceaccount.com}" "${HUB_NUM_CB:+${HUB_NUM_CB}-compute@developer.gserviceaccount.com}"; do
+      [[ -n "$_cb_m" ]] || continue
+      gcloud artifacts repositories add-iam-policy-binding "$SRC_REPO" \
+        --project="$SRC_PROJ" --location="$SRC_LOC" \
+        --member="serviceAccount:${_cb_m}" --role="roles/artifactregistry.reader" --quiet >/dev/null 2>&1 || true
+      gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+        --project="$HUB_PROJECT" --location="$REPO_LOC" \
+        --member="serviceAccount:${_cb_m}" --role="roles/artifactregistry.writer" --quiet >/dev/null 2>&1 || true
+    done
+    gcloud builds submit --no-source --project="$HUB_PROJECT" --region="$HUB_REGION" --config="$CRANE_CFG" --quiet
+  fi
+fi
 if [[ "$TIER" == "terraform-ha" && "$HUB_MODE" == "cloudrun" ]]; then
   if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/pkg/runtimebroker/nfs_mount.go" ]]; then
     python3 - "${SCION_REPO}/pkg/runtimebroker/nfs_mount.go" <<'PY'
@@ -534,28 +703,207 @@ if [[ "$TIER" == "terraform-ha" ]]; then
     fi
   fi
 
-  echo "== 5. Verify GKE Agent Cluster & Hub-Scope Defaults"
-  run gcloud container clusters get-credentials "$CLUSTER_NAME" --project="$HUB_PROJECT" --region="$HUB_REGION"
+  echo "== 5. Verify GKE Agent Cluster, RBAC, Post-Deploy IAM & Hub-Scope Defaults"
+  run gcloud container clusters get-credentials "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION"
   run kubectl get namespace "$HUB_K8S_NAMESPACE"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "Plan: would ensure Role/${HUB_NAME}-hub in namespace ${HUB_K8S_NAMESPACE} permits serviceaccounts and events (get,list,watch)"
+  elif [[ "$APPROVE_APPLY" == 1 ]]; then
+    if kubectl -n "$HUB_K8S_NAMESPACE" get role "${HUB_NAME}-hub" >/dev/null 2>&1; then
+      kubectl -n "$HUB_K8S_NAMESPACE" get role "${HUB_NAME}-hub" -o json | python3 -c '
+import json, sys
+role = json.load(sys.stdin)
+rules = role.get("rules", [])
+need_sa = any("serviceaccounts" in r.get("resources", []) for r in rules)
+need_ev = any("events" in r.get("resources", []) for r in rules)
+if not need_sa or not need_ev:
+    rules.append({"apiGroups": [""], "resources": ["serviceaccounts", "events"], "verbs": ["get", "list", "watch"]})
+role["rules"] = rules
+print(json.dumps(role))
+' | kubectl apply -f - >/dev/null || true
+    fi
+  fi
 
   TARGET_PROJECT="${SANDBOX_PROJECT:-$HUB_PROJECT}"
   TARGET_LOCATION="${VERTEX_LOCATION:-${GOOGLE_CLOUD_LOCATION:-global}}"
+
+  # Post-deploy cross-SA, AR, IAP, Observability & GCS IAM bindings (SAs exist only after Step 4 Terraform)
+  HUB_SA_EMAIL="${HUB_NAME}-hub@${HUB_PROJECT}.iam.gserviceaccount.com"
+  AGENT_SA_EMAIL="${HUB_NAME}-agent@${HUB_PROJECT}.iam.gserviceaccount.com"
+  TRANSPORT_SA_EMAIL="${HUB_NAME}-transport@${HUB_PROJECT}.iam.gserviceaccount.com"
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}"
-  elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" == https://* ]]; then
-    HUB_URL="$HUB_URL_OUT" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" python3 - <<PY || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
-import os, sys
+    echo "Plan: would apply post-deploy IAM/IAP/AR/TokenCreator bindings for ${HUB_SA_EMAIL} and ${AGENT_SA_EMAIL}"
+    if [[ -n "$SHARED_GCS_BUCKET" ]]; then
+      echo "Plan: would ensure GCS bucket gs://${SHARED_GCS_BUCKET} with objectAdmin for ${AGENT_SA_EMAIL} and ${HUB_SA_EMAIL}"
+    fi
+    if [[ "$SPOT_WORKERS" == "1" || -n "$SHARED_GCS_BUCKET" ]]; then
+      echo "Plan: would configure Hub profiles (spot=${SPOT_WORKERS}, shared_gcs=${SHARED_GCS_BUCKET:-none}) and observability"
+    fi
+  elif [[ "$APPROVE_APPLY" == 1 ]]; then
+    _HUB_PROJ_NUM="$(gcloud projects describe "$HUB_PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+    if [[ -n "$_HUB_PROJ_NUM" ]]; then
+      for _role in roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
+        for _sa in "$HUB_SA_EMAIL" "$AGENT_SA_EMAIL"; do
+          gcloud projects add-iam-policy-binding "$HUB_PROJECT" --member="serviceAccount:${_sa}" --role="$_role" --condition=None --quiet >/dev/null 2>&1 || true
+        done
+      done
+      gcloud projects add-iam-policy-binding "$HUB_PROJECT" --member="serviceAccount:${HUB_SA_EMAIL}" --role="roles/run.admin" --condition=None --quiet >/dev/null 2>&1 || true
+      gcloud projects add-iam-policy-binding "$TARGET_PROJECT" --member="serviceAccount:${AGENT_SA_EMAIL}" --role="roles/aiplatform.user" --condition=None --quiet >/dev/null 2>&1 || true
+      for _ar_m in "serviceAccount:${AGENT_SA_EMAIL}" "serviceAccount:${HUB_SA_EMAIL}" "serviceAccount:service-${_HUB_PROJ_NUM}@serverless-robot-prod.iam.gserviceaccount.com"; do
+        gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" --project="$HUB_PROJECT" --location="$REPO_LOC" --role="roles/artifactregistry.reader" --member="$_ar_m" --quiet >/dev/null 2>&1 || true
+      done
+      gcloud iam service-accounts add-iam-policy-binding "$TRANSPORT_SA_EMAIL" --project="$HUB_PROJECT" --member="serviceAccount:${AGENT_SA_EMAIL}" --role="roles/iam.serviceAccountTokenCreator" --quiet >/dev/null 2>&1 || true
+      for _tc_m in "serviceAccount:${HUB_SA_EMAIL}" "serviceAccount:${AGENT_SA_EMAIL}"; do
+        gcloud iam service-accounts add-iam-policy-binding "$AGENT_SA_EMAIL" --project="$HUB_PROJECT" --member="$_tc_m" --role="roles/iam.serviceAccountTokenCreator" --quiet >/dev/null 2>&1 || true
+      done
+      for _su_m in "serviceAccount:${HUB_SA_EMAIL}" "user:${PO_EMAIL}" ${HUB_IMPERSONATE_SA:+"serviceAccount:${HUB_IMPERSONATE_SA}"}; do
+        gcloud iam service-accounts add-iam-policy-binding "$AGENT_SA_EMAIL" --project="$HUB_PROJECT" --member="$_su_m" --role="roles/iam.serviceAccountUser" --quiet >/dev/null 2>&1 || true
+      done
+      if [[ "$HUB_MODE" == "cloudrun" ]]; then
+        for _iap_m in "serviceAccount:${AGENT_SA_EMAIL}" "serviceAccount:${HUB_SA_EMAIL}" ${HUB_IMPERSONATE_SA:+"serviceAccount:${HUB_IMPERSONATE_SA}"}; do
+          gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$HUB_NAME" --region="$HUB_REGION" --project="$HUB_PROJECT" --role="roles/iap.httpsResourceAccessor" --member="$_iap_m" --quiet >/dev/null 2>&1 || true
+        done
+      fi
+      if [[ -n "${EXTRA_CROSS_IAP_SERVICES:-}" ]]; then
+        IFS=',' read -ra _X_IAP <<< "$EXTRA_CROSS_IAP_SERVICES"
+        for _xs in "${_X_IAP[@]}"; do
+          IFS=':' read -r _xp _xr _xn <<< "$_xs"
+          [[ -n "$_xp" && -n "$_xr" && -n "$_xn" ]] || continue
+          for _iap_m in "serviceAccount:${AGENT_SA_EMAIL}" "serviceAccount:${HUB_SA_EMAIL}" ${HUB_IMPERSONATE_SA:+"serviceAccount:${HUB_IMPERSONATE_SA}"}; do
+            gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$_xn" --region="$_xr" --project="$_xp" --role="roles/iap.httpsResourceAccessor" --member="$_iap_m" --quiet >/dev/null 2>&1 || true
+          done
+        done
+      fi
+      if [[ -n "$SHARED_GCS_BUCKET" ]]; then
+        if ! gcloud storage buckets describe "gs://${SHARED_GCS_BUCKET}" --project="$HUB_PROJECT" >/dev/null 2>&1; then
+          gcloud storage buckets create "gs://${SHARED_GCS_BUCKET}" --project="$HUB_PROJECT" --location="$HUB_REGION" --uniform-bucket-level-access --quiet >/dev/null 2>&1 || true
+        fi
+        for _gcs_m in "serviceAccount:${AGENT_SA_EMAIL}" "serviceAccount:${HUB_SA_EMAIL}"; do
+          gcloud storage buckets add-iam-policy-binding "gs://${SHARED_GCS_BUCKET}" --member="$_gcs_m" --role="roles/storage.objectAdmin" --quiet >/dev/null 2>&1 || true
+        done
+      fi
+    fi
+
+    if [[ -n "$HUB_URL_OUT" && "$HUB_URL_OUT" != "https://..." && ( "$HUB_URL_OUT" == https://* || "$HUB_URL_OUT" == http://* ) ]]; then
+      HUB_URL="$HUB_URL_OUT" HUB_IAP_AUDIENCE="${IAP_CLIENT_ID:-direct}" HUB_DIRECT_IAP_SIGN_JWT=1 HUB_PROJECT="$HUB_PROJECT" HUB_NAME="$HUB_NAME" HUB_REGION="$HUB_REGION" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" \
+      SPOT_WORKERS="$SPOT_WORKERS" SHARED_GCS_BUCKET="$SHARED_GCS_BUCKET" DEFAULT_SCRATCHPAD="${DEFAULT_SCRATCHPAD:-}" \
+      TARGET_PROJECT="$TARGET_PROJECT" TARGET_LOCATION="$TARGET_LOCATION" python3 - <<PY || echo "Warning: could not configure Hub API defaults automatically; retry after IAP propagates." >&2
+import json, os, subprocess, sys, time
 sys.path.insert(0, "${SCRIPT_DIR}")
-from hub_client import HubClient
-client = HubClient.from_env()
+from hub_client import HubClient, HubAPIError
+
+hub_url = os.environ["HUB_URL"]
+retries = int(os.environ.get("HUB_API_RETRY_ATTEMPTS", "12"))
+sleep_sec = float(os.environ.get("HUB_API_RETRY_SLEEP_SEC", "6"))
+
+client = None
+for attempt in range(1, retries + 1):
+    try:
+        client = HubClient.from_env()
+        client.request("GET", "/api/v1/admin/server-config", timeout=15)
+        break
+    except Exception as exc:
+        if attempt >= retries:
+            raise
+        print(f"Waiting for Hub IAP/IAM propagation ({attempt}/{retries}): {str(exc)[:120]}", file=sys.stderr)
+        time.sleep(sleep_sec)
+
 for key, val in [
-    ("GOOGLE_CLOUD_PROJECT", "${TARGET_PROJECT}"),
-    ("GOOGLE_CLOUD_REGION", "${TARGET_LOCATION}"),
-    ("GOOGLE_CLOUD_LOCATION", "${TARGET_LOCATION}"),
+    ("GOOGLE_CLOUD_PROJECT", os.environ["TARGET_PROJECT"]),
+    ("GOOGLE_CLOUD_QUOTA_PROJECT", os.environ["TARGET_PROJECT"]),
+    ("GOOGLE_CLOUD_REGION", os.environ["TARGET_LOCATION"]),
+    ("GOOGLE_CLOUD_LOCATION", os.environ["TARGET_LOCATION"]),
 ]:
     client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
-print("Configured hub-scope Vertex AI defaults on", "${HUB_URL_OUT}")
+
+if os.environ.get("DEFAULT_SCRATCHPAD", "").lower() == "false":
+    client.request("PUT", "/api/v1/admin/project-defaults", body={"default_scratchpad": False}, timeout=15)
+
+spot_workers = os.environ.get("SPOT_WORKERS") == "1"
+bucket = os.environ.get("SHARED_GCS_BUCKET", "").strip()
+
+if spot_workers or bucket:
+    _, cur = client.request("GET", "/api/v1/admin/server-config", timeout=15)
+    cur = cur if isinstance(cur, dict) else {}
+    profiles = dict(cur.get("profiles") or {})
+    runtimes = dict(cur.get("runtimes") or {})
+    vols = [{"source": "", "target": "/scion-volumes/shared", "type": "gcs", "bucket": bucket, "mode": "implicit-dirs"}] if bucket else None
+    k8s_res = {"requests": {"cpu": "1", "memory": "2Gi"}, "limits": {"cpu": "2", "memory": "4Gi"}, "disk": "4Gi"}
+    remote_prof = dict(profiles.get("remote") or {"runtime": "remote"})
+    remote_prof["runtime"] = "remote"
+    remote_prof["resources"] = k8s_res
+    if vols is not None:
+        remote_prof["volumes"] = vols
+    profiles["remote"] = remote_prof
+    if spot_workers:
+        spot_prof = {
+            "runtime": "remote",
+            "node_selector": {"cloud.google.com/gke-spot": "true"},
+            "tolerations": [{"key": "cloud.google.com/gke-spot", "operator": "Equal", "value": "true", "effect": "NoSchedule"}],
+            "resources": k8s_res,
+        }
+        if vols is not None:
+            spot_prof["volumes"] = vols
+        profiles["spot"] = spot_prof
+    runtimes["remote"] = {"type": "kubernetes", "namespace": os.environ["HUB_NAME"]}
+    patch_sc = {
+        "profiles": profiles,
+        "runtimes": runtimes,
+        "server": {
+            "hub": {
+                "stalled_threshold": "16h",
+                "auto_suspend_stalled": False,
+                "observability": {"metrics_enabled": True, "tracing_enabled": True},
+            }
+        },
+        "telemetry": {
+            "enabled": True,
+            "cloud": {"enabled": True, "provider": "gcp", "gcp_project_id": os.environ["HUB_PROJECT"]},
+            "hub": {"enabled": True},
+        },
+    }
+    if spot_workers:
+        patch_sc["active_profile"] = "spot"
+    client.request("PUT", "/api/v1/admin/server-config", body=patch_sc, timeout=15)
+
+    # Also synchronize embedded broker settings in Secret Manager + Cloud Run revision when present
+    try:
+        import yaml
+        sec_name = f"{os.environ['HUB_NAME']}-settings"
+        sec_raw = subprocess.check_output(
+            ["gcloud", "secrets", "versions", "access", "latest", f"--secret={sec_name}", f"--project={os.environ['HUB_PROJECT']}"],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        sec_cfg = yaml.safe_load(sec_raw) or {}
+        if spot_workers:
+            sec_cfg["active_profile"] = "spot"
+        sec_cfg["profiles"] = profiles
+        sec_cfg["runtimes"] = {**dict(sec_cfg.get("runtimes") or {}), **runtimes}
+        sec_dumped = yaml.safe_dump(sec_cfg, sort_keys=False)
+        subprocess.run(
+            ["gcloud", "secrets", "versions", "add", sec_name, f"--project={os.environ['HUB_PROJECT']}", "--data-file=-"],
+            input=sec_dumped, text=True, check=True, stderr=subprocess.DEVNULL, timeout=20,
+        )
+        ver = subprocess.check_output(
+            ["gcloud", "secrets", "versions", "list", sec_name, f"--project={os.environ['HUB_PROJECT']}", "--sort-by=~createTime", "--limit=1", "--format=value(name)"],
+            text=True, stderr=subprocess.DEVNULL, timeout=15,
+        ).strip().split("/")[-1]
+        subprocess.run(
+            [
+                "gcloud", "run", "services", "update", os.environ["HUB_NAME"],
+                f"--region={os.environ['HUB_REGION']}", f"--project={os.environ['HUB_PROJECT']}",
+                f"--update-secrets=/run/secrets/settings.yaml={sec_name}:{ver}",
+                "--update-env-vars=SCION_CLOUD_LOGGING=true",
+                "--quiet",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
+        )
+    except Exception:
+        pass
+print("Configured hub-scope defaults & profiles on", hub_url)
 PY
+    fi
   fi
 
 elif [[ "$TIER" == "hybrid-gke" ]]; then
@@ -590,7 +938,13 @@ if [[ -n "$IAP_CLIENT_ID" ]]; then
   echo "HUB_IAP_AUDIENCE=${IAP_CLIENT_ID}"
 fi
 echo "AGENT_RUNTIME=kubernetes"
-echo "RUNTIME_PROFILE=remote"
+if [[ "$SPOT_WORKERS" == "1" ]]; then
+  echo "RUNTIME_PROFILE=spot"
+  echo "LEAD_PROFILE=remote"
+else
+  echo "RUNTIME_PROFILE=remote"
+fi
+echo "HUB_GKE_PROJECT=${HUB_GKE_PROJECT}"
 echo "HUB_K8S_CLUSTER=${CLUSTER_NAME}"
 echo "HUB_K8S_NAMESPACE=${HUB_K8S_NAMESPACE}"
 echo "IMAGE_REGISTRY=${IMAGE_REGISTRY}"

@@ -662,4 +662,114 @@ def test_setup_gke_hub_patches_shared_project_clone_per_agent_idempotently(tmp_p
     assert "ClaimName: pvcName,\n\t\t\t\tReadOnly:  sd.ReadOnly," in patched_k8s_rt
 
 
+def test_setup_gke_hub_supports_shared_gke_crane_spot_cloudrun_and_gcs_dry_run(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    for cfg in ("shared-infra", "hub"):
+        (scion_repo / "deploy" / "terraform" / "configurations" / cfg / "variables.tf").write_text(
+            'variable "external_gke_project_id" { default = "" }\n'
+            'variable "external_gke_cluster_name" { default = "" }\n'
+        )
+    work_dir = tmp_path / "work-lean-ha"
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "demo-scion-x",
+        "HUB_REGION": "us-central1",
+        "HUB_ZONE": "us-central1-b",
+        "SHARED_PREFIX": "tfhx",
+        "HUB_NAME": "main",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--gke-project",
+            "shared-gke-host",
+            "--gke-cluster",
+            "shared-autopilot",
+            "--gke-region",
+            "us-central1",
+            "--skip-shared-infra",
+            "--copy-images-from",
+            "us-central1-docker.pkg.dev/src-proj/src-repo",
+            "--spot-workers",
+            "--shared-gcs-bucket",
+            "demo-scion-x-shared",
+            "--image-tag",
+            "v20261110",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "reusing shared-gke-host/shared-autopilot" in out
+    crane_yaml = (work_dir / "cloudbuild-crane-copy.yaml").read_text()
+    assert "gcr.io/go-containerregistry/crane:latest" in crane_yaml
+    assert "us-central1-docker.pkg.dev/src-proj/src-repo/hub:v20261110" in crane_yaml
+    assert "us-central1-docker.pkg.dev/demo-scion-x/tfhx-scion/scion-antigravity:v20261110" in crane_yaml
+    hub_tfvars = (work_dir / "hub.tfvars").read_text()
+    assert 'external_gke_project_id   = "shared-gke-host"' in hub_tfvars
+    assert 'external_gke_cluster_name = "shared-autopilot"' in hub_tfvars
+    assert "permits serviceaccounts and events" in out
+    assert "RUNTIME_PROFILE=spot" in out
+    assert "LEAD_PROFILE=remote" in out
+    assert "HUB_GKE_PROJECT=shared-gke-host" in out
+    assert "gs://demo-scion-x-shared" in out
+
+
+def test_setup_gke_hub_rejects_external_gke_without_terraform_support(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-no-ext"
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "demo-scion-x",
+        "HUB_REGION": "us-central1",
+        "HUB_ZONE": "us-central1-b",
+        "SHARED_PREFIX": "tfhx",
+        "HUB_NAME": "main",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--gke-project",
+            "shared-gke-host",
+            "--gke-cluster",
+            "shared-autopilot",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 1
+    assert "external_gke_project_id" in res.stderr
+
+
+
+
 
