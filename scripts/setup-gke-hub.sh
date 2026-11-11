@@ -328,17 +328,36 @@ mkdir -p "$WORK_DIR"
 ABS_WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
 SCION_GIT_URL="${SCION_GIT_URL:-https://github.com/GoogleCloudPlatform/scion.git}"
-SCION_REF="${SCION_REF:-}"
+# Scion revision the Hub and agent images are built from. Pinned, because this script patches Scion
+# source by text and four of the eight failures in hillclimb Run 1 came from upstream changes that
+# landed between runs. The pin is the commit the first end-to-end run passed on. To move it, run a
+# full cold start with SCION_REF=main (or a newer commit), fix what breaks, then update this default.
+SCION_PINNED_REF="6eb4b41c452ca24c4b7f798d9b36c5a7bdb93b63"
+SCION_REF="${SCION_REF:-$SCION_PINNED_REF}"
 
 if [[ -z "$SCION_REPO" ]]; then
   SCION_REPO="${ABS_WORK_DIR}/scion-src"
-  if [[ ! -d "${SCION_REPO}/.git" && ! -d "${SCION_REPO}/deploy/terraform" ]]; then
-    clone_args=(clone --depth 1)
-    if [[ -n "$SCION_REF" ]]; then
-      clone_args+=(-b "$SCION_REF")
+  _scion_ref_is_sha=0
+  [[ "$SCION_REF" =~ ^[0-9a-f]{40}$ ]] && _scion_ref_is_sha=1
+  if [[ "$_scion_ref_is_sha" == "1" && -d "${SCION_REPO}/.git" ]]; then
+    # A cached clone of another revision (for example an earlier unpinned run) is replaced; it is
+    # this script's own build cache under WORK_DIR, never a caller's checkout.
+    _scion_have="$(git -C "$SCION_REPO" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$_scion_have" != "$SCION_REF" ]]; then
+      echo "Scion cache is at ${_scion_have:-unknown}, want ${SCION_REF}: recloning ${SCION_REPO}." >&2
+      run rm -rf "$SCION_REPO"
     fi
-    clone_args+=("$SCION_GIT_URL" "$SCION_REPO")
-    run git "${clone_args[@]}"
+  fi
+  if [[ ! -d "${SCION_REPO}/.git" && ! -d "${SCION_REPO}/deploy/terraform" ]]; then
+    if [[ "$_scion_ref_is_sha" == "1" ]]; then
+      # `git clone -b` takes a branch or tag, not a commit: fetch the commit itself.
+      run git init -q "$SCION_REPO"
+      run git -C "$SCION_REPO" remote add origin "$SCION_GIT_URL"
+      run git -C "$SCION_REPO" fetch -q --depth 1 origin "$SCION_REF"
+      run git -C "$SCION_REPO" checkout -q FETCH_HEAD
+    else
+      run git clone --depth 1 -b "$SCION_REF" "$SCION_GIT_URL" "$SCION_REPO"
+    fi
   fi
 fi
 

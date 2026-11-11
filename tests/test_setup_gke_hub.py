@@ -671,14 +671,16 @@ def test_setup_gke_hub_auto_clones_scion_when_scion_repo_omitted(tmp_path):
     fake_bin.mkdir()
     calls_log = tmp_path / "calls.log"
 
+    pinned = "6eb4b41c452ca24c4b7f798d9b36c5a7bdb93b63"
     (fake_bin / "git").write_text(
         '#!/usr/bin/env bash\n'
         f'echo "git $*" >> "{calls_log}"\n'
-        'if [[ "$1" == "clone" ]]; then\n'
+        'if [[ "$1" == "clone" || "$1" == "init" ]]; then\n'
         '  dest="${@: -1}"\n'
         '  mkdir -p "$dest/.git"\n'
         f'  cp -R "{template_scion}/." "$dest/"\n'
         'fi\n'
+        f'if [[ "$*" == *"rev-parse HEAD"* ]]; then echo "${{FAKE_SCION_HEAD:-{pinned}}}"; fi\n'
         'exit 0\n'
     )
     (fake_bin / "git").chmod(0o755)
@@ -725,7 +727,12 @@ def test_setup_gke_hub_auto_clones_scion_when_scion_repo_omitted(tmp_path):
     assert res.returncode == 0, out
     calls = calls_log.read_text()
     expected_src = str((work_dir / "scion-src").resolve())
-    assert "git clone --depth 1 https://github.com/GoogleCloudPlatform/scion.git" in calls
+    # Default: the pinned Scion commit, fetched by SHA (git clone -b cannot take a commit)
+    assert f"git init -q {expected_src}" in calls
+    assert f"git -C {expected_src} remote add origin https://github.com/GoogleCloudPlatform/scion.git" in calls
+    assert f"git -C {expected_src} fetch -q --depth 1 origin {pinned}" in calls
+    assert f"git -C {expected_src} checkout -q FETCH_HEAD" in calls
+    assert "git clone" not in calls
     assert expected_src in calls
     assert (work_dir / "scion-src" / ".git").is_dir()
     assert f"-chdir={expected_src}/deploy/terraform/configurations/shared-infra" in calls
@@ -752,7 +759,7 @@ def test_setup_gke_hub_auto_clones_scion_when_scion_repo_omitted(tmp_path):
         text=True,
     )
     assert res2.returncode == 0, res2.stdout + res2.stderr
-    assert calls_log.read_text().count("git clone --depth 1") == 1
+    assert calls_log.read_text().count("fetch -q --depth 1 origin") == 1
 
     # SCION_REF passes -b <ref> on fresh work_dir
     work_dir_ref = tmp_path / "work-autoclone-ref"
@@ -778,6 +785,21 @@ def test_setup_gke_hub_auto_clones_scion_when_scion_repo_omitted(tmp_path):
     )
     assert res3.returncode == 0, res3.stdout + res3.stderr
     assert "git clone --depth 1 -b v0.9.1 https://github.com/GoogleCloudPlatform/scion.git" in calls_log.read_text()
+
+    # A cached clone at another revision (for example from an unpinned run) is replaced by the pin
+    res4 = subprocess.run(
+        [
+            "bash", str(ROOT / "scripts/setup-gke-hub.sh"), "--tier", "terraform-ha", "--hub-mode", "cloudrun",
+            "--work-dir", str(work_dir), "--image-tag", "v20261110", "--harnesses", "antigravity",
+        ],
+        cwd=ROOT,
+        env={**env, "FAKE_SCION_HEAD": "d84957b00ec033d7f3b4c0bc33026ebe6bbf4c5a"},
+        capture_output=True,
+        text=True,
+    )
+    assert res4.returncode == 0, res4.stdout + res4.stderr
+    assert "recloning" in res4.stderr
+    assert calls_log.read_text().count(f"fetch -q --depth 1 origin {pinned}") == 2
 
 
 def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal_sql(tmp_path):
