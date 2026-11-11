@@ -452,16 +452,29 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     ]
     assert "/scion-volumes/knowledge-plane/INDEX.md" in lead_posts[0]["task"]
 
-    # 2. Cloud telemetry env configured on GKE apply (HUB_PROJECT fallback to SANDBOX_PROJECT)
-    env_puts = {}
-    for req in fake_hub.requests:
-        if req["method"] == "PUT" and ("/env/" in req["path"]):
-            key = req["path"].rsplit("/", 1)[-1]
-            env_puts[key] = json.loads(req["body"].decode("utf-8"))["value"]
-    assert env_puts["SCION_TELEMETRY_ENABLED"] == "true"
-    assert env_puts["SCION_TELEMETRY_CLOUD_ENABLED"] == "true"
-    assert env_puts["SCION_TELEMETRY_CLOUD_PROVIDER"] == "gcp"
-    assert env_puts["SCION_GCP_PROJECT_ID"] == "my-hub"
+    # 2. Cloud telemetry on GKE apply goes into each template's `telemetry:` block (HUB_PROJECT fallback
+    #    to SANDBOX_PROJECT). The Hub env API rejects SCION_* names as reserved (hillclimb Run 1), so
+    #    provisioning must never PUT them.
+    env_put_keys = {
+        req["path"].rsplit("/", 1)[-1]
+        for req in fake_hub.requests
+        if req["method"] == "PUT" and ("/env/" in req["path"])
+    }
+    assert not any(k.startswith("SCION_") for k in env_put_keys), env_put_keys
+    import provision_factory
+    import yaml
+
+    agent_yamls = sorted((kit_dir / "templates").glob("*/scion-agent.yaml"))
+    assert agent_yamls
+    for agent_yaml in agent_yamls:
+        cfg = yaml.safe_load(agent_yaml.read_text())
+        assert cfg["telemetry"] == {
+            "enabled": True,
+            "cloud": {"enabled": True, "provider": "gcp", "gcp_project_id": "my-hub"},
+        }, agent_yaml
+        assert cfg["env"]["GOOGLE_CLOUD_LOCATION"] == "global"
+    # Idempotent: a second pass leaves the files unchanged
+    assert provision_factory._inject_cloud_telemetry(kit_dir / "templates", "my-hub") == []
 
     # 3. Delta mode skips Scion LLM schedule creation completely
     assert fake_hub.schedules.get(build_pid, []) == []

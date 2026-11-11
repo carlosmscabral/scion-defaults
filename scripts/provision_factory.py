@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -9,6 +10,37 @@ from pathlib import Path
 from hub_client import HubClient
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+_TELEMETRY_BLOCK_RE = re.compile(r"(?m)^telemetry:[ \t]*\n(?:[ \t]+.*\n?)*")
+
+
+def _inject_cloud_telemetry(tpl_root: Path, gcp_project: str) -> list[str]:
+    """Point every kit template's `telemetry:` block at GCP-native export for `gcp_project`.
+
+    Scion turns this block into SCION_TELEMETRY_* / SCION_GCP_PROJECT_ID inside the agent container.
+    The Hub env API cannot carry them: it rejects SCION_* names as reserved. The project ID is only
+    known at provision time, so the compiled kit (git-ignored) is rewritten in place, idempotently.
+    """
+    if not gcp_project or not tpl_root.is_dir():
+        return []
+    block = (
+        "telemetry:\n"
+        "  enabled: true\n"
+        "  cloud:\n"
+        "    enabled: true\n"
+        "    provider: gcp\n"
+        f'    gcp_project_id: "{gcp_project}"\n'
+    )
+    changed: list[str] = []
+    for path in sorted(tpl_root.glob("*/scion-agent.yaml")):
+        text = path.read_text(encoding="utf-8")
+        updated, count = _TELEMETRY_BLOCK_RE.subn(lambda _m: block, text, count=1)
+        if count == 0:
+            updated = text.rstrip("\n") + "\n" + block
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+            changed.append(path.parent.name)
+    return changed
 
 
 def _load_env(env_file) -> dict:
@@ -270,38 +302,10 @@ def provision_factory(
                     if exc.status not in (403, 409, 422):
                         raise
 
-            telemetry_gcp_project = eff_env.get("HUB_PROJECT") or sandbox_project
-            telemetry_env = [
-                ("SCION_TELEMETRY_ENABLED", "true"),
-                ("SCION_TELEMETRY_CLOUD_ENABLED", "true"),
-                ("SCION_TELEMETRY_CLOUD_PROVIDER", "gcp"),
-            ]
-            if telemetry_gcp_project:
-                telemetry_env.append(("SCION_GCP_PROJECT_ID", telemetry_gcp_project))
-
-            for key, val in telemetry_env:
-                try:
-                    client.request(
-                        "PUT",
-                        f"/api/v1/env/{key}",
-                        body={"value": val, "scope": "hub", "injectionMode": "always"},
-                    )
-                except HubAPIError as exc:
-                    if exc.status not in (403, 404, 405):
-                        raise
-
+            # Cloud telemetry is not set through the Hub env API: the Hub rejects SCION_* names with
+            # 400 (reserved control-plane namespace). Phase 7 writes it into each template's
+            # scion-agent.yaml `telemetry:` block instead (see _inject_cloud_telemetry).
             for pid in target_pids:
-                for key, val in telemetry_env:
-                    try:
-                        client.request(
-                            "PUT",
-                            f"/api/v1/projects/{pid}/env/{key}",
-                            body={"value": val, "injectionMode": "always"},
-                        )
-                    except HubAPIError as exc:
-                        if exc.status not in (403, 404, 405):
-                            raise
-
                 worker_sa_rec = client.register_project_service_account(pid, worker_sa_email, sandbox_project, name=worker_sa_name)
                 worker_sa_uuid = worker_sa_rec.get("id", worker_sa_email)
                 if scion_factory.deploy_mode(spec) != "none" and deployer_sa_name:
@@ -393,6 +397,8 @@ def provision_factory(
                 subprocess.run(cmd_harness, cwd=ROOT_DIR, env=sub_base_env, check=True, stdout=sys.stderr)
 
         tpl_root = kit_dir / "templates"
+        if runtime == "kubernetes" and apply:
+            _inject_cloud_telemetry(tpl_root, eff_env.get("HUB_PROJECT") or sandbox_project)
 
         def _roles_csv(entries: list[dict]) -> str:
             names = [r.get("role", "") for r in entries if r.get("role")]

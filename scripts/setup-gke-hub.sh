@@ -119,6 +119,10 @@ HUB_ZONE="${HUB_ZONE:-${HUB_REGION}-b}"
 USE_OPERATOR_SA="${USE_OPERATOR_SA:-$([[ "$CREATE_PROJECT" == "1" && "$HUB_MODE" == "cloudrun" ]] && echo 1 || echo 0)}"
 STATE_BUCKET="${STATE_BUCKET:-${HUB_PROJECT}-${SHARED_PREFIX}-tfstate}"
 BUILD_POLL_SEC="${BUILD_POLL_SEC:-10}"
+# Platforms for the Scion base and harness images. Cloud Run and GKE Autopilot run amd64 only, and the
+# upstream arm64 half builds under emulation (about 60 of the 90 cold-start minutes in hillclimb Run 1).
+# Set IMAGE_PLATFORMS=all to keep the upstream linux/amd64,linux/arm64 builds.
+IMAGE_PLATFORMS="${IMAGE_PLATFORMS:-linux/amd64}"
 SKIP_EXISTING_IMAGES="${SKIP_EXISTING_IMAGES:-0}"
 
 if [[ "$TIER" == "terraform-ha" ]]; then
@@ -634,6 +638,18 @@ EOF
   fi
 fi
 
+if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && "$IMAGE_PLATFORMS" != "all" && -d "${SCION_REPO}/image-build" ]]; then
+  # build-images.sh ignores --platform under --builder cloud-build (the YAMLs hardcode both platforms).
+  python3 - "${SCION_REPO}/image-build" "$IMAGE_PLATFORMS" <<'PY'
+import pathlib, sys
+root, platforms = pathlib.Path(sys.argv[1]), sys.argv[2]
+for p in sorted(root.glob("cloudbuild*.yaml")):
+    src = p.read_text()
+    if "linux/amd64,linux/arm64" in src:
+        p.write_text(src.replace("linux/amd64,linux/arm64", platforms))
+PY
+fi
+
 for base_target in core-base scion-base; do
   if [[ "$DRY_RUN" == "1" || "$APPROVE_APPLY" == 1 ]]; then
     if ! image_exists_in_ar "${IMAGE_REGISTRY}/${base_target}:${IMAGE_TAG}"; then
@@ -740,7 +756,7 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   run kubectl get namespace "$HUB_K8S_NAMESPACE"
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}, SCION_TELEMETRY_ENABLED=true, SCION_TELEMETRY_CLOUD_ENABLED=true, SCION_TELEMETRY_CLOUD_PROVIDER=gcp, SCION_GCP_PROJECT_ID=${TARGET_PROJECT}"
+    echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}"
   elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" == https://* ]]; then
     HUB_URL="${HUB_API_BASE_URL:-$HUB_URL_OUT}" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" python3 - <<PY || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
 import os, sys
@@ -751,13 +767,11 @@ for key, val in [
     ("GOOGLE_CLOUD_PROJECT", "${TARGET_PROJECT}"),
     ("GOOGLE_CLOUD_REGION", "${TARGET_LOCATION}"),
     ("GOOGLE_CLOUD_LOCATION", "${TARGET_LOCATION}"),
-    ("SCION_TELEMETRY_ENABLED", "true"),
-    ("SCION_TELEMETRY_CLOUD_ENABLED", "true"),
-    ("SCION_TELEMETRY_CLOUD_PROVIDER", "gcp"),
-    ("SCION_GCP_PROJECT_ID", "${TARGET_PROJECT}"),
 ]:
+    # The Hub env API rejects SCION_* names (reserved control-plane namespace), so cloud telemetry is
+    # configured in each template's scion-agent.yaml `telemetry:` block by provision_factory.py.
     client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
-print("Configured hub-scope Vertex AI and Cloud Telemetry defaults on", "${HUB_URL_OUT}")
+print("Configured hub-scope Vertex AI defaults on", "${HUB_URL_OUT}")
 PY
   fi
 

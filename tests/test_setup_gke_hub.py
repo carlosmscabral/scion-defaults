@@ -939,6 +939,8 @@ def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal
 
 def test_setup_gke_hub_write_env_merges_existing_keys_and_sets_0600(tmp_path, fake_hub):
     scion_repo = make_fake_scion_upstream(tmp_path)
+    cb_yaml = scion_repo / "image-build" / "cloudbuild-scion-base.yaml"
+    cb_yaml.write_text("steps:\n  - args:\n      - '--platform'\n      - 'linux/amd64,linux/arm64'\n")
     work_dir = tmp_path / "work-write-env"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1064,10 +1066,12 @@ def test_setup_gke_hub_write_env_merges_existing_keys_and_sets_0600(tmp_path, fa
     assert env_puts["GOOGLE_CLOUD_PROJECT"]["value"] == "demo-hub-proj"
     assert env_puts["GOOGLE_CLOUD_REGION"]["value"] == "global"
     assert env_puts["GOOGLE_CLOUD_LOCATION"]["value"] == "global"
-    assert env_puts["SCION_TELEMETRY_ENABLED"]["value"] == "true"
-    assert env_puts["SCION_TELEMETRY_CLOUD_ENABLED"]["value"] == "true"
-    assert env_puts["SCION_TELEMETRY_CLOUD_PROVIDER"]["value"] == "gcp"
-    assert env_puts["SCION_GCP_PROJECT_ID"]["value"] == "demo-hub-proj"
+    # The Hub env API rejects SCION_* names as reserved (hillclimb Run 1); telemetry lives in templates.
+    assert not any(k.startswith("SCION_") for k in env_puts), sorted(env_puts)
+
+    # Upstream Cloud Build configs are narrowed to amd64 (the emulated arm64 half dominated cold start).
+    assert "linux/arm64" not in cb_yaml.read_text()
+    assert "'linux/amd64'" in cb_yaml.read_text()
 
     # DRY_RUN=1 never mutates --write-env outside WORK_DIR
     untouched = tmp_path / "untouched.env"
