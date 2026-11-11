@@ -9,5 +9,3 @@ env:
   FACTORY_SUBDIR: "${FACTORY_SUBDIR}"   # product folder the harness starts in (factory-cd.sh)
 # Antigravity agents need the telemetry-free hook command (scripts/patch-antigravity-hooks.py): this block alone does
 # not help, because the Hub-injected SCION_TELEMETRY_ENABLED wins over it today (lessons-learned.md L6).
-telemetry:
-  enabled: false

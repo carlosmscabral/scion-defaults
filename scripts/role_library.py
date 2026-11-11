@@ -66,6 +66,7 @@ When two reviewed PASS issues touch overlapping files in the shared worktree, au
 If a push is rejected by repository or token scope limits (for example `.github/workflows/*` without `workflow` scope), have the worker save the reviewed restricted paths as a patch in `/scion-volumes/scratchpad/pending-<issue>/`, land the permitted paths, escalate the patch path to the product owner through your Decision rights channel, and keep remaining WIP moving.
 Escalate scope adjustments, architectural decisions (ADRs), and cost/IAM questions to the product owner.
 Never write product code yourself.
+When a specialist stays silent or idle for more than 5 minutes after starting or receiving a brief, inspect expected deliverables first and nudge it with `scion message --interrupt <agent> "..."`.
 Coordinate teammates, track task progress, and post evidence comments when work is verified.""",
     },
     "backend": {
@@ -101,6 +102,7 @@ Deliver clean diffs to your lead and report completion with exact file locations
         "responsibility": "Reviews diffs for ACID transaction safety, invariants, and test coverage; renders PASS/FAIL verdicts.",
         "needs_service": False,
         "protocol": """You review code changes independently against repository invariants, design specifications, and ADRs.
+Inspect the delivered files and brief acceptance checks first (before scanning unrelated harness or template configs).
 Examine the diff thoroughly for ACID transaction safety, edge-case coverage, and regressions.
 Verify that tests importing optional or secondary-app packages guard those imports (for example `pytest.importorskip(...)`) so test collection stays green in minimal per-app environments.
 Deliver a definitive PASS or FAIL verdict with concrete file:line evidence to your lead.

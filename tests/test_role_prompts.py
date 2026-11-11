@@ -120,6 +120,23 @@ def test_eval_lead_briefs_by_file_and_sizes_only_with_its_own_team(kit):
     assert "investigator" not in eval_lead
 
 
+def test_deterministic_wake_sla_reviewer_focus_and_clean_agent_yaml(kit):
+    lead_prompt = _prompt(kit, "lead")
+    reviewer_prompt = _prompt(kit, "reviewer")
+    assert "more than 5 minutes" in lead_prompt
+    assert "scion message --interrupt" in lead_prompt
+    assert "Inspect the delivered files and brief acceptance checks first" in reviewer_prompt
+    assert "telemetry:" not in (kit / "templates" / "lead" / "scion-agent.yaml").read_text()
+    assert "max_duration:" not in (kit / "templates" / "lead" / "scion-agent.yaml").read_text()
+    assert "telemetry:" not in (kit / "templates" / "reviewer" / "scion-agent.yaml").read_text()
+
+    static_lead = (ROOT / "templates" / "lead" / "system-prompt.md").read_text()
+    static_rev = (ROOT / "templates" / "reviewer" / "system-prompt.md").read_text()
+    assert "5 minutes" in static_lead and "30 minutes" not in static_lead
+    assert "Inspect deliverables first" in static_rev
+
+
+
 # --- Fix round 1: roster-aware reviewers, role-aware Operating Loop, kinds, pre-work reports -----------------------
 
 def _compile(tmp_path, spec):

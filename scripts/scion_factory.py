@@ -1159,8 +1159,6 @@ def _render_scion_agent_yaml(role_spec: dict[str, Any], spec: dict[str, Any] | N
         "schema_version: \"1\"",
         f"default_harness_config: {harness}-factory" if use_factory_hc else f"default_harness_config: {harness}",
         f"model: \"{model}\"",
-        "telemetry:",
-        "  enabled: true",
     ]
     env = []
     if (harness == "opencode" and "vertex" in model.lower()) or (
