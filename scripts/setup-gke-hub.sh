@@ -12,7 +12,33 @@ IMAGE_TAG="${IMAGE_TAG:-v$(date -u +%Y%m%d%H%M%S)}"
 WORK_DIR="build/gke-hub"
 APPROVE_APPLY=0
 DRY_RUN="${DRY_RUN:-0}"
+SKIP_SHARED_INFRA="${SKIP_SHARED_INFRA:-0}"
+CLI_GKE_PROJECT=""
+CLI_GKE_CLUSTER=""
+CLI_GKE_REGION=""
 ENV_FILE=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --env <file>           Load environment variables from file
+  --tier <tier>          Provisioning tier: terraform-ha (default) or hybrid-gke
+  --hub-mode <mode>      Hub deployment mode: cloudrun (default) or gke
+  --scion-repo <dir>     Path to Scion repository checkout (required)
+  --harnesses <list>     Comma-separated harnesses to build (default: claude,antigravity)
+  --image-tag <tag>      Container image tag (default: UTC timestamp)
+  --work-dir <dir>       Working directory for tfvars and build configs (default: build/gke-hub)
+  --skip-shared-infra    Skip configurations/shared-infra and reuse the existing GKE cluster
+  --gke-project <id>     GCP project hosting the GKE cluster (default: HUB_PROJECT)
+  --gke-cluster <name>   Existing GKE cluster name override (default: <SHARED_PREFIX>-agents)
+  --gke-region <region>  GKE cluster region/location override (default: HUB_REGION)
+  --approve-apply        Execute Terraform apply, Cloud Build, and IAM changes
+  --dry-run              Print commands without mutating GCP or local files (or DRY_RUN=1)
+  -h, --help             Show this help message
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,9 +49,13 @@ while [[ $# -gt 0 ]]; do
     --harnesses) HARNESSES="$2"; shift 2 ;;
     --image-tag) IMAGE_TAG="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --skip-shared-infra) SKIP_SHARED_INFRA=1; shift 1 ;;
+    --gke-project) CLI_GKE_PROJECT="$2"; shift 2 ;;
+    --gke-cluster) CLI_GKE_CLUSTER="$2"; shift 2 ;;
+    --gke-region) CLI_GKE_REGION="$2"; shift 2 ;;
     --approve-apply) APPROVE_APPLY=1; shift 1 ;;
     --dry-run) DRY_RUN=1; shift 1 ;;
-    -h|--help) echo "Usage: $0 [options]"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -63,13 +93,21 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   else
     HUB_TF_DIR="hub-gke"
   fi
-  CLUSTER_NAME="${SHARED_PREFIX}-agents"
+  DEFAULT_CLUSTER_NAME="${SHARED_PREFIX}-agents"
   HUB_K8S_NAMESPACE="${HUB_NAME}"
   IMAGE_REGISTRY="${IMAGE_REGISTRY:-${HUB_REGION}-docker.pkg.dev/${HUB_PROJECT}/${SHARED_PREFIX}-scion}"
 else
-  CLUSTER_NAME="scion-hub-${HUB_NAME}"
+  DEFAULT_CLUSTER_NAME="scion-hub-${HUB_NAME}"
   HUB_K8S_NAMESPACE="scion-hub-${HUB_NAME}"
   IMAGE_REGISTRY="${IMAGE_REGISTRY:-${HUB_REGION}-docker.pkg.dev/${HUB_PROJECT}/scion}"
+fi
+
+HUB_GKE_PROJECT="${CLI_GKE_PROJECT:-${HUB_GKE_PROJECT:-${EXTERNAL_GKE_PROJECT_ID:-$HUB_PROJECT}}}"
+HUB_GKE_REGION="${CLI_GKE_REGION:-${HUB_GKE_REGION:-${HUB_GKE_LOCATION:-$HUB_REGION}}}"
+CLUSTER_NAME="${CLI_GKE_CLUSTER:-${HUB_GKE_CLUSTER:-${EXTERNAL_GKE_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}}"
+USE_EXTERNAL_GKE=0
+if [[ "$HUB_GKE_PROJECT" != "$HUB_PROJECT" || "$CLUSTER_NAME" != "$DEFAULT_CLUSTER_NAME" ]]; then
+  USE_EXTERNAL_GKE=1
 fi
 
 run() {
@@ -251,11 +289,34 @@ EOF
   if [[ -n "$iap_cid" ]]; then
     echo "iap_oauth_client_id = \"${iap_cid}\"" >> "$out_file"
   fi
+  if [[ "$USE_EXTERNAL_GKE" == "1" && "$HAS_HUB_EXTERNAL_GKE_TF" == "1" ]]; then
+    cat >> "$out_file" <<EOF
+external_gke_project_id   = "${HUB_GKE_PROJECT}"
+external_gke_cluster_name = "${CLUSTER_NAME}"
+EOF
+  fi
 }
 
 if [[ -z "$SCION_REPO" ]]; then
   echo "--scion-repo is required to build images and run Terraform." >&2
   exit 1
+fi
+
+HAS_SHARED_EXTERNAL_GKE_TF=0
+HAS_HUB_EXTERNAL_GKE_TF=0
+if [[ "$TIER" == "terraform-ha" ]]; then
+  SHARED_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/shared-infra"
+  HUB_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/${HUB_TF_DIR}"
+  if grep -q 'variable "external_gke_project_id"' "${SHARED_TF_PATH}/variables.tf" 2>/dev/null; then
+    HAS_SHARED_EXTERNAL_GKE_TF=1
+  fi
+  if grep -q 'variable "external_gke_project_id"' "${HUB_TF_PATH}/variables.tf" 2>/dev/null; then
+    HAS_HUB_EXTERNAL_GKE_TF=1
+  fi
+  if [[ "$USE_EXTERNAL_GKE" == "1" && "$HAS_HUB_EXTERNAL_GKE_TF" != "1" ]]; then
+    echo "Error: reusing a GKE cluster in another project (${HUB_GKE_PROJECT}) or with a non-default name (${CLUSTER_NAME} != ${DEFAULT_CLUSTER_NAME}) requires '--scion-repo' to declare 'external_gke_project_id' and 'external_gke_cluster_name' in deploy/terraform/configurations/${HUB_TF_DIR}/variables.tf. For same-project reuse of '${DEFAULT_CLUSTER_NAME}', use '--skip-shared-infra'." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$WORK_DIR"
@@ -279,22 +340,39 @@ if [[ "$TIER" == "terraform-ha" ]]; then
     run gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
   fi
 
-  echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX})"
-  cat > "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
+  if [[ "$SKIP_SHARED_INFRA" == "1" ]]; then
+    echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX}) [skipped — reusing ${HUB_GKE_PROJECT}/${CLUSTER_NAME}]"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      run gcloud container clusters describe "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION"
+    else
+      gcloud container clusters describe "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION" --format='value(name)' >/dev/null || {
+        echo "Error: --skip-shared-infra requires existing GKE cluster '${CLUSTER_NAME}' in project '${HUB_GKE_PROJECT}' (${HUB_GKE_REGION}). Run once without --skip-shared-infra first." >&2
+        exit 1
+      }
+    fi
+  else
+    echo "== 2. Terraform HA: shared-infra (${SHARED_PREFIX})"
+    cat > "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
 project_id            = "${HUB_PROJECT}"
 region                = "${HUB_REGION}"
 zone                  = "${HUB_ZONE}"
 name_prefix           = "${SHARED_PREFIX}"
 sql_availability_type = "${SQL_AVAILABILITY_TYPE}"
 EOF
+    if [[ "$USE_EXTERNAL_GKE" == "1" && "$HAS_SHARED_EXTERNAL_GKE_TF" == "1" ]]; then
+      cat >> "${ABS_WORK_DIR}/shared-infra.tfvars" <<EOF
+external_gke_project_id   = "${HUB_GKE_PROJECT}"
+external_gke_cluster_name = "${CLUSTER_NAME}"
+EOF
+    fi
 
-  SHARED_TF_PATH="${SCION_REPO}/deploy/terraform/configurations/shared-infra"
-  run terraform -chdir="${SHARED_TF_PATH}" init -reconfigure \
-    -backend-config="bucket=${STATE_BUCKET}" \
-    -backend-config="prefix=${SHARED_PREFIX}/shared-infra"
-  run terraform -chdir="${SHARED_TF_PATH}" plan -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
-  if [[ "$APPROVE_APPLY" == 1 && "$DRY_RUN" == 0 ]]; then
-    run terraform -chdir="${SHARED_TF_PATH}" apply -auto-approve -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    run terraform -chdir="${SHARED_TF_PATH}" init -reconfigure \
+      -backend-config="bucket=${STATE_BUCKET}" \
+      -backend-config="prefix=${SHARED_PREFIX}/shared-infra"
+    run terraform -chdir="${SHARED_TF_PATH}" plan -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    if [[ "$APPROVE_APPLY" == 1 && "$DRY_RUN" == 0 ]]; then
+      run terraform -chdir="${SHARED_TF_PATH}" apply -auto-approve -var-file="${ABS_WORK_DIR}/shared-infra.tfvars"
+    fi
   fi
 
   # Grant Cloud Build default SA builder + push access (modern GCP orgs disable automatic grants on default compute SA)
@@ -535,8 +613,12 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   fi
 
   echo "== 5. Verify GKE Agent Cluster & Hub-Scope Defaults"
-  run gcloud container clusters get-credentials "$CLUSTER_NAME" --project="$HUB_PROJECT" --region="$HUB_REGION"
-  run kubectl get namespace "$HUB_K8S_NAMESPACE"
+  run gcloud container clusters get-credentials "$CLUSTER_NAME" --project="$HUB_GKE_PROJECT" --region="$HUB_GKE_REGION"
+  if [[ "$DRY_RUN" == "1" ]] || command -v kubectl >/dev/null 2>&1; then
+    run kubectl get namespace "$HUB_K8S_NAMESPACE"
+  else
+    echo "Skipping local kubectl check (kubectl not found; namespace verified by Terraform)."
+  fi
 
   TARGET_PROJECT="${SANDBOX_PROJECT:-$HUB_PROJECT}"
   TARGET_LOCATION="${VERTEX_LOCATION:-${GOOGLE_CLOUD_LOCATION:-global}}"
@@ -564,7 +646,7 @@ elif [[ "$TIER" == "hybrid-gke" ]]; then
 {
   "gke_target": {
     "cluster_name": "${CLUSTER_NAME}",
-    "location": "${HUB_REGION}",
+    "location": "${HUB_GKE_REGION}",
     "namespace": "${HUB_K8S_NAMESPACE}"
   },
   "container_images": {
@@ -590,7 +672,13 @@ if [[ -n "$IAP_CLIENT_ID" ]]; then
   echo "HUB_IAP_AUDIENCE=${IAP_CLIENT_ID}"
 fi
 echo "AGENT_RUNTIME=kubernetes"
-echo "RUNTIME_PROFILE=remote"
+echo "RUNTIME_PROFILE=${RUNTIME_PROFILE:-remote}"
+if [[ "$HUB_GKE_PROJECT" != "$HUB_PROJECT" ]]; then
+  echo "HUB_GKE_PROJECT=${HUB_GKE_PROJECT}"
+fi
+if [[ "$HUB_GKE_REGION" != "$HUB_REGION" ]]; then
+  echo "HUB_GKE_REGION=${HUB_GKE_REGION}"
+fi
 echo "HUB_K8S_CLUSTER=${CLUSTER_NAME}"
 echo "HUB_K8S_NAMESPACE=${HUB_K8S_NAMESPACE}"
 echo "IMAGE_REGISTRY=${IMAGE_REGISTRY}"
