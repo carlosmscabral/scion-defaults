@@ -258,9 +258,12 @@ These files existed in the repository before the factory started. They stay wher
 
 ## Keep this knowledge plane healthy
 
-- Run `python3 {KP_ROOT}/kp-check.py` after you change any file here. It fails on broken links and unknown
-  `REQ-`/`ADR-` IDs.
-- Add a decision with [adr/_template.md](adr/_template.md), and add a row to the table above.
+- Run `python3 {KP_ROOT}/kp-check.py` after you change any file here. It fails on broken links, unknown
+  `REQ-`/`ADR-` IDs, asymmetric ADR supersession links, and stale superseded constants in `value-registry.json`.
+- Add a decision with [adr/_template.md](adr/_template.md), and add a row to the table above. When a new ADR supersedes
+  an existing one, list the old ID in `Supersedes:` and mark the old ADR `Status: Superseded by ADR-MMM`.
+- Pin canonical numeric or string thresholds in optional `value-registry.json` (`id`, `current`, `superseded`) when
+  evolving requirements so `kp-check.py` rejects stale oracle values across active docs and agent instructions.
 - Don't put live state in this file. {live_writer}
 - Don't put evaluation golden datasets here. They belong to the evaluation team.
 """
@@ -430,11 +433,13 @@ run. The evaluation team reads the build team's knowledge plane read-only at `{E
 
 
 KP_CHECK_SCRIPT = r'''#!/usr/bin/env python3
-"""Check a Scion factory knowledge plane for broken links and unknown REQ-/ADR- IDs.
+"""Check a Scion factory knowledge plane for broken links, unknown IDs, and oracle drift.
 
 Usage: python3 knowledge-plane/kp-check.py [KNOWLEDGE_PLANE_DIR]
-Exit code 0 when every reference resolves, 1 otherwise.
+Exit code 0 when every reference, ADR supersession link, and value-registry rule passes, or 1 otherwise.
 """
+import fnmatch
+import json
 import re
 import sys
 from pathlib import Path
@@ -442,6 +447,128 @@ from pathlib import Path
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 REQ = re.compile(r"\bREQ-\d{3,}\b")
 ADR = re.compile(r"\bADR-\d{3,}\b")
+SUPERSEDES_LINE = re.compile(r"^-\s*\*\*Supersedes:\*\*\s*(.+)$", re.M | re.I)
+SUPERSEDED_BY_LINE = re.compile(r"^-\s*\*\*(?:Status|Superseded by):\*\*\s*([^\n]*superseded by[^\n]*)$", re.M | re.I)
+ROOT_GUIDE_CANDIDATES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md")
+
+
+def _check_adr_supersession(kp: Path, problems: list[str]) -> set[Path]:
+    """Validate bidirectional Supersedes <-> Superseded by links and return superseded ADR paths."""
+    adr_dir = kp / "adr"
+    if not adr_dir.is_dir():
+        return set()
+
+    adr_files: dict[str, Path] = {}
+    supersedes_map: dict[str, set[str]] = {}
+    superseded_by_map: dict[str, set[str]] = {}
+    superseded_paths: set[Path] = set()
+
+    for p in sorted(adr_dir.glob("ADR-*.md")):
+        m = ADR.match(p.name)
+        if not m:
+            continue
+        aid = m.group(0)
+        adr_files[aid] = p
+        text = p.read_text(errors="ignore")
+        supersedes_map[aid] = {
+            target
+            for line in SUPERSEDES_LINE.findall(text)
+            for target in ADR.findall(line)
+            if target != aid
+        }
+        superseded_by_map[aid] = {
+            target
+            for line in SUPERSEDED_BY_LINE.findall(text)
+            for target in ADR.findall(line)
+            if target != aid
+        }
+        if superseded_by_map[aid]:
+            superseded_paths.add(p.resolve())
+
+    for new_id, old_ids in sorted(supersedes_map.items()):
+        rel_new = adr_files[new_id].relative_to(kp)
+        for old_id in sorted(old_ids):
+            if old_id not in adr_files:
+                problems.append(f"{rel_new}: Supersedes references missing {old_id}")
+            elif new_id not in superseded_by_map.get(old_id, set()):
+                rel_old = adr_files[old_id].relative_to(kp)
+                problems.append(
+                    f"{rel_old}: missing 'Superseded by {new_id}' status back-link for {rel_new}"
+                )
+
+    for old_id, new_ids in sorted(superseded_by_map.items()):
+        rel_old = adr_files[old_id].relative_to(kp)
+        for new_id in sorted(new_ids):
+            if new_id not in adr_files:
+                problems.append(f"{rel_old}: Superseded by references missing {new_id}")
+            elif old_id not in supersedes_map.get(new_id, set()):
+                rel_new = adr_files[new_id].relative_to(kp)
+                problems.append(
+                    f"{rel_new}: missing 'Supersedes: {old_id}' header matching {rel_old}"
+                )
+
+    return superseded_paths
+
+
+def _check_value_registry(kp: Path, superseded_adrs: set[Path], problems: list[str]) -> None:
+    """Scan active knowledge-plane and root guide docs against optional value-registry.json."""
+    reg_file = kp / "value-registry.json"
+    if not reg_file.is_file():
+        return
+    try:
+        raw = json.loads(reg_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        problems.append(f"value-registry.json: invalid JSON ({exc})")
+        return
+
+    entries = raw.get("values", []) if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        problems.append("value-registry.json: expected a list or {'values': [...]} object")
+        return
+
+    repo_root = kp.parent
+    candidates: list[tuple[str, Path]] = []
+    for doc in sorted(kp.rglob("*.md")):
+        if doc.name == "_template.md" or doc.resolve() in superseded_adrs:
+            continue
+        rel_kp = doc.relative_to(kp).as_posix()
+        if rel_kp == "state/LIVE.md":
+            continue
+        candidates.append((f"{kp.name}/{rel_kp}", doc))
+    for gname in ROOT_GUIDE_CANDIDATES:
+        gpath = repo_root / gname
+        if gpath.is_file():
+            candidates.append((gname, gpath))
+
+    for idx, item in enumerate(entries):
+        if not isinstance(item, dict):
+            problems.append(f"value-registry.json[{idx}]: entry must be an object")
+            continue
+        entry_id = str(item.get("id") or f"entry-{idx}")
+        current = str(item.get("current") or "")
+        superseded_vals = [str(v) for v in (item.get("superseded") or []) if str(v)]
+        if not current or not superseded_vals:
+            problems.append(f"value-registry.json[{idx}] ({entry_id}): requires 'current' and 'superseded'")
+            continue
+        ctx_raw = str(item.get("context_pattern") or "").strip()
+        ctx_re = re.compile(ctx_raw, re.I) if ctx_raw else None
+        excludes = [str(p) for p in (item.get("exclude_globs") or [])]
+
+        val_patterns = [
+            (old, re.compile(rf"(?<!\w){re.escape(old)}(?!\w)", re.I))
+            for old in superseded_vals
+        ]
+        for label, doc_path in candidates:
+            if any(fnmatch.fnmatch(label, pat) for pat in excludes):
+                continue
+            for lineno, line in enumerate(doc_path.read_text(errors="ignore").splitlines(), 1):
+                if ctx_re and not ctx_re.search(line):
+                    continue
+                for old, pat in val_patterns:
+                    if pat.search(line):
+                        problems.append(
+                            f"{label}:{lineno}: stale superseded value {old!r} for {entry_id} (expected {current!r})"
+                        )
 
 
 def main() -> int:
@@ -455,7 +582,7 @@ def main() -> int:
     defined_reqs = set(re.findall(r"^## (REQ-\d{3,})", reqs_file.read_text(), re.M)) if reqs_file.exists() else set()
     defined_adrs = {m.group(0) for p in (kp / "adr").glob("ADR-*.md") for m in [ADR.match(p.name)] if m}
 
-    problems = []
+    problems: list[str] = []
     for doc in docs:
         if doc.name == "_template.md":
             continue
@@ -471,6 +598,9 @@ def main() -> int:
             problems.append(f"{rel}: unknown requirement {rid}")
         for aid in sorted(set(ADR.findall(text)) - defined_adrs):
             problems.append(f"{rel}: unknown decision {aid}")
+
+    superseded_adrs = _check_adr_supersession(kp, problems)
+    _check_value_registry(kp, superseded_adrs, problems)
 
     for line in problems:
         print(line)
