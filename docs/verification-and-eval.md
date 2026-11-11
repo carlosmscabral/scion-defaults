@@ -81,6 +81,15 @@ To maintain strict reproducibility and prevent uncommitted or dirty files in sha
    gcloud run services update-traffic $SERVICE_NAME --to-latest --region=$SANDBOX_REGION
    ```
 
+### 1.5 Universal Anti-Masking Verification Guardrails
+
+Autonomous coding agents exhibit four recurring failure modes across languages and domains unless role protocols enforce deterministic counter-checks:
+
+1. **Unclamped Metric Exports and Paired Negative Threshold Tests:** Do not clamp or hardcode exported metrics (`min(measured, limit)`) to pass quantitative `REQ-NNN` checks. Every threshold test must pair a positive pass case with a negative over-threshold injection case through the same assertion helper.
+2. **Structured Fallback Telemetry and Post-Deploy Smoke Checks:** Do not swallow upstream RPC, database, or model errors in silent fallback `catch` blocks. Emit structured `[fallback] kind=<subsystem> reason=<cause>` logs and verify non-empty payload responses with zero unexpected fallbacks during post-deploy smoke runs before updating `state/LIVE.md`.
+3. **Scenario Preconditions and Complete Root-Cause Closure:** Assert the scenario entry precondition before asserting outcomes so unexercised test setups fail immediately. Confirm that every root cause listed in an investigation report or finding has a merged commit or a linked follow-up issue before marking work `status:verified`.
+4. **Dual Negative and Happy-Path L2 Contract Probes:** On protected routes, verify both unauthenticated `401`/`403` rejection and (when probe credentials or smoke fixtures are configured) authenticated happy-path response schemas and non-empty bodies.
+
 ---
 
 ## 2. Product Evaluation Methodology (5-Layer Pyramid: L1–L5)
