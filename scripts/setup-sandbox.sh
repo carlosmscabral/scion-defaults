@@ -146,7 +146,8 @@ echo "sandbox=$P region=$R deployer=$DEPLOYER_SA runtime=$RUNTIME_SA hub_vm_sa=$
 step "1. APIs"
 apis=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com aiplatform.googleapis.com
       iam.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com firestore.googleapis.com
-      storage.googleapis.com logging.googleapis.com serviceusage.googleapis.com)
+      storage.googleapis.com logging.googleapis.com cloudtrace.googleapis.com monitoring.googleapis.com
+      serviceusage.googleapis.com)
 [[ "$with_spanner" == 1 ]] && apis+=(spanner.googleapis.com)
 [[ "$with_bigquery" == 1 ]] && apis+=(bigquery.googleapis.com)
 run gcloud services enable "${apis[@]}" --project="$P"
@@ -320,6 +321,16 @@ if [[ "$IS_GKE_MODE" == 1 ]]; then
   for role in roles/aiplatform.user roles/datastore.user roles/serviceusage.serviceUsageConsumer roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
     bind_project "serviceAccount:$WORKER_SA" "$role"
   done
+  if [[ -n "${HUB_K8S_NAMESPACE:-}" && -n "${HUB_PROJECT:-}" ]]; then
+    # sciontool PID 1 initializes GCPExporter before the metadata server starts, authenticating via the
+    # pod KSA's Workload Identity GSA (<hub_name>-agent@<hub_project>) rather than WORKER_SA.
+    _hub_agent_sa="${HUB_K8S_NAMESPACE}-agent@${HUB_PROJECT}.iam.gserviceaccount.com"
+    if [[ "$_hub_agent_sa" != "$WORKER_SA" ]] && exists gcloud iam service-accounts describe "$_hub_agent_sa" --project="$HUB_PROJECT"; then
+      for role in roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
+        bind_project "serviceAccount:$_hub_agent_sa" "$role"
+      done
+    fi
+  fi
   if [[ -n "${DATA_BUCKET:-}" ]]; then
     iam gcloud storage buckets add-iam-policy-binding "gs://$DATA_BUCKET" --member="serviceAccount:$WORKER_SA" \
       --role=roles/storage.objectAdmin --quiet

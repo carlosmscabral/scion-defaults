@@ -147,6 +147,10 @@ class FakeHubHandler(BaseHTTPRequestHandler):
             return
             
         
+        if self.path == "/api/v1/admin/server-config":
+            self._send_json(200, getattr(self.server, "server_config", {}))
+            return
+
         if "/api/v1/templates" in self.path:
             self._send_json(200, {"templates": []})
             return
@@ -282,6 +286,15 @@ class FakeHubHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"envVar": {"key": key, "value": b.get("value")}, "created": True})
             return
 
+        if self.path == "/api/v1/admin/server-config":
+            if getattr(self.server, "deny_admin_server_config", False):
+                self._send_json(403, {"error": "hub.config.update denied"})
+                return
+            b = json.loads(body.decode("utf-8")) if body else {}
+            self.server.__dict__.setdefault("server_config", {}).update(b)
+            self._send_json(200, self.server.server_config)
+            return
+
         if "/api/v1/templates" in self.path:
             self._send_json(200, {"items": []})
             return
@@ -385,6 +398,15 @@ class FakeHubHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"id": pid, "slug": slug})
             return
             
+        if self.path == "/api/v1/admin/server-config":
+            if getattr(self.server, "deny_admin_server_config", False):
+                self._send_json(403, {"error": "hub.config.update denied"})
+                return
+            b = json.loads(body.decode("utf-8")) if body else {}
+            self.server.__dict__.setdefault("server_config", {}).update(b)
+            self._send_json(200, self.server.server_config)
+            return
+
         if "/api/v1/templates" in self.path:
             self._send_json(200, {"id": "tpl-1"})
             return

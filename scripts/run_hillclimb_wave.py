@@ -760,14 +760,16 @@ def _run_po_decision_drill(
         body={"body": reply_body},
     )
 
-    # 3. Verify lead wakes within 2 minutes (po_wake_sla_sec) and finishes the PO issue
+    # 3. Verify lead wakes within the 2-minute CronJob window (+ K8s Job boot slack) and finishes the PO issue
+    po_wake_sla_sec = float(eff_env.get("PO_WAKE_SLA_SEC", "150"))
+    wake_poll_sec = min(poll_interval_sec, 5.0)
     finish_deadline = _monotonic() + max(timeout_sec, 1)
     woke = False
     wake_latency_sec: float | None = None
     finished = False
 
     while _monotonic() <= finish_deadline:
-        _sleep(poll_interval_sec)
+        _sleep(wake_poll_sec if not woke else poll_interval_sec)
         open_issues = _list_open_wave_issues(repo, issue_label, github_token=github_token, api_base=api_base)
         po_iss = next((it for it in open_issues if int(it.get("number") or 0) == po_issue_num), None)
         po_labels = _extract_issue_labels(po_iss) if po_iss else set()
@@ -1290,8 +1292,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout-sec",
         type=int,
-        default=3600,
-        help="Timeout in seconds per wave phase before triggering guaranteed gke-down cleanup (default: 3600)",
+        default=5400,
+        help="Timeout in seconds per wave phase before triggering guaranteed gke-down cleanup (default: 5400)",
     )
     parser.add_argument(
         "--backup-root",

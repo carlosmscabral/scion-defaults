@@ -187,3 +187,33 @@ def test_setup_sandbox_gke_mode_grants_cloud_telemetry_writer_roles(tmp_path):
     out = res.stdout + res.stderr
     for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
         assert f"--member=serviceAccount:agent-worker@sandbox.iam.gserviceaccount.com --role={role}" in calls
+
+    # When the Hub's pod KSA GSA (<hub_namespace>-agent@<hub_project>) exists, sciontool PID 1 exports
+    # telemetry as that identity before the metadata server starts, so it also gets telemetry writer roles.
+    bindir = tmp_path / "bin-hub-agent"
+    bindir.mkdir()
+    (bindir / "gcloud").write_text(
+        FAKE_GCLOUD.replace(
+            '*"service-accounts describe"*) exit 1 ;;',
+            '*"service-accounts describe scion-prod-agent@hub-proj.iam.gserviceaccount.com"*) exit 0 ;;\n  *"service-accounts describe"*) exit 1 ;;',
+        )
+    )
+    (bindir / "gcloud").chmod(0o755)
+    (bindir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "sleep").chmod(0o755)
+    (bindir / "kubectl").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "kubectl").chmod(0o755)
+    st_ag = tmp_path / "state-hub-agent"
+    st_ag.mkdir()
+    ef_ag = tmp_path / "factory-hub-agent.env"
+    ef_ag.write_text(k8s_env)
+    r_ag = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FACTORY_ENV": str(ef_ag), "FAKE_STATE": str(st_ag), "DRY_RUN": "0"},
+        capture_output=True,
+        text=True,
+    )
+    assert r_ag.returncode == 0, r_ag.stdout + r_ag.stderr
+    calls_ag = (st_ag / "calls").read_text()
+    for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
+        assert f"--member=serviceAccount:scion-prod-agent@hub-proj.iam.gserviceaccount.com --role={role}" in calls_ag

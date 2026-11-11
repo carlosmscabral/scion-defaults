@@ -251,6 +251,9 @@ def _load_delta_state(store: Any, project_slug: str) -> dict[str, Any]:
         "idle_since": 0.0,
         "lead_sleeping": False,
         "lead_turns_in_epoch": 0,
+        "dispatched_issues": [],
+        "last_wake_ts": 0.0,
+        "stalled_wip_ts": 0.0,
     }
     if store is None or not hasattr(store, "get_document"):
         return state
@@ -264,25 +267,52 @@ def _load_delta_state(store: Any, project_slug: str) -> dict[str, Any]:
                 state.update(parsed)
         except json.JSONDecodeError:
             pass
-    for key in ("last_fingerprint", "idle_since", "lead_sleeping", "lead_turns_in_epoch"):
+    for key in (
+        "last_fingerprint",
+        "idle_since",
+        "lead_sleeping",
+        "lead_turns_in_epoch",
+        "dispatched_issues",
+        "last_wake_ts",
+        "stalled_wip_ts",
+    ):
         if key in doc:
             state[key] = doc[key]
     state["last_fingerprint"] = str(state.get("last_fingerprint") or "")
     state["idle_since"] = float(state.get("idle_since") or 0.0)
     state["lead_sleeping"] = bool(state.get("lead_sleeping", False))
     state["lead_turns_in_epoch"] = int(state.get("lead_turns_in_epoch") or 0)
+    raw_dispatched = state.get("dispatched_issues")
+    if isinstance(raw_dispatched, list):
+        state["dispatched_issues"] = sorted(
+            {int(x) for x in raw_dispatched if isinstance(x, int) or (isinstance(x, str) and x.isdigit())}
+        )
+    else:
+        state["dispatched_issues"] = []
+    state["last_wake_ts"] = float(state.get("last_wake_ts") or 0.0)
+    state["stalled_wip_ts"] = float(state.get("stalled_wip_ts") or 0.0)
     return state
 
 
 def _save_delta_state(store: Any, project_slug: str, state: dict[str, Any]) -> None:
     if store is None or not hasattr(store, "upsert_document"):
         return
+    dispatched = sorted(
+        {
+            int(x)
+            for x in (state.get("dispatched_issues") or [])
+            if isinstance(x, int) or (isinstance(x, str) and x.isdigit())
+        }
+    )
     payload = {
         "project_slug": project_slug,
         "last_fingerprint": str(state.get("last_fingerprint") or ""),
         "idle_since": float(state.get("idle_since") or 0.0),
         "lead_sleeping": bool(state.get("lead_sleeping", False)),
         "lead_turns_in_epoch": int(state.get("lead_turns_in_epoch") or 0),
+        "dispatched_issues": dispatched,
+        "last_wake_ts": float(state.get("last_wake_ts") or 0.0),
+        "stalled_wip_ts": float(state.get("stalled_wip_ts") or 0.0),
         "updated_at": "REQUEST_TIME",
     }
     store.upsert_document(CONTROL_STATE_COLLECTION, f"delta__{project_slug}", payload)
@@ -367,7 +397,13 @@ def _call_github_fetcher(fetcher, github_repo: str, issue_label: str, github_tok
     return fetcher()
 
 
-def _format_delta_message(classified: dict, abnormal_children: list[dict], *, rotated: bool = False) -> str:
+def _format_delta_message(
+    classified: dict,
+    abnormal_children: list[dict],
+    *,
+    rotated: bool = False,
+    stopped_children: list[str] | None = None,
+) -> str:
     parts: list[str] = []
     if rotated:
         parts.append("[session-rotated: read /scion-volumes/scratchpad/STATE.json and /scion-volumes/knowledge-plane/INDEX.md]")
@@ -397,6 +433,13 @@ def _format_delta_message(classified: dict, abnormal_children: list[dict], *, ro
         ]
         parts.append("ABNORMAL_CHILDREN: " + ", ".join(items))
 
+    if stopped_children:
+        parts.append(
+            "STALLED_WIP: open actionable issues remain with 0 busy specialists "
+            f"(stopped: {', '.join(sorted(stopped_children))}); inspect scion list, restart any "
+            "stopped specialist still needed by in-progress issues with scion start <slug>, and re-send its brief"
+        )
+
     waiting_po = sorted(classified.get("waiting_po") or [], key=lambda x: int(x.get("number", 0)))
     if waiting_po:
         parts.append("WAITING_PO: " + ", ".join(f"#{iss.get('number')}" for iss in waiting_po))
@@ -418,6 +461,7 @@ def run_delta_tick(
     idle_grace_sec: int = 600,
     max_turns_before_rotate: int = 25,
     child_silence_sec: int = 1800,
+    stalled_wip_sec: int = 120,
     github_fetcher=None,
     build_branch: str = "",
     runtime_profile: str = "",
@@ -443,6 +487,20 @@ def run_delta_tick(
     any_running_children: list[dict] = []
     busy_children: list[dict] = []
     abnormal_children: list[dict] = []
+    stopped_children: list[str] = []
+    latest_activity_ts = 0.0
+
+    for ag in ([lead_agent] if lead_agent else []) + child_agents:
+        ag_ts = _parse_epoch(
+            ag.get("lastActivityEvent")
+            or ag.get("last_activity_event")
+            or ag.get("updatedAt")
+            or ag.get("updated")
+            or ag.get("createdAt")
+            or ag.get("created")
+        )
+        if ag_ts is not None and ag_ts > latest_activity_ts:
+            latest_activity_ts = ag_ts
 
     for ch in child_agents:
         ch_slug = str(ch.get("slug") or ch.get("name") or "")
@@ -453,6 +511,8 @@ def run_delta_tick(
             any_running_children.append(ch)
             if ch_phase != "running" or ch_activity not in _SLEEPABLE_CHILD_ACTIVITIES:
                 busy_children.append(ch)
+        elif ch_phase == "stopped" and ch_slug:
+            stopped_children.append(ch_slug)
 
         if ch_phase in ("error", "halted"):
             abnormal_children.append({"slug": ch_slug, "phase": ch_phase, "silent_bucket": 0})
@@ -484,8 +544,65 @@ def run_delta_tick(
     fingerprint = compute_delta_fingerprint(classified, abnormal_children)
     has_actionable_work = bool(actionable or po_replies or abnormal_children)
 
-    # 1. Actionable work exists and fingerprint changed -> wake (and optionally rotate) lead
-    if has_actionable_work and fingerprint != state["last_fingerprint"]:
+    lead_phase_cur = str((lead_agent or {}).get("phase") or (lead_agent or {}).get("status") or "").lower()
+    lead_activity_cur = str((lead_agent or {}).get("activity") or "").lower()
+    lead_busy = bool(
+        lead_agent is not None
+        and lead_phase_cur in _ACTIVE_PHASES
+        and (lead_phase_cur != "running" or (bool(lead_activity_cur) and lead_activity_cur not in _IDLE_ACTIVITIES))
+    )
+
+    cur_actionable_nums = sorted({int(iss.get("number", 0)) for iss in actionable if int(iss.get("number", 0)) > 0})
+    prev_dispatched = {int(x) for x in (state.get("dispatched_issues") or []) if int(x) > 0}
+
+    # Suppress self-inflicted mid-wave echo wakes when lead/specialists move already-dispatched issues
+    # between status:ready -> status:in-progress -> status:verified while pods are actively working.
+    in_flight_echo = bool(
+        has_actionable_work
+        and fingerprint != state["last_fingerprint"]
+        and not po_replies
+        and not abnormal_children
+        and prev_dispatched
+        and cur_actionable_nums
+        and set(cur_actionable_nums).issubset(prev_dispatched)
+        and (lead_busy or busy_children)
+    )
+    if in_flight_echo:
+        if apply:
+            state["last_fingerprint"] = fingerprint
+            state["dispatched_issues"] = cur_actionable_nums
+            state["idle_since"] = 0.0
+            _save_delta_state(store, project_slug, state)
+        return {
+            "project_slug": project_slug,
+            "lead_slug": resolved_lead,
+            "action": "suppressed_in_flight_echo",
+            "woke_lead": False,
+            "rotated_lead": False,
+            "auto_slept": False,
+            "fingerprint": fingerprint,
+            "actionable_count": len(actionable),
+            "po_replies_count": len(po_replies),
+            "waiting_po_count": len(classified["waiting_po"]),
+            "abnormal_children_count": len(abnormal_children),
+        }
+
+    # Detect specialist pod eviction / SIGTERM stop leaving open issues stranded with zero busy workers.
+    last_progress_ts = max(float(state.get("last_wake_ts") or 0.0), latest_activity_ts)
+    stalled_wip = bool(
+        actionable
+        and not po_replies
+        and not abnormal_children
+        and not lead_busy
+        and not busy_children
+        and stopped_children
+        and stalled_wip_sec > 0
+        and (now_ts - last_progress_ts) >= stalled_wip_sec
+        and (now_ts - float(state.get("stalled_wip_ts") or 0.0)) >= max(stalled_wip_sec, 300)
+    )
+
+    # 1. Actionable work exists and fingerprint changed (or WIP stalled after specialist stop) -> wake lead
+    if has_actionable_work and (fingerprint != state["last_fingerprint"] or stalled_wip):
         rotated_lead = bool(
             int(state["lead_turns_in_epoch"]) >= max_turns_before_rotate and not any_running_children
         )
@@ -517,19 +634,39 @@ def run_delta_tick(
                     if err.status != 404:
                         raise
                 state["lead_turns_in_epoch"] = 0
+                state["dispatched_issues"] = []
                 lead_agent = None
 
             lead_phase = str((lead_agent or {}).get("phase") or (lead_agent or {}).get("status") or "").lower()
             if lead_agent is None or lead_phase != "running":
-                if rotated_lead and client.get_agent(pid, resolved_lead) is not None:
-                    payload = {**create_body, "projectId": pid}
-                    client.request("POST", f"/api/v1/projects/{pid}/agents", body=payload, timeout=180)
-                client.ensure_agent_started(
-                    pid,
-                    resolved_lead,
-                    create_body=create_body,
-                    force_resume=True,
-                )
+                try:
+                    if rotated_lead and client.get_agent(pid, resolved_lead) is not None:
+                        payload = {**create_body, "projectId": pid}
+                        client.request("POST", f"/api/v1/projects/{pid}/agents", body=payload, timeout=180)
+                    client.ensure_agent_started(
+                        pid,
+                        resolved_lead,
+                        create_body=create_body,
+                        force_resume=True,
+                    )
+                except HubAPIError as err:
+                    # Provisioning or a concurrent start may already be launching lead (HTTP 409 start_in_progress);
+                    # defer cleanly to the next tick instead of crashing the CronJob pod.
+                    if err.status == 409:
+                        return {
+                            "project_slug": project_slug,
+                            "lead_slug": resolved_lead,
+                            "action": "start_in_progress",
+                            "woke_lead": False,
+                            "rotated_lead": rotated_lead,
+                            "auto_slept": False,
+                            "fingerprint": fingerprint,
+                            "actionable_count": len(actionable),
+                            "po_replies_count": len(po_replies),
+                            "waiting_po_count": len(classified["waiting_po"]),
+                            "abnormal_children_count": len(abnormal_children),
+                        }
+                    raise
 
             if not _wait_for_tmux(client, pid, resolved_lead):
                 if rotated_lead:
@@ -548,16 +685,43 @@ def run_delta_tick(
                     "abnormal_children_count": len(abnormal_children),
                 }
 
-            msg = _format_delta_message(classified, abnormal_children, rotated=rotated_lead)
-            client.request(
-                "POST",
-                f"/api/v1/projects/{pid}/agents/{resolved_lead}/message",
-                body={"message": msg},
+            stalled_stopped = stopped_children if (stalled_wip or (stopped_children and not busy_children and not lead_busy and prev_dispatched)) else None
+            msg = _format_delta_message(
+                classified,
+                abnormal_children,
+                rotated=rotated_lead,
+                stopped_children=stalled_stopped,
             )
+            try:
+                client.request(
+                    "POST",
+                    f"/api/v1/projects/{pid}/agents/{resolved_lead}/message",
+                    body={"message": msg},
+                )
+            except HubAPIError as err:
+                if err.status == 409:
+                    return {
+                        "project_slug": project_slug,
+                        "lead_slug": resolved_lead,
+                        "action": "start_in_progress",
+                        "woke_lead": False,
+                        "rotated_lead": rotated_lead,
+                        "auto_slept": False,
+                        "fingerprint": fingerprint,
+                        "actionable_count": len(actionable),
+                        "po_replies_count": len(po_replies),
+                        "waiting_po_count": len(classified["waiting_po"]),
+                        "abnormal_children_count": len(abnormal_children),
+                    }
+                raise
 
             state["lead_sleeping"] = False
             state["idle_since"] = 0.0
             state["last_fingerprint"] = fingerprint
+            state["dispatched_issues"] = cur_actionable_nums
+            state["last_wake_ts"] = now_ts
+            if stalled_wip:
+                state["stalled_wip_ts"] = now_ts
             state["lead_turns_in_epoch"] = int(state["lead_turns_in_epoch"]) + 1
             _save_delta_state(store, project_slug, state)
 
@@ -565,6 +729,7 @@ def run_delta_tick(
             "project_slug": project_slug,
             "lead_slug": resolved_lead,
             "woke_lead": True,
+            "stalled_wip": stalled_wip,
             "rotated_lead": rotated_lead,
             "auto_slept": False,
             "fingerprint": fingerprint,
@@ -622,10 +787,13 @@ def run_delta_tick(
                     not state["lead_sleeping"]
                     or int(state["lead_turns_in_epoch"]) != 0
                     or state["last_fingerprint"] != fingerprint
+                    or state.get("dispatched_issues")
                 ):
                     state["lead_sleeping"] = True
                     state["lead_turns_in_epoch"] = 0
                     state["last_fingerprint"] = fingerprint
+                    state["dispatched_issues"] = []
+                    state["stalled_wip_ts"] = 0.0
                     state_dirty = True
 
                 if state_dirty:

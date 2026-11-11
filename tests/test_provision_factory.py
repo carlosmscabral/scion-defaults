@@ -475,6 +475,10 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
         assert cfg["env"]["GOOGLE_CLOUD_LOCATION"] == "global"
     # Idempotent: a second pass leaves the files unchanged
     assert provision_factory._inject_cloud_telemetry(kit_dir / "templates", "my-hub") == []
+    assert fake_hub.server_config["telemetry"] == {
+        "enabled": True,
+        "cloud": {"enabled": True, "provider": "gcp", "gcp_project_id": "my-hub"},
+    }
 
     # 2b. Vertex AI env the Hub requires before it starts a vertex-ai agent is written at project scope
     #     by provisioning itself and read back (hillclimb Run 1, fourth attempt: 422 missing_env_vars).
@@ -536,6 +540,10 @@ def test_ensure_vertex_env_fails_fast_when_hub_drops_project_env_and_warns_on_hu
 
     with pytest.raises(RuntimeError, match="both empty"):
         provision_factory._ensure_vertex_env(client, ["proj-c"], "", "global")
+
+    fake_hub.deny_admin_server_config = True
+    tel_warns = provision_factory._ensure_hub_cloud_telemetry(client, "my-hub")
+    assert len(tel_warns) == 1 and "403" in tel_warns[0]
 
 
 def test_control_plane_identity_prefers_project_owner_and_falls_back_with_a_named_role():

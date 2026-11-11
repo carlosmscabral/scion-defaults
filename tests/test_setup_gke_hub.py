@@ -1441,3 +1441,74 @@ def test_patch_scion_shared_dir_volume_handles_new_and_old_scion_and_fails_on_un
     # A file with no shared-dir claim code is left alone
     r4, _ = run("package runtime\n")
     assert r4.returncode == 0
+
+
+def test_setup_gke_hub_seeds_cloud_telemetry_into_hub_settings_template_idempotently(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    tftpl = scion_repo / "deploy" / "terraform" / "modules" / "hub-cloudrun" / "templates" / "settings.yaml.tftpl"
+    tftpl.parent.mkdir(parents=True, exist_ok=True)
+    tftpl.write_text('schema_version: "1"\nimage_registry: ${image_registry}\nactive_profile: remote\n')
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    build_script = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+    )
+    build_script.chmod(0o755)
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"builds get-default-service-account"*) echo "projects/demo/serviceAccounts/123-compute@developer.gserviceaccount.com" ;;\n'
+        '  *"builds submit"*) echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]." ;;\n'
+        '  *"builds describe"*) echo "SUCCESS" ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+    for tool in ("terraform", "kubectl"):
+        (fake_bin / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin / tool).chmod(0o755)
+
+    for _ in range(2):
+        res = subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/setup-gke-hub.sh"),
+                "--tier",
+                "terraform-ha",
+                "--hub-mode",
+                "cloudrun",
+                "--scion-repo",
+                str(scion_repo),
+                "--work-dir",
+                str(tmp_path / "work-tel"),
+                "--image-tag",
+                "v20261111",
+                "--harnesses",
+                "antigravity",
+                "--approve-apply",
+            ],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DRY_RUN": "0",
+                "BUILD_POLL_SEC": "0.01",
+                "HUB_PROJECT": "demo-hub-proj",
+                "HUB_REGION": "us-east1",
+                "HUB_ZONE": "us-east1-b",
+                "HUB_NAME": "tfha-e2e",
+                "PO_EMAIL": "admin@example.com",
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "command not found" not in res.stderr
+
+    rendered = tftpl.read_text()
+    assert rendered.count("\ntelemetry:\n") == 1
+    assert "provider: gcp" in rendered
+    assert "gcp_project_id: ${project_id}" in rendered

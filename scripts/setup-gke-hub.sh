@@ -625,6 +625,25 @@ if new not in src and old in src:
     p.write_text(updated)
 PY
   fi
+  if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl" ]]; then
+    # Current Scion ignores template telemetry blocks on Hub dispatch (ptone/scion#4524); only the Hub
+    # settings `telemetry` section reaches runtime brokers and injects SCION_GCP_PROJECT_ID into pods.
+    python3 - "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+if not re.search(r"(?m)^telemetry:\s*$", src):
+    block = (
+        "\ntelemetry:\n"
+        "  enabled: true\n"
+        "  cloud:\n"
+        "    enabled: true\n"
+        "    provider: gcp\n"
+        "    gcp_project_id: ${project_id}\n"
+    )
+    p.write_text(src.rstrip("\n") + "\n" + block)
+PY
+  fi
   CLOUDRUN_IGNORE="${ABS_WORK_DIR}/gcloudignore-cloudrun"
   if [[ -f "${SCION_REPO}/image-build/gcloudignore-omni" ]]; then
     grep -Ev '^(/scripts/|#!include:)' "${SCION_REPO}/image-build/gcloudignore-omni" > "$CLOUDRUN_IGNORE" || true
@@ -787,20 +806,45 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}"
   elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" == https://* ]]; then
-    HUB_URL="${HUB_API_BASE_URL:-$HUB_URL_OUT}" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" python3 - <<PY || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
+    HUB_URL="${HUB_API_BASE_URL:-$HUB_URL_OUT}" \
+    HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" \
+    HUB_PROJECT="$HUB_PROJECT" \
+    HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" \
+    _HUB_SCRIPT_DIR="$SCRIPT_DIR" \
+    _HUB_TARGET_PROJECT="$TARGET_PROJECT" \
+    _HUB_TARGET_LOCATION="$TARGET_LOCATION" \
+    _HUB_URL_OUT="$HUB_URL_OUT" \
+    python3 - <<'PY' || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
 import os, sys
-sys.path.insert(0, "${SCRIPT_DIR}")
+sys.path.insert(0, os.environ["_HUB_SCRIPT_DIR"])
 from hub_client import HubClient
 client = HubClient.from_env()
+target_project = os.environ["_HUB_TARGET_PROJECT"]
+target_location = os.environ["_HUB_TARGET_LOCATION"]
 for key, val in [
-    ("GOOGLE_CLOUD_PROJECT", "${TARGET_PROJECT}"),
-    ("GOOGLE_CLOUD_REGION", "${TARGET_LOCATION}"),
-    ("GOOGLE_CLOUD_LOCATION", "${TARGET_LOCATION}"),
+    ("GOOGLE_CLOUD_PROJECT", target_project),
+    ("GOOGLE_CLOUD_REGION", target_location),
+    ("GOOGLE_CLOUD_LOCATION", target_location),
 ]:
-    # The Hub env API rejects SCION_* names (reserved control-plane namespace), so cloud telemetry is
-    # configured in each template's scion-agent.yaml `telemetry:` block by provision_factory.py.
+    # The Hub env API rejects SCION_* names (reserved control-plane namespace); cloud telemetry is
+    # configured through Hub server-config settings instead.
     client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
-print("Configured hub-scope Vertex AI defaults on", "${HUB_URL_OUT}")
+client.request(
+    "PUT",
+    "/api/v1/admin/server-config",
+    body={
+        "telemetry": {
+            "enabled": True,
+            "cloud": {
+                "enabled": True,
+                "provider": "gcp",
+                "gcp_project_id": target_project,
+            },
+        }
+    },
+    timeout=15,
+)
+print("Configured hub-scope Vertex AI and Cloud Telemetry defaults on", os.environ["_HUB_URL_OUT"])
 PY
   fi
 

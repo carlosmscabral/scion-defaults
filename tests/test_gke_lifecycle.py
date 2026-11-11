@@ -174,6 +174,7 @@ def test_extract_pod_and_transcript_metrics_counts_errors_and_tokens_accurately(
     )
     (backend_pod / "agent.log").write_text(
         "2026-11-10T20:01:00Z ERROR Failed to start telemetry: cloud telemetry enabled but destination is not configured\n"
+        "2026-11-10T20:01:01Z [sciontool] [ERROR] Received 2 spans but cloud exporter is not configured - spans will be dropped\n"
         "2026-11-10T20:01:05Z ERROR Token refresh failed: status 401: Invalid IAP credentials: empty token\n"
         "2026-11-10T20:01:10Z ERROR hub connection auth_lost: transport token rejected\n"
     )
@@ -265,7 +266,7 @@ def test_extract_pod_and_transcript_metrics_counts_errors_and_tokens_accurately(
     metrics = gke_lifecycle.extract_pod_and_transcript_metrics(backup_dir)
     assert metrics["iap_401_errors"] == 4
     assert metrics["heartbeat_errors"] == 3
-    assert metrics["telemetry_boot_errors"] == 2
+    assert metrics["telemetry_boot_errors"] == 3
 
     assert metrics["per_agent"]["lead"] == {
         "steps": 7,

@@ -63,6 +63,40 @@ def _pick_control_plane_role(assignable_roles: list) -> tuple[str, str]:
 VERTEX_ENV_KEYS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION")
 
 
+def _ensure_hub_cloud_telemetry(client, gcp_project: str) -> list[str]:
+    """Configure Hub-level GCP Cloud Telemetry defaults via `/api/v1/admin/server-config`.
+
+    Current Scion ignores template `telemetry:` blocks on Hub dispatch (`ptone/scion#4524`); brokers
+    receive `SCION_TELEMETRY_CLOUD_*` and `SCION_GCP_PROJECT_ID` from the Hub's `telemetry` operational
+    settings section instead. Project-scoped callers without `hub.config.update` receive a warning and
+    rely on the Hub's bootstrap `settings.yaml`.
+    """
+    from hub_client import HubAPIError
+
+    if not gcp_project:
+        return []
+    try:
+        client.request(
+            "PUT",
+            "/api/v1/admin/server-config",
+            body={
+                "telemetry": {
+                    "enabled": True,
+                    "cloud": {
+                        "enabled": True,
+                        "provider": "gcp",
+                        "gcp_project_id": gcp_project,
+                    },
+                }
+            },
+        )
+    except HubAPIError as exc:
+        if exc.status in (403, 404, 405):
+            return [f"hub server-config telemetry not updated (HTTP {exc.status}); relying on bootstrap settings.yaml"]
+        raise
+    return []
+
+
 def _ensure_vertex_env(client, pids: list[str], gcp_project: str, location: str) -> list[str]:
     """Give every factory project the Vertex AI env the Hub requires before it starts an agent.
 
@@ -378,15 +412,18 @@ def provision_factory(
                     if exc.status not in (403, 409, 422):
                         raise
 
-            # Cloud telemetry is not set through the Hub env API: the Hub rejects SCION_* names with
-            # 400 (reserved control-plane namespace). Phase 7 writes it into each template's
-            # scion-agent.yaml `telemetry:` block instead (see _inject_cloud_telemetry).
+            telemetry_gcp_project = eff_env.get("SANDBOX_PROJECT") or eff_env.get("HUB_PROJECT") or ""
+            telemetry_warnings = _ensure_hub_cloud_telemetry(
+                client,
+                eff_env.get("HUB_PROJECT") or telemetry_gcp_project,
+            )
             vertex_env_warnings = _ensure_vertex_env(
                 client,
                 list(target_pids),
                 eff_env.get("HUB_PROJECT") or sandbox_project,
                 eff_env.get("VERTEX_LOCATION") or eff_env.get("GOOGLE_CLOUD_LOCATION") or "global",
             )
+            vertex_env_warnings.extend(telemetry_warnings)
             for w in vertex_env_warnings:
                 print(f"Warning: {w}", file=sys.stderr)
 

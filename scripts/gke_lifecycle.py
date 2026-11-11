@@ -436,9 +436,15 @@ def extract_pod_and_transcript_metrics(backup_dir: Path | str) -> dict[str, Any]
                         iap_401_errors += 1
                     if "heartbeat failed" in ll:
                         heartbeat_errors += 1
-                    if (
-                        "failed to start telemetry" in ll
-                        or "cloud telemetry enabled but destination is not configured" in ll
+                    if any(
+                        m in ll
+                        for m in (
+                            "failed to start telemetry",
+                            "cloud telemetry enabled but destination is not configured",
+                            "cloud exporter is not configured",
+                            "failed to create cloud exporter",
+                            "cloud logging asynchronous delivery failed",
+                        )
                     ):
                         telemetry_boot_errors += 1
 

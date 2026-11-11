@@ -661,3 +661,98 @@ def test_delta_auto_sleep_stops_lead_when_agent_delete_is_denied_and_tolerates_t
     assert delta_hub.agents["uuid-bc"]["bananacast-lead"]["phase"] == "stopped"
     saved = store.get_document("factory_control_state", "delta__bananacast")
     assert saved["lead_sleeping"] is True and saved["lead_turns_in_epoch"] == 0
+
+
+def test_delta_suppresses_in_flight_echo_wakes_and_recovers_stalled_wip_after_specialist_stop(delta_hub):
+    store = FakeDeltaStore()
+    delta_hub.agents["uuid-bc"] = {
+        "lead": {
+            "id": "id-lead",
+            "slug": "lead",
+            "name": "lead",
+            "template": "lead",
+            "phase": "running",
+            "activity": "idle",
+            "lastActivityEvent": "2026-11-11T19:30:00Z",
+        }
+    }
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-owner")
+
+    import datetime
+
+    t0 = datetime.datetime(2026, 11, 11, 19, 30, 0, tzinfo=datetime.timezone.utc).timestamp()
+
+    # 1. Initial wave wake with 2 ready issues
+    issues_ready = [
+        {"number": 358, "title": "Auth fix", "labels": [{"name": "status:ready"}], "comments": 0},
+        {"number": 359, "title": "Proxy fix", "labels": [{"name": "status:ready"}], "comments": 0},
+    ]
+    r1 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0, github_fetcher=lambda *_: (issues_ready, {})
+    )
+    assert r1["woke_lead"] is True
+    assert len(delta_hub.messages) == 1
+
+    # 2. Lead starts backend + reviewer and marks #358/#359 status:in-progress (with comments=1).
+    #    While backend is busy, delta MUST NOT send a redundant echo wake for the same issue numbers!
+    delta_hub.agents["uuid-bc"]["backend"] = {
+        "id": "id-be",
+        "slug": "backend",
+        "name": "backend",
+        "template": "backend",
+        "phase": "running",
+        "activity": "working",
+        "lastActivityEvent": "2026-11-11T19:32:00Z",
+    }
+    issues_in_prog = [
+        {"number": 358, "title": "Auth fix", "labels": [{"name": "status:in-progress"}], "comments": 1},
+        {"number": 359, "title": "Proxy fix", "labels": [{"name": "status:in-progress"}], "comments": 1},
+    ]
+    r2 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 120, github_fetcher=lambda *_: (issues_in_prog, {})
+    )
+    assert r2["woke_lead"] is False
+    assert r2["action"] == "suppressed_in_flight_echo"
+    assert len(delta_hub.messages) == 1
+
+    # 3. #359 finishes (status:verified) while backend is still working on #358 -> still no echo wake!
+    issues_358_only = [
+        {"number": 358, "title": "Auth fix", "labels": [{"name": "status:in-progress"}], "comments": 2},
+    ]
+    r3 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 240, github_fetcher=lambda *_: (issues_358_only, {})
+    )
+    assert r3["woke_lead"] is False
+    assert len(delta_hub.messages) == 1
+
+    # 4. Eviction drill: kubectl delete pod stops backend (SIGTERM -> phase="stopped") while #358 is still open!
+    #    After stalled_wip_sec (120s) with zero busy children, delta wakes lead with STALLED_WIP recovery instructions.
+    delta_hub.agents["uuid-bc"]["backend"]["phase"] = "stopped"
+    delta_hub.agents["uuid-bc"]["backend"]["activity"] = "completed"
+    r4 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 400, github_fetcher=lambda *_: (issues_358_only, {})
+    )
+    assert r4["woke_lead"] is True
+    assert r4["stalled_wip"] is True
+    assert len(delta_hub.messages) == 2
+    assert "STALLED_WIP" in delta_hub.messages[-1]["body"]["message"]
+    assert "backend" in delta_hub.messages[-1]["body"]["message"]
+
+
+def test_delta_handles_concurrent_409_start_in_progress_without_crashing(delta_hub, monkeypatch):
+    store = FakeDeltaStore()
+    delta_hub.agents["uuid-bc"] = {
+        "lead": {"id": "id-lead", "slug": "lead", "name": "lead", "template": "lead", "phase": "starting"}
+    }
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-owner")
+
+    def raise_409(*_args, **_kwargs):
+        raise hub_client.HubAPIError(409, "POST", "/api/v1/projects/uuid-bc/agents/lead/start", "start_in_progress")
+
+    monkeypatch.setattr(client, "ensure_agent_started", raise_409)
+    issues = [{"number": 401, "title": "Test", "labels": [{"name": "status:ready"}], "comments": 0}]
+    res = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=5000.0, github_fetcher=lambda *_: (issues, {})
+    )
+    assert res["woke_lead"] is False
+    assert res["action"] == "start_in_progress"
