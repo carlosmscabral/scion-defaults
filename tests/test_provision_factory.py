@@ -150,7 +150,7 @@ def test_scion_factory_provision_dry_run_and_apply_against_gke_fake_hub(fake_hub
         members = getattr(fake_hub, "project_members", {}).get(pid, [])
         assert any(
             m.get("principalId") == "factory-control@my-sandbox.iam.gserviceaccount.com"
-            and m.get("roleDefinitionId") == "rd-proj-admin"
+            and m.get("roleDefinitionId") == "rd-proj-owner"
             for m in members
         ), members
 
@@ -536,3 +536,20 @@ def test_ensure_vertex_env_fails_fast_when_hub_drops_project_env_and_warns_on_hu
 
     with pytest.raises(RuntimeError, match="both empty"):
         provision_factory._ensure_vertex_env(client, ["proj-c"], "", "global")
+
+
+def test_control_plane_identity_prefers_project_owner_and_falls_back_with_a_named_role():
+    # The control plane execs into agents and deletes them; current Scion reserves both for
+    # project-owner. With project-admin the factory could neither wake lead nor go to sleep
+    # (hillclimb Run 1).
+    import provision_factory
+
+    owner = {"id": "rd-owner", "name": "project-owner"}
+    admin = {"id": "rd-admin", "name": "project-admin"}
+    member = {"id": "rd-member", "name": "project-member"}
+    assert provision_factory._pick_control_plane_role([member, admin, owner]) == ("rd-owner", "project-owner")
+    # Older Hub without an assignable owner role: admin, and the caller records a warning for it
+    assert provision_factory._pick_control_plane_role([member, admin]) == ("rd-admin", "project-admin")
+    assert provision_factory._pick_control_plane_role([member]) == ("rd-member", "project-member")
+    assert provision_factory._pick_control_plane_role([]) == ("", "")
+    assert provision_factory._pick_control_plane_role(["junk", {"name": "no-id"}]) == ("", "")

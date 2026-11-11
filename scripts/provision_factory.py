@@ -43,6 +43,23 @@ def _inject_cloud_telemetry(tpl_root: Path, gcp_project: str) -> list[str]:
     return changed
 
 
+CONTROL_PLANE_ROLE_PREFERENCE = ("project-owner", "project-admin")
+
+
+def _pick_control_plane_role(assignable_roles: list) -> tuple[str, str]:
+    """Return (role_id, role_name) for the control-plane identity: the first preferred role the Hub
+    offers, else the first assignable role (named "" when it has no name)."""
+    by_name = {
+        str(r.get("name") or ""): str(r.get("id")) for r in assignable_roles if isinstance(r, dict) and r.get("id")
+    }
+    for name in CONTROL_PLANE_ROLE_PREFERENCE:
+        if name in by_name:
+            return by_name[name], name
+    for name, role_id in by_name.items():
+        return role_id, name
+    return "", ""
+
+
 VERTEX_ENV_KEYS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION")
 
 
@@ -349,6 +366,7 @@ def provision_factory(
         deployer_sa_email = f"{deployer_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
 
         vertex_env_warnings: list[str] = []
+        control_role_warnings: list[str] = []
         if runtime == "kubernetes" and apply:
             from hub_client import HubAPIError
 
@@ -391,10 +409,18 @@ def provision_factory(
                     try:
                         _, aroles_resp = client.request("GET", f"/api/v1/projects/{pid}/members/assignable-roles")
                         aroles = aroles_resp.get("items", []) if isinstance(aroles_resp, dict) else (aroles_resp or [])
-                        role_id = next(
-                            (r.get("id") for r in aroles if isinstance(r, dict) and r.get("name") == "project-admin"),
-                            next((r.get("id") for r in aroles if isinstance(r, dict) and r.get("id")), ""),
-                        )
+                        # project-owner, not project-admin: the control plane execs into agents
+                        # (tmux readiness, killing hung processes) and deletes them (idle cleanup,
+                        # lead rotation), and current Scion reserves both for project-owner. The
+                        # role is scoped to this factory's Hub project. In hillclimb Run 1, with
+                        # project-admin, the delta controller could neither wake lead nor put the
+                        # factory to sleep.
+                        role_id, role_name = _pick_control_plane_role(aroles)
+                        if role_name != CONTROL_PLANE_ROLE_PREFERENCE[0]:
+                            control_role_warnings.append(
+                                f"control-plane identity got Hub role {role_name or 'unknown'} on {pid}, "
+                                f"not {CONTROL_PLANE_ROLE_PREFERENCE[0]}: exec, agent delete and lead rotation may be denied"
+                            )
                         if role_id:
                             _, cur_m = client.request("GET", f"/api/v1/projects/{pid}/members")
                             cur_items = cur_m.get("items", []) if isinstance(cur_m, dict) else (cur_m or [])
@@ -416,8 +442,8 @@ def provision_factory(
                         if exc.status not in (400, 403, 404, 409):
                             raise
         phase_identity: dict = {"phase": "identity_and_profile", "ok": True}
-        if runtime == "kubernetes" and apply and vertex_env_warnings:
-            phase_identity["warnings"] = vertex_env_warnings
+        if runtime == "kubernetes" and apply and (vertex_env_warnings or control_role_warnings):
+            phase_identity["warnings"] = [*vertex_env_warnings, *control_role_warnings]
         phases.append(phase_identity)
 
         # 6. shared_dirs_and_kp

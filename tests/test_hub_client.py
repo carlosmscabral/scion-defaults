@@ -200,7 +200,10 @@ class FakeHubHandler(BaseHTTPRequestHandler):
 
         m_aroles = re.match(r"/api/v1/projects/([^/]+)/members/assignable-roles", self.path)
         if m_aroles:
-            self._send_json(200, {"items": [{"id": "rd-proj-admin", "name": "project-admin"}, {"id": "rd-proj-member", "name": "project-member"}]})
+            roles = [{"id": "rd-proj-owner", "name": "project-owner"}, {"id": "rd-proj-admin", "name": "project-admin"}, {"id": "rd-proj-member", "name": "project-member"}]
+            if getattr(self.server, "no_owner_role", False):
+                roles = roles[1:]
+            self._send_json(200, {"items": roles})
             return
 
         m_members = re.match(r"/api/v1/projects/([^/]+)/members(?:\?.*)?$", self.path)
