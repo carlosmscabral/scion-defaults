@@ -935,6 +935,56 @@ def test_create_project_and_ensure_agent_started_handle_python311_timeout_error(
     assert agent["phase"] == "running"
 
 
+def test_direct_iap_sign_jwt_strategy(fake_hub, monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_check_output(cmd, **kw):
+        if cmd[:3] == ["gcloud", "auth", "print-access-token"]:
+            return "adc-tok\n"
+        raise RuntimeError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(hub_client.subprocess, "check_output", fake_check_output)
+    orig_opener = hub_client.urllib.request.build_opener()
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        if ":signJwt" in req.full_url:
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["headers"] = dict(req.headers)
+            return _FakeResp(json.dumps({"signedJwt": "signed-jwt-tok"}).encode("utf-8"))
+        return orig_opener.open(req, timeout=timeout)
+
+    monkeypatch.setattr(hub_client.urllib.request, "urlopen", fake_urlopen)
+
+    c = hub_client.HubClient.from_env(
+        {
+            "HUB_URL": "https://tfhd-main-example.a.run.app",
+            "HUB_IAP_AUDIENCE": "direct",
+            "HUB_IMPERSONATE_SA": "tfhd-operator@demo-proj.iam.gserviceaccount.com",
+        },
+        scion_home=str(tmp_path / "empty-scion"),
+    )
+    assert c.transport_token == "signed-jwt-tok"
+    assert ":signJwt" in captured["url"]
+    payload = json.loads(captured["body"]["payload"])
+    assert payload["aud"] == "https://tfhd-main-example.a.run.app/*"
+    assert payload["iss"] == "tfhd-operator@demo-proj.iam.gserviceaccount.com"
+
+
+
 
 
 

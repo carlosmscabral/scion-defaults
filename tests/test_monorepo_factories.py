@@ -548,3 +548,85 @@ def test_factory_cd_switches_google_managed_direct_iap_to_metadata_access_token(
     finally:
         srv.shutdown()
 
+
+def test_factory_cd_prefers_sign_jwt_and_exports_quota_project(tmp_path):
+    import http.server
+    import threading
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    captured = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if "/instance/service-accounts/default/token" in self.path:
+                body = json.dumps({"access_token": "ya29-pod-oauth", "expires_in": 3600}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.endswith("/instance/service-accounts/default/email"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"agent@demo-proj.iam.gserviceaccount.com")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            if ":signJwt" in self.path:
+                length = int(self.headers.get("Content-Length", "0"))
+                captured["path"] = self.path
+                captured["payload"] = json.loads(json.loads(self.rfile.read(length).decode("utf-8"))["payload"])
+                body = json.dumps({"signedJwt": "eyJ-rs256-direct-iap-jwt"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(home),
+            "GOOGLE_CLOUD_PROJECT": "demo-proj",
+            "SCION_TRANSPORT_MODE": "iap",
+            "SCION_TRANSPORT_AUDIENCE": "369001918367-syntheticdirectiap.apps.googleusercontent.com",
+            "SCION_HUB_ENDPOINT": "https://hub-demo.a.run.app",
+            "SCION_METADATA_URL": base,
+            "SCION_IAMCREDENTIALS_URL": base,
+            "FACTORY_CD_IAP_REFRESH_SEC": "0",
+        }
+        res = subprocess.run(
+            [
+                "sh",
+                str(FACTORY_CD),
+                "python3",
+                "-c",
+                "import json, os; print(json.dumps({'file': os.environ.get('SCION_TRANSPORT_TOKEN_FILE'), 'quota': os.environ.get('GOOGLE_CLOUD_QUOTA_PROJECT')}))",
+            ],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        got = json.loads(res.stdout.strip())
+        assert got["quota"] == "demo-proj"
+        assert Path(got["file"]).read_text().strip() == "eyJ-rs256-direct-iap-jwt"
+        assert captured["payload"]["aud"] == "https://hub-demo.a.run.app/*"
+    finally:
+        srv.shutdown()
+
+

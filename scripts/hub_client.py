@@ -145,9 +145,65 @@ class HubClient:
         audience = (env.get("HUB_IAP_AUDIENCE") or env.get("SCION_TRANSPORT_AUDIENCE") or "").strip()
         impersonate_sa = (env.get("HUB_IMPERSONATE_SA") or "").strip()
         token_type = (env.get("HUB_TRANSPORT_TOKEN_TYPE") or "").strip()
-        use_access_token = (token_type == "access_token") or audience.startswith(GOOGLE_MANAGED_DIRECT_IAP_PREFIX)
-        if not transport_token and (audience or use_access_token):
-            if use_access_token:
+        use_sign_jwt = (
+            token_type == "sign_jwt"
+            or env.get("HUB_DIRECT_IAP_SIGN_JWT", "").strip() == "1"
+            or audience.lower() in ("direct", "sign-jwt")
+            or audience.startswith("https://")
+        )
+        use_access_token = (not use_sign_jwt) and (
+            (token_type == "access_token") or audience.startswith(GOOGLE_MANAGED_DIRECT_IAP_PREFIX)
+        )
+        if not transport_token and (audience or use_access_token or use_sign_jwt):
+            if use_sign_jwt and impersonate_sa:
+                parsed_base = urllib.parse.urlparse(base_url)
+                if audience.startswith("https://"):
+                    jwt_aud = audience if audience.endswith("/*") else audience.rstrip("/") + "/*"
+                elif parsed_base.scheme == "https" and parsed_base.netloc:
+                    jwt_aud = f"https://{parsed_base.netloc}/*"
+                else:
+                    jwt_aud = audience
+                adc_tok = ""
+                for cmd in (
+                    ["gcloud", "auth", "print-access-token"],
+                    ["gcloud", "auth", "application-default", "print-access-token"],
+                ):
+                    try:
+                        adc_tok = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+                        if adc_tok:
+                            break
+                    except Exception:
+                        pass
+                if adc_tok and jwt_aud:
+                    quota_proj = env.get("HUB_PROJECT") or env.get("SANDBOX_PROJECT") or ""
+                    if not quota_proj and "@" in impersonate_sa and ".iam.gserviceaccount.com" in impersonate_sa:
+                        quota_proj = impersonate_sa.split("@", 1)[1].split(".iam.gserviceaccount.com", 1)[0]
+                    iam_headers = {"Authorization": f"Bearer {adc_tok}", "Content-Type": "application/json"}
+                    if quota_proj:
+                        iam_headers["x-goog-user-project"] = quota_proj
+                    now_ts = int(time.time())
+                    payload = json.dumps({
+                        "iss": impersonate_sa,
+                        "sub": impersonate_sa,
+                        "aud": jwt_aud,
+                        "iat": now_ts,
+                        "exp": now_ts + 3600,
+                    })
+                    try:
+                        iam_req = urllib.request.Request(
+                            f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{urllib.parse.quote(impersonate_sa, safe='@.')}:signJwt",
+                            data=json.dumps({"payload": payload}).encode("utf-8"),
+                            headers=iam_headers,
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(iam_req, timeout=10) as iam_resp:
+                            iam_data = json.loads(iam_resp.read().decode("utf-8", errors="replace"))
+                            transport_token = (iam_data.get("signedJwt") or "").strip()
+                    except Exception:
+                        pass
+                if not transport_token:
+                    use_access_token = True
+            if not transport_token and use_access_token:
                 if impersonate_sa:
                     try:
                         out = subprocess.check_output(
@@ -222,7 +278,7 @@ class HubClient:
                             transport_token = out.strip()
                         except Exception:
                             pass
-            else:
+            elif not transport_token:
                 if impersonate_sa:
                     try:
                         out = subprocess.check_output(
