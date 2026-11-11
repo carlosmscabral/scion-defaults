@@ -934,7 +934,11 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
     # Check 3: Agent health + hung subprocess reaping
     for p in projects:
         pid = p.get("id") or p["slug"]
+        proj_slug = p.get("slug") or pid
         agents = client.list_agents(pid)
+        agent_slugs = [a.get("slug") or a.get("name") for a in agents if a.get("slug") or a.get("name")]
+        lead = lead_agent_for(proj_slug, agent_slugs)
+        lead_present = lead in agent_slugs
         for a in agents:
             slug = a.get("slug") or a.get("name")
             if not slug: continue
@@ -965,6 +969,20 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
                         restarts.append(now)
                         state["restarts"][key] = restarts
                         client.ensure_agent_started(pid, slug, force_resume=True)
+                        if lead_present and slug != lead:
+                            try:
+                                client.request(
+                                    "POST",
+                                    f"/api/v1/projects/{pid}/agents/{lead}/message",
+                                    body={
+                                        "message": (
+                                            f"PO -> {lead}: watchdog auto-restarted agent {slug} "
+                                            f"(was phase={phase}). Please check its status and re-send its active task brief if needed."
+                                        )
+                                    },
+                                )
+                            except Exception as exc:
+                                print(f"WARNING: failed to notify {lead} of restart for {slug}: {exc}", file=sys.stderr)
                 else:
                     if apply and key not in state["alerted"]:
                         state["alerted"][key] = time.time()

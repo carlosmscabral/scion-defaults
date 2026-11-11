@@ -72,7 +72,7 @@ Work through the `questions` in pillar order. For each question:
 | Pillar | Fields to fill |
 |---|---|
 | `1_mission_and_boundaries` | `project.name`, `project.mission`, `project.non_goals`, and the `vcs` section |
-| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""` or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
+| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""`, `"remote"`, `"spot"`, or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
 | `3_roster_models_and_cost` | `team.build_roles`, `team.eval_roles`, `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode`, `team.max_wip`, `infrastructure.budget_usd` |
 | `4_evaluation_pyramid_oracle` | `evaluation_pyramid.l1_health` through `evaluation_pyramid.l5_latency_slo` |
 | `5_backlog_waves_and_autonomy` | `waves[*].issues[*]` with `owner_role`, `acceptance_criteria`, and `requirements` (REQ- IDs) |
@@ -86,7 +86,7 @@ The draft specification starts with the default roster:
 
 Work through the team configuration with the human:
 
-1. **Deploy mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""` or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy). With `none`, do not add `deployer` or `eval-deployer` roles.
+1. **Deploy mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""`, `"remote"`, `"spot"`, or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy). With `none`, do not add `deployer` or `eval-deployer` roles.
 2. **Review proposed specialists:** Present the default roster and each item in `proposed_roles` with its evidence. For each specialist the human confirms, run:
    ```bash
    ./scripts/scion-factory add-role factory.yaml --role R --evidence "..."

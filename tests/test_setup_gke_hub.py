@@ -662,4 +662,161 @@ def test_setup_gke_hub_patches_shared_project_clone_per_agent_idempotently(tmp_p
     assert "ClaimName: pvcName,\n\t\t\t\tReadOnly:  sd.ReadOnly," in patched_k8s_rt
 
 
+def test_setup_gke_hub_spot_workers_opt_in_configures_profiles_and_preserves_existing(tmp_path):
+    import http.server
+    import json
+    import threading
+
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-spot"
+
+    # 1. Dry-run without --spot-workers keeps opt-in default (remote only)
+    dry_env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "demo-hub-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "tfha-spot",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res_default = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        env=dry_env,
+        capture_output=True,
+        text=True,
+    )
+    assert res_default.returncode == 0, res_default.stdout + res_default.stderr
+    assert "RUNTIME_PROFILE=remote" in res_default.stdout
+    assert "LEAD_PROFILE=" not in res_default.stdout
+    assert "profiles 'remote' (on-demand) and 'spot'" not in res_default.stdout
+
+    # 2. Apply with --spot-workers pushes profiles.spot + profiles.remote via Hub API while preserving existing profiles
+    captured = {"env": {}, "server_config_puts": []}
+
+    class HubStub(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/api/v1/admin/server-config":
+                body = json.dumps({"profiles": {"custom": {"runtime": "remote"}}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw.decode("utf-8"))
+            if self.path.startswith("/api/v1/env/"):
+                captured["env"][self.path.rsplit("/", 1)[-1]] = payload.get("value")
+            elif self.path == "/api/v1/admin/server-config":
+                captured["server_config_puts"].append(payload)
+            body = b'{"status":"saved"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HubStub)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        hub_url = f"http://127.0.0.1:{srv.server_address[1]}"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "gcloud").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"builds get-default-service-account"* ]]; then echo ""; exit 0; fi\n'
+            'if [[ "$*" == *"run services describe"* ]]; then echo "' + hub_url + '"; exit 0; fi\n'
+            'if [[ "$*" == *"artifacts docker images describe"* ]]; then echo "sha256:deadbeef"; exit 0; fi\n'
+            "exit 0\n"
+        )
+        (fake_bin / "gcloud").chmod(0o755)
+        (fake_bin / "terraform").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"output -raw hub_url"* ]]; then echo "' + hub_url + '"; exit 0; fi\n'
+            "exit 0\n"
+        )
+        (fake_bin / "terraform").chmod(0o755)
+        (fake_bin / "kubectl").write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin / "kubectl").chmod(0o755)
+
+        apply_env = {
+            **dry_env,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DRY_RUN": "0",
+            "SKIP_EXISTING_IMAGES": "1",
+            "BUILD_POLL_SEC": "0.05",
+            "IAP_OAUTH_CLIENT_ID": "123456-abcdef.apps.googleusercontent.com",
+            "SCION_HUB_TOKEN": "tok-admin",
+        }
+        res_spot = subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/setup-gke-hub.sh"),
+                "--tier",
+                "terraform-ha",
+                "--hub-mode",
+                "cloudrun",
+                "--scion-repo",
+                str(scion_repo),
+                "--work-dir",
+                str(work_dir),
+                "--image-tag",
+                "v20261111",
+                "--harnesses",
+                "antigravity",
+                "--spot-workers",
+                "--approve-apply",
+            ],
+            cwd=ROOT,
+            env=apply_env,
+            capture_output=True,
+            text=True,
+        )
+        out = res_spot.stdout + res_spot.stderr
+        assert res_spot.returncode == 0, out
+        assert "RUNTIME_PROFILE=spot" in out
+        assert "LEAD_PROFILE=remote" in out
+        assert len(captured["server_config_puts"]) == 1
+        profiles = captured["server_config_puts"][0]["profiles"]
+        assert profiles["custom"] == {"runtime": "remote"}
+        assert profiles["remote"] == {"runtime": "remote"}
+        assert profiles["spot"]["runtime"] == "remote"
+        assert profiles["spot"]["node_selector"] == {"cloud.google.com/gke-spot": "true"}
+        assert profiles["spot"]["tolerations"] == [
+            {
+                "key": "cloud.google.com/gke-spot",
+                "operator": "Equal",
+                "value": "true",
+                "effect": "NoSchedule",
+            }
+        ]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+
 

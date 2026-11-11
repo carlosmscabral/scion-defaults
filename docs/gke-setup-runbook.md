@@ -10,7 +10,8 @@ Before starting, configure your `config/factory.env` with the following GKE keys
 - `HUB_IMPERSONATE_SA`: Operator Google Service Account to impersonate from developer workstations when org policy blocks user-credential OIDC/IAP tokens (optional inside GKE pods, which use Workload Identity automatically).
 - `HUB_TRANSPORT_MODE`: `iap` (default when `HUB_IAP_AUDIENCE` is set) or `serverless`.
 - `AGENT_RUNTIME=kubernetes`: Instructs provisioning, sandbox IAM, and control-plane scripts to target GKE pods (`workspaceMode: "per-agent"` / `clone-per-agent`).
-- `RUNTIME_PROFILE`: Set to `remote` on Full Terraform HA (`--hub-mode cloudrun`), empty `""` when using the Hub's default K8s profile, or `gke` for Hybrid VM+GKE.
+- `RUNTIME_PROFILE`: Set to `remote` on Full Terraform HA (`--hub-mode cloudrun`), `spot` to schedule worker pods on GKE Autopilot Spot nodes (configured via `setup-gke-hub.sh --spot-workers`), empty `""` when using the Hub's default K8s profile, or `gke` for Hybrid VM+GKE.
+- `LEAD_PROFILE`: Optional profile override for `lead` and `eval-lead` pods. Defaults to `remote` (On-Demand) when `RUNTIME_PROFILE=spot` so factory orchestration stays resilient to Spot preemption.
 - `HUB_K8S_CLUSTER` / `HUB_REGION`: GKE cluster name and region/zone.
 - `HUB_K8S_NAMESPACE`: Kubernetes namespace for agent pods and control-plane `CronJob`s (e.g. `scion-hub`).
 - `IMAGE_REGISTRY`: Artifact Registry path for multi-arch Hub and harness images.
@@ -30,6 +31,7 @@ For a completely serverless/managed infrastructure, use the Terraform configurat
    ```bash
    scripts/setup-gke-hub.sh --tier terraform-ha --scion-repo <dir> --harnesses claude,antigravity --approve-apply
    ```
+   To run worker agents on GKE Autopilot Spot nodes while keeping `lead` and `eval-lead` on-demand, pass `--spot-workers` (or `SPOT_WORKERS=1`). This registers a `spot` profile on the Hub via `/api/v1/admin/server-config` and emits `RUNTIME_PROFILE=spot` and `LEAD_PROFILE=remote`. Because Spot pods lose uncommitted local workspace state if preempted, ensure workers commit and push frequently; `factory-watchdog.py` restarts failed workers and notifies `lead`.
 4. Verify connectivity using IAP `Proxy-Authorization` and the `/health` endpoint. On Cloud Run Direct IAP (`369001918367-*`), both `scripts/hub_client.py` (for K8s `CronJob`s) and `config/harness/home/.local/bin/factory-cd.sh` (for agent pods) automatically mint Workload Identity Service Account access tokens with `cloud-platform`, `userinfo.email`, and `openid` scopes—requiring zero static Kubernetes Secrets or PATs.
 
 ## Option B: Hybrid VM + GKE Tier

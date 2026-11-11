@@ -233,6 +233,7 @@ def provision_factory(
         control_sa_name = eff_env.get("CONTROL_SA_NAME", "factory-control")
         deployer_sa_name = eff_env.get("DEPLOYER_SA_NAME", "")
         runtime_profile = eff_env.get("RUNTIME_PROFILE") or spec.get("infrastructure", {}).get("runtime_profile", "")
+        lead_profile = eff_env.get("LEAD_PROFILE") or ("remote" if runtime_profile == "spot" else runtime_profile)
 
         worker_sa_email = f"{worker_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
         control_sa_email = f"{control_sa_name}@{sandbox_project}.iam.gserviceaccount.com"
@@ -261,7 +262,10 @@ def provision_factory(
                 if runtime_profile:
                     patch["activeProfile"] = runtime_profile
                     if id_mode == "assign":
-                        patch["defaultGCPIdentityServiceAccountIDByProfile"] = {runtime_profile: worker_sa_uuid}
+                        sa_by_profile = {runtime_profile: worker_sa_uuid}
+                        if lead_profile and lead_profile != runtime_profile:
+                            sa_by_profile[lead_profile] = worker_sa_uuid
+                        patch["defaultGCPIdentityServiceAccountIDByProfile"] = sa_by_profile
                 client.put_project_settings(pid, patch)
 
                 if control_sa_email:
@@ -419,8 +423,8 @@ def provision_factory(
             }
             if runtime == "kubernetes" and vcs_enabled:
                 c_body["branch"] = _resolve_branch(spec, "build_branch", eff_env)
-            if runtime_profile:
-                c_body["profile"] = runtime_profile
+            if lead_profile:
+                c_body["profile"] = lead_profile
             if harness_auth:
                 c_body["harnessAuth"] = harness_auth
             client.ensure_agent_started(build_pid_id, lead_name, create_body=c_body, wait_sec=wait_sec, poll_sec=poll_sec)
@@ -432,8 +436,8 @@ def provision_factory(
             }
             if runtime == "kubernetes" and vcs_enabled:
                 e_body["branch"] = _resolve_branch(spec, "eval_branch", eff_env)
-            if runtime_profile:
-                e_body["profile"] = runtime_profile
+            if lead_profile:
+                e_body["profile"] = lead_profile
             if harness_auth:
                 e_body["harnessAuth"] = harness_auth
             client.ensure_agent_started(eval_pid_id, eval_lead_name, create_body=e_body, wait_sec=wait_sec, poll_sec=poll_sec)

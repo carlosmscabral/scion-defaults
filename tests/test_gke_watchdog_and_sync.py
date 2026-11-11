@@ -336,3 +336,34 @@ def test_watchdog_api_mode_wakes_monorepo_prefixed_lead_and_reads_camel_case_cre
     assert len(alerts) == 1 and alerts[0][0] == "PO_ESCALATION"
 
 
+def test_watchdog_api_mode_notifies_lead_when_restarting_worker(fake_hub):
+    fake_hub.projects_by_slug = {"spot-demo": {"id": "uuid-spot", "slug": "spot-demo"}}
+    fake_hub.agents_by_project = {
+        "uuid-spot": [
+            {"id": "ag-lead", "slug": "lead", "template": "lead", "phase": "running"},
+            {"id": "ag-be", "slug": "backend", "template": "backend", "phase": "error"},
+        ]
+    }
+    client = hub_client.HubClient(base_url=fake_hub.url, token="tok-admin")
+    state = {"restarts": {}, "alerted": {}, "last_user_msg_ts": ""}
+    old_fp = os.environ.get("FACTORY_PROJECTS")
+    os.environ["FACTORY_PROJECTS"] = "spot-demo"
+    try:
+        watchdog_mod.run_api_watchdog(client, state, apply=True, runtime="kubernetes")
+    finally:
+        if old_fp is None:
+            os.environ.pop("FACTORY_PROJECTS", None)
+        else:
+            os.environ["FACTORY_PROJECTS"] = old_fp
+
+    start_paths = [r["path"] for r in fake_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
+    assert "/api/v1/projects/uuid-spot/agents/backend/start" in start_paths
+    msg_reqs = [
+        r for r in fake_hub.requests
+        if r["method"] == "POST" and r["path"] == "/api/v1/projects/uuid-spot/agents/lead/message"
+    ]
+    assert len(msg_reqs) == 1
+    assert b"watchdog auto-restarted agent backend" in msg_reqs[0]["body"]
+
+
+

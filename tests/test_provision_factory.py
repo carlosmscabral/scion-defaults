@@ -296,3 +296,61 @@ def test_provision_go_waits_for_tmux_session_before_sending_go_message(fake_hub,
     assert last_exec_idx < msg_idx
 
 
+def test_provision_factory_spot_workers_lead_on_demand(fake_hub, tmp_path):
+    spec = _starter()
+    spec["project"]["slug"] = "spot-lab"
+    spec["project"]["eval_slug"] = "spot-lab-eval"
+    spec["infrastructure"]["runtime"] = "kubernetes"
+    spec["infrastructure"]["runtime_profile"] = "spot"
+    spec_path = tmp_path / "factory.yaml"
+    kit_dir = tmp_path / "kit"
+    scion_factory.save_spec(spec, spec_path)
+    scion_factory.compile_factory_boilerplate(spec, kit_dir)
+
+    env_file = write_gke_factory_env(tmp_path, fake_hub.url)
+    with open(env_file, "a") as f:
+        f.write("\nRUNTIME_PROFILE=spot\n")
+
+    r_apply = subprocess.run(
+        [
+            sys.executable,
+            "scripts/scion_factory.py",
+            "provision",
+            str(spec_path),
+            "--kit",
+            str(kit_dir),
+            "--env",
+            str(env_file),
+            "--apply",
+            "--json",
+        ],
+        cwd=ROOT,
+        env=fake_cli_env(tmp_path, fake_hub.url),
+        capture_output=True,
+        text=True,
+    )
+    assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
+    build_pid = fake_hub.projects_by_slug["spot-lab"]["id"]
+    eval_pid = fake_hub.projects_by_slug["spot-lab-eval"]["id"]
+
+    # Verify project default activeProfile is spot and both spot + remote have explicit SA mappings
+    for pid in (build_pid, eval_pid):
+        assert fake_hub.project_settings[pid]["activeProfile"] == "spot"
+        sa_by_profile = fake_hub.project_settings[pid]["defaultGCPIdentityServiceAccountIDByProfile"]
+        assert set(sa_by_profile.keys()) == {"spot", "remote"}
+        assert sa_by_profile["spot"] == sa_by_profile["remote"]
+
+    # Verify lead and eval-lead are created with profile "remote" (on-demand)
+    agent_posts = [
+        json.loads(r["body"].decode("utf-8"))
+        for r in fake_hub.requests
+        if r["method"] == "POST" and r["path"].endswith("/agents")
+    ]
+    lead_post = next(p for p in agent_posts if p["name"] == "lead")
+    assert lead_post["profile"] == "remote"
+
+    eval_lead_post = next(p for p in agent_posts if p["name"] == "eval-lead")
+    assert eval_lead_post["profile"] == "remote"
+
+
+

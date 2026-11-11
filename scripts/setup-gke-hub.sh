@@ -12,6 +12,7 @@ IMAGE_TAG="${IMAGE_TAG:-v$(date -u +%Y%m%d%H%M%S)}"
 WORK_DIR="build/gke-hub"
 APPROVE_APPLY=0
 DRY_RUN="${DRY_RUN:-0}"
+SPOT_WORKERS="${SPOT_WORKERS:-0}"
 ENV_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -23,9 +24,11 @@ while [[ $# -gt 0 ]]; do
     --harnesses) HARNESSES="$2"; shift 2 ;;
     --image-tag) IMAGE_TAG="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --spot-workers) SPOT_WORKERS=1; shift 1 ;;
+    --no-spot-workers) SPOT_WORKERS=0; shift 1 ;;
     --approve-apply) APPROVE_APPLY=1; shift 1 ;;
     --dry-run) DRY_RUN=1; shift 1 ;;
-    -h|--help) echo "Usage: $0 [options]"; exit 0 ;;
+    -h|--help) echo "Usage: $0 [--env <file>] [--tier terraform-ha|hybrid-gke] [--hub-mode cloudrun|gke] [--scion-repo <dir>] [--harnesses <list>] [--spot-workers|--no-spot-workers] [--approve-apply] [--dry-run]"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -542,8 +545,11 @@ if [[ "$TIER" == "terraform-ha" ]]; then
   TARGET_LOCATION="${VERTEX_LOCATION:-${GOOGLE_CLOUD_LOCATION:-global}}"
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}"
-  elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" == https://* ]]; then
-    HUB_URL="$HUB_URL_OUT" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" python3 - <<PY || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
+    if [[ "$SPOT_WORKERS" == "1" ]]; then
+      echo "Plan: would configure Hub server-config profiles 'remote' (on-demand) and 'spot' (GKE Autopilot Spot)"
+    fi
+  elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" != "https://..." && ( "$HUB_URL_OUT" == https://* || "$HUB_URL_OUT" == http://* ) ]]; then
+    HUB_URL="$HUB_URL_OUT" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" SPOT_WORKERS="$SPOT_WORKERS" python3 - <<PY || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
 import os, sys
 sys.path.insert(0, "${SCRIPT_DIR}")
 from hub_client import HubClient
@@ -555,6 +561,29 @@ for key, val in [
 ]:
     client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
 print("Configured hub-scope Vertex AI defaults on", "${HUB_URL_OUT}")
+if os.environ.get("SPOT_WORKERS") == "1":
+    existing_profiles = {}
+    try:
+        _, cfg = client.request("GET", "/api/v1/admin/server-config", timeout=15)
+        if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict):
+            existing_profiles = dict(cfg["profiles"])
+    except Exception:
+        existing_profiles = {}
+    existing_profiles.setdefault("remote", {"runtime": "remote"})
+    existing_profiles["spot"] = {
+        "runtime": "remote",
+        "node_selector": {"cloud.google.com/gke-spot": "true"},
+        "tolerations": [
+            {
+                "key": "cloud.google.com/gke-spot",
+                "operator": "Equal",
+                "value": "true",
+                "effect": "NoSchedule",
+            }
+        ],
+    }
+    client.request("PUT", "/api/v1/admin/server-config", body={"profiles": existing_profiles}, timeout=15)
+    print("Configured GKE Autopilot Spot Workers profile ('spot') and On-Demand profile ('remote') on", "${HUB_URL_OUT}")
 PY
   fi
 
@@ -590,7 +619,12 @@ if [[ -n "$IAP_CLIENT_ID" ]]; then
   echo "HUB_IAP_AUDIENCE=${IAP_CLIENT_ID}"
 fi
 echo "AGENT_RUNTIME=kubernetes"
-echo "RUNTIME_PROFILE=remote"
+if [[ "$SPOT_WORKERS" == "1" ]]; then
+  echo "RUNTIME_PROFILE=spot"
+  echo "LEAD_PROFILE=remote"
+else
+  echo "RUNTIME_PROFILE=remote"
+fi
 echo "HUB_K8S_CLUSTER=${CLUSTER_NAME}"
 echo "HUB_K8S_NAMESPACE=${HUB_K8S_NAMESPACE}"
 echo "IMAGE_REGISTRY=${IMAGE_REGISTRY}"
