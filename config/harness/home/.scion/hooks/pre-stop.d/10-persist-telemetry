@@ -35,7 +35,12 @@ _copy_atomic() {
   fi
 }
 
-_copy_atomic "${HOME}/.scion/agent.log" "${DEST_ROOT}/agent.log"
+# Current Scion writes ~/agent.log; older builds wrote ~/.scion/agent.log.
+if [ -f "${HOME}/agent.log" ]; then
+  _copy_atomic "${HOME}/agent.log" "${DEST_ROOT}/agent.log"
+else
+  _copy_atomic "${HOME}/.scion/agent.log" "${DEST_ROOT}/agent.log"
+fi
 
 if [ -d "${HOME}/.gemini" ]; then
   find "${HOME}/.gemini" -type f -name "transcript_full.jsonl" 2>/dev/null | while IFS= read -r _tp; do

@@ -852,7 +852,7 @@ def _archive_k8s_logs_and_transcripts(
                 "--",
                 "sh",
                 "-c",
-                "cat /home/scion/.scion/agent.log 2>/dev/null || cat ~/.scion/agent.log 2>/dev/null",
+                "cat /home/scion/agent.log 2>/dev/null || cat /home/scion/.scion/agent.log 2>/dev/null || cat ~/.scion/agent.log 2>/dev/null",
             ],
             timeout=20,
         )

@@ -246,3 +246,26 @@ def fake_metadata_server():
     yield server.state
     server.shutdown()
     server.server_close()
+
+
+def test_persist_telemetry_hook_mirrors_agent_log_from_home_root(tmp_path):
+    # Current Scion writes the agent log to ~/agent.log, not ~/.scion/agent.log. In hillclimb Run 1
+    # the mirror copied transcripts but no agent log, so the scorecard's error counts had no input.
+    hook = ROOT / "config" / "harness" / "home" / ".scion" / "hooks" / "pre-stop.d" / "10-persist-telemetry"
+    home = tmp_path / "home"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (home / ".scion").mkdir(parents=True)
+    (home / "agent.log").write_text("current location\n")
+    (home / ".scion" / "agent.log").write_text("stale legacy location\n")
+    r = subprocess.run(
+        ["sh", str(hook)],
+        env={**os.environ, "HOME": str(home), "SCION_SCRATCHPAD_DIR": str(scratch),
+             "SCION_AGENT_SLUG": "lead", "HOSTNAME": "bananacast-hc1--lead"},
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert (scratch / ".telemetry" / "lead" / "bananacast-hc1--lead" / "agent.log").read_text() == "current location\n"
+    launcher = (ROOT / "config" / "harness" / "home" / ".local" / "bin" / "factory-cd.sh").read_text()
+    assert '_cp_telem "${HOME}/agent.log" "${_dst_root}/agent.log"' in launcher
+    assert "cat /home/scion/agent.log" in (ROOT / "scripts" / "gke_lifecycle.py").read_text()

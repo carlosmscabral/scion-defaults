@@ -115,7 +115,12 @@ _persist_telemetry() {
       rm -f "$_t" 2>/dev/null || true
     fi
   }
-  _cp_telem "${HOME}/.scion/agent.log" "${_dst_root}/agent.log"
+  # Current Scion writes ~/agent.log; older builds wrote ~/.scion/agent.log.
+  if [ -f "${HOME}/agent.log" ]; then
+    _cp_telem "${HOME}/agent.log" "${_dst_root}/agent.log"
+  else
+    _cp_telem "${HOME}/.scion/agent.log" "${_dst_root}/agent.log"
+  fi
   if [ -d "${HOME}/.gemini" ]; then
     find "${HOME}/.gemini" -type f -name "transcript_full.jsonl" 2>/dev/null | while IFS= read -r _tf; do
       [ -n "$_tf" ] || continue
