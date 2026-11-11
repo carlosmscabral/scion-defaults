@@ -413,8 +413,21 @@ run gcloud services enable --project="$HUB_PROJECT" \
   logging.googleapis.com cloudtrace.googleapis.com monitoring.googleapis.com
 
 if [[ "$CREATE_PROJECT" == "1" ]]; then
-  if ! gcloud compute networks describe default --project="$HUB_PROJECT" >/dev/null 2>&1; then
-    run gcloud compute networks create default --project="$HUB_PROJECT" --subnet-mode=auto
+  # A just-enabled Compute Engine API can still answer SERVICE_DISABLED for a short time on a brand-new
+  # project (hillclimb Run 1, third attempt), so retry instead of failing the cold start.
+  _net_ready=0
+  for _net_try in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if gcloud compute networks describe default --project="$HUB_PROJECT" >/dev/null 2>&1 \
+      || run gcloud compute networks create default --project="$HUB_PROJECT" --subnet-mode=auto; then
+      _net_ready=1
+      break
+    fi
+    echo "Waiting for the Compute Engine API to propagate (attempt ${_net_try}/12)..." >&2
+    [[ $_net_try -lt 12 ]] && sleep "${BUILD_POLL_SEC}"
+  done
+  if [[ "$_net_ready" == "0" ]]; then
+    echo "Failed to create the default VPC network in ${HUB_PROJECT} after 12 attempts." >&2
+    exit 1
   fi
   if ! gcloud iam service-accounts describe "$OPERATOR_SA_EMAIL" --project="$HUB_PROJECT" >/dev/null 2>&1; then
     run gcloud iam service-accounts create "$OPERATOR_SA_NAME" \

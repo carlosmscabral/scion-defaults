@@ -787,6 +787,7 @@ def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal
     calls_log = tmp_path / "calls.log"
     proj_created = tmp_path / "proj_created"
     net_created = tmp_path / "net_created"
+    net_create_tried = tmp_path / "net_create_tried"
     sa_created = tmp_path / "sa_created"
 
     (fake_bin / "gcloud").write_text(
@@ -809,6 +810,11 @@ def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal
         '    exit 1\n'
         '    ;;\n'
         '  *"compute networks create default"*)\n'
+        f'    if [[ ! -f "{net_create_tried}" ]]; then\n'
+        f'      touch "{net_create_tried}"\n'
+        '      echo "ERROR: (gcloud.compute.networks.create) PERMISSION_DENIED: SERVICE_DISABLED" >&2\n'
+        '      exit 1\n'
+        '    fi\n'
         f'    touch "{net_created}"\n'
         '    exit 0\n'
         '    ;;\n'
@@ -838,6 +844,7 @@ def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DRY_RUN": "0",
         "USE_OPERATOR_SA": "1",
+        "BUILD_POLL_SEC": "0.05",
         "HUB_PROJECT": "demo-new-proj",
         "HUB_REGION": "us-east1",
         "HUB_ZONE": "us-east1-b",
@@ -873,6 +880,8 @@ def test_setup_gke_hub_create_project_links_folder_billing_default_vpc_and_zonal
     assert "projects create demo-new-proj --folder=987654" in calls
     assert "billing projects link demo-new-proj --billing-account=0123-ABCD" in calls
     assert "compute networks create default --project=demo-new-proj --subnet-mode=auto" in calls
+    # The first create fails while the just-enabled Compute Engine API propagates; setup retries it.
+    assert calls.count("compute networks create default") == 2
     assert "firestore.googleapis.com" in calls
     assert "cloudtrace.googleapis.com" in calls
     assert "logging.googleapis.com" in calls
