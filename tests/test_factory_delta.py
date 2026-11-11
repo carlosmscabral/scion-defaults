@@ -725,10 +725,20 @@ def test_delta_suppresses_in_flight_echo_wakes_and_recovers_stalled_wip_after_sp
     assert r3["woke_lead"] is False
     assert len(delta_hub.messages) == 1
 
-    # 4. Eviction drill: kubectl delete pod stops backend (SIGTERM -> phase="stopped") while #358 is still open!
+    # 4. Eviction drill: kubectl delete pod stops backend (SIGTERM -> phase="stopped") while #358 is still open,
+    #    even if reviewer ended its setup turn with `sciontool status blocked`!
     #    After stalled_wip_sec (120s) with zero busy children, delta wakes lead with STALLED_WIP recovery instructions.
     delta_hub.agents["uuid-bc"]["backend"]["phase"] = "stopped"
     delta_hub.agents["uuid-bc"]["backend"]["activity"] = "completed"
+    delta_hub.agents["uuid-bc"]["reviewer"] = {
+        "id": "id-rev",
+        "slug": "reviewer",
+        "name": "reviewer",
+        "template": "reviewer",
+        "phase": "running",
+        "activity": "blocked",
+        "lastActivityEvent": "2026-11-11T19:33:00Z",
+    }
     r4 = factory_delta.run_delta_tick(
         client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 400, github_fetcher=lambda *_: (issues_358_only, {})
     )
@@ -739,18 +749,29 @@ def test_delta_suppresses_in_flight_echo_wakes_and_recovers_stalled_wip_after_sp
     assert "backend" in delta_hub.messages[-1]["body"]["message"]
 
 
-def test_delta_handles_concurrent_409_start_in_progress_without_crashing(delta_hub, monkeypatch):
+def test_delta_handles_concurrent_409_start_in_progress_and_skips_restart_when_already_starting(delta_hub, monkeypatch):
     store = FakeDeltaStore()
     delta_hub.agents["uuid-bc"] = {
         "lead": {"id": "id-lead", "slug": "lead", "name": "lead", "template": "lead", "phase": "starting"}
     }
     client = hub_client.HubClient(base_url=delta_hub.url, token="tok-owner")
+    issues = [{"number": 401, "title": "Test", "labels": [{"name": "status:ready"}], "comments": 0}]
+
+    # 1. Lead already in `starting` phase: skips redundant ensure_agent_started(force_resume=True) and waits on tmux
+    monkeypatch.setattr(factory_delta, "_wait_for_tmux", lambda *_a, **_kw: False)
+    res_starting = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=4900.0, github_fetcher=lambda *_: (issues, {})
+    )
+    assert res_starting["action"] == "waiting_for_tmux"
+    assert not any(r["method"] == "POST" and r["path"].endswith("/start") for r in delta_hub.requests)
+
+    # 2. Lead `stopped` while a concurrent caller starts it -> HTTP 409 start_in_progress returns cleanly
+    delta_hub.agents["uuid-bc"]["lead"]["phase"] = "stopped"
 
     def raise_409(*_args, **_kwargs):
         raise hub_client.HubAPIError(409, "POST", "/api/v1/projects/uuid-bc/agents/lead/start", "start_in_progress")
 
     monkeypatch.setattr(client, "ensure_agent_started", raise_409)
-    issues = [{"number": 401, "title": "Test", "labels": [{"name": "status:ready"}], "comments": 0}]
     res = factory_delta.run_delta_tick(
         client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=5000.0, github_fetcher=lambda *_: (issues, {})
     )

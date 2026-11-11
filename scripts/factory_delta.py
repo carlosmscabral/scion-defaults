@@ -36,8 +36,8 @@ CONTROL_STATE_COLLECTION = "factory_control_state"
 
 _SKIP_LABELS = frozenset({"digest", "hillclimb-archive", "status:verified"})
 _PO_WAIT_LABELS = frozenset({"status:po-decision", "status:blocked"})
-_IDLE_ACTIVITIES = frozenset({"idle", "completed", "waiting_for_input"})
-_SLEEPABLE_CHILD_ACTIVITIES = frozenset({"idle", "completed", "waiting_for_input", "stalled"})
+_IDLE_ACTIVITIES = frozenset({"idle", "completed", "waiting_for_input", "blocked"})
+_SLEEPABLE_CHILD_ACTIVITIES = frozenset({"idle", "completed", "waiting_for_input", "stalled", "blocked"})
 _ACTIVE_PHASES = frozenset({"running", "provisioning", "starting", "created"})
 
 
@@ -638,7 +638,7 @@ def run_delta_tick(
                 lead_agent = None
 
             lead_phase = str((lead_agent or {}).get("phase") or (lead_agent or {}).get("status") or "").lower()
-            if lead_agent is None or lead_phase != "running":
+            if lead_agent is None or lead_phase not in _ACTIVE_PHASES:
                 try:
                     if rotated_lead and client.get_agent(pid, resolved_lead) is not None:
                         payload = {**create_body, "projectId": pid}

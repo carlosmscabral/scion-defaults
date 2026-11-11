@@ -461,6 +461,7 @@ If woken solely by a bare system `state-change` (`COMPLETED`) notification with 
 Never create Python virtual environments, install language packages, or run product test suites yourself before delegating: write briefs and start required specialists immediately so pods boot in parallel, and let each specialist manage its own container-local `/tmp/.venv`.
 Persist active issue and wave state in `/scion-volumes/scratchpad/STATE.json`, write briefs to `/scion-volumes/scratchpad/briefs/<issue>-<agent>.md`, and start **only** the specialists required by active issues (never pre-starting unused roles).
 When a `DELTA:` wake reports `ABNORMAL_CHILDREN` or `STALLED_WIP`, inspect `scion list`, restart any `stopped`/`error`/`halted` specialist still needed by open `in-progress` issues (`scion start <agent>`), and re-send its brief message.
+When a `DELTA:` wake reports `PO_REPLIES`, read the latest human comment (`gh issue view <N> --comments`), apply the PO decision (recording evidence, removing `status:po-decision` / `status:blocked`, and adding `status:verified` directly when zero code changes are needed, or briefing a specialist otherwise).
 When `<reviewer>` reports `PASS` for `origin/factory/issue-<N>`, merge or fast-forward `origin/factory/issue-<N>` onto `<build_branch>`, push `origin/<build_branch>`, delete remote `factory/issue-<N>`, update `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists with `scion stop <agent>`.
 Prepend `<!-- scion-agent: <agent-slug> -->` to every GitHub comment, and post your escalation comment *before* adding `status:po-decision` through your Decision rights channel.
 If a push is rejected by repository or token scope limits (for example `.github/workflows/*` without `workflow` scope), keep restricted paths in `/scion-volumes/scratchpad/pending-<issue>/`, land permitted paths, and escalate through your Decision rights channel.
@@ -496,7 +497,8 @@ Examine the diff thoroughly for ACID transaction safety, edge-case coverage, and
 Verify that tests importing optional or secondary-app packages guard those imports (for example `pytest.importorskip(...)`) so test collection stays green in minimal per-app environments.
 Never fix code yourself; provide actionable `file:line` review feedback only.
 On a first-attempt `FAIL`, message the writer directly so it can fix and re-push `origin/factory/issue-<N>` without waking `lead`.
-On `PASS` (or second `FAIL`), write `/scion-volumes/scratchpad/reports/<N>-review.md` and message `lead` once with the verdict and commit SHA.""",
+On `PASS` (or second `FAIL`), write `/scion-volumes/scratchpad/reports/<N>-review.md` and message `lead` once with the verdict and commit SHA.
+When waiting for writer handoffs, finish your turn with `sciontool status task_completed "Awaiting writer handoffs"` (never `sciontool status blocked`).""",
     },
 }
 
