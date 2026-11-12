@@ -13,6 +13,8 @@ WORK_DIR="build/gke-hub"
 APPROVE_APPLY=0
 DRY_RUN="${DRY_RUN:-0}"
 ENV_FILE=""
+PRE_HOOKS=()
+POST_HOOKS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,6 +25,8 @@ while [[ $# -gt 0 ]]; do
     --harnesses) HARNESSES="$2"; shift 2 ;;
     --image-tag) IMAGE_TAG="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --pre-hook) PRE_HOOKS+=("$2"); shift 2 ;;
+    --post-hook) POST_HOOKS+=("$2"); shift 2 ;;
     --approve-apply) APPROVE_APPLY=1; shift 1 ;;
     --dry-run) DRY_RUN=1; shift 1 ;;
     -h|--help) echo "Usage: $0 [options]"; exit 0 ;;
@@ -78,6 +82,25 @@ run() {
   else
     "$@"
   fi
+}
+
+run_hooks() {
+  local phase="$1"
+  shift
+  local hook
+  export HUB_PROJECT HUB_REGION HUB_ZONE SHARED_PREFIX HUB_NAME TIER HUB_MODE
+  export SCION_REPO WORK_DIR ABS_WORK_DIR CLUSTER_NAME HUB_K8S_NAMESPACE
+  export IMAGE_REGISTRY IMAGE_TAG APPROVE_APPLY DRY_RUN PO_EMAIL
+  export HUB_URL_OUT="${HUB_URL_OUT:-}" IAP_CLIENT_ID="${IAP_CLIENT_ID:-}"
+  for hook in "$@"; do
+    [[ -n "$hook" ]] || continue
+    echo "== Running ${phase}-hook: ${hook}"
+    if [[ -x "$hook" ]]; then
+      run "$hook"
+    else
+      run bash "$hook"
+    fi
+  done
 }
 
 wait_for_cloud_build() {
@@ -258,8 +281,28 @@ if [[ -z "$SCION_REPO" ]]; then
   exit 1
 fi
 
+if [[ -n "${PRE_HOOKS_ENV:-}" ]]; then
+  IFS=',' read -ra _ENV_PRE <<< "$PRE_HOOKS_ENV"
+  PRE_HOOKS=("${_ENV_PRE[@]}" "${PRE_HOOKS[@]}")
+fi
+if [[ -n "${POST_HOOKS_ENV:-}" ]]; then
+  IFS=',' read -ra _ENV_POST <<< "$POST_HOOKS_ENV"
+  POST_HOOKS+=("${_ENV_POST[@]}")
+fi
+for _h in "${PRE_HOOKS[@]}" "${POST_HOOKS[@]}"; do
+  [[ -n "$_h" ]] || continue
+  if [[ ! -f "$_h" ]]; then
+    echo "Hook script not found: ${_h}" >&2
+    exit 1
+  fi
+done
+
 mkdir -p "$WORK_DIR"
 ABS_WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+if [[ ${#PRE_HOOKS[@]} -gt 0 ]]; then
+  run_hooks "pre" "${PRE_HOOKS[@]}"
+fi
 
 echo "== 1. Enable APIs & Terraform State Bucket"
 run gcloud services enable --project="$HUB_PROJECT" \
@@ -579,6 +622,10 @@ EOF
   else
     echo "Plan: would run $SCION_REPO/scripts/single-node-vm/deploy.sh --config ${ABS_WORK_DIR}/deploy-config.json"
   fi
+fi
+
+if [[ ${#POST_HOOKS[@]} -gt 0 ]]; then
+  run_hooks "post" "${POST_HOOKS[@]}"
 fi
 
 echo ""
