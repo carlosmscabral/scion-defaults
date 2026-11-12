@@ -226,7 +226,8 @@ class FakeMetadataHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"access_token": "tok-direct-iap-ok", "expires_in": 3599}).encode())
+                tok = state.get("token", "tok-direct-iap-ok")
+                self.wfile.write(json.dumps({"access_token": tok, "expires_in": 3599}).encode())
                 return
         self.send_response(404)
         self.end_headers()
@@ -269,3 +270,40 @@ def test_persist_telemetry_hook_mirrors_agent_log_from_home_root(tmp_path):
     launcher = (ROOT / "config" / "harness" / "home" / ".local" / "bin" / "factory-cd.sh").read_text()
     assert '_cp_telem "${HOME}/agent.log" "${_dst_root}/agent.log"' in launcher
     assert "cat /home/scion/agent.log" in (ROOT / "scripts" / "gke_lifecycle.py").read_text()
+
+
+def test_direct_iap_refresh_cadence_hits_gke_metadata_5m_window_without_redundant_rewrites(fake_metadata_server, tmp_path):
+    launcher = (ROOT / "config" / "harness" / "home" / ".local" / "bin" / "factory-cd.sh").read_text()
+    assert 'FACTORY_CD_IAP_REFRESH_SEC:-180' in launcher
+    # gke-metadata-server caches Workload Identity access tokens until 300s before 60m expiry ([T+55m, T+60m)).
+    # A 180s interval guarantees at least one poll inside [3300s, 3600s) regardless of initial phase offset.
+    for offset in range(0, 180):
+        ticks = [offset + 180 * k for k in range(1, 25)]
+        assert any(3300 <= t < 3600 for t in ticks)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "SCION_TRANSPORT_MODE": "iap",
+        "SCION_TRANSPORT_AUDIENCE": "369001918367-abc.apps.googleusercontent.com",
+        "SCION_METADATA_URL": fake_metadata_server["url"],
+        "SCION_IAP_RETRY_SLEEP_SEC": "0.01",
+    }
+    assert subprocess.run(["sh", str(HOOK_PATH)], env=env, capture_output=True, text=True).returncode == 0
+    t_path = home / ".scion" / "transport-token"
+    i_path = home / ".scion" / "iap-access-token"
+    ino_before = (t_path.stat().st_ino, i_path.stat().st_ino)
+
+    # Polling while gke-metadata-server still returns the cached token skips atomic rename churn.
+    assert subprocess.run(["sh", str(HOOK_PATH)], env=env, capture_output=True, text=True).returncode == 0
+    assert (t_path.stat().st_ino, i_path.stat().st_ino) == ino_before
+
+    # Once gke-metadata-server rotates the cached token inside [T+55m, T+60m), both files update atomically (0600).
+    fake_metadata_server["token"] = "tok-rotated-at-57m"
+    assert subprocess.run(["sh", str(HOOK_PATH)], env=env, capture_output=True, text=True).returncode == 0
+    assert t_path.read_text() == "tok-rotated-at-57m"
+    assert i_path.read_text() == "tok-rotated-at-57m"
+    assert (t_path.stat().st_mode & 0o777) == 0o600
+

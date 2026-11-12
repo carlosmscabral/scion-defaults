@@ -28,15 +28,15 @@ Run all commands from the root of the `scion-defaults` repository.
 
 ## Step 0: Target Hub mode
 
-Ask the user for the target Hub mode: **New Full GKE Scion Hub**, **Existing GKE / Cloud Run Scion Hub**, or **Existing Single-VM Hub**. If installing Scion from scratch on GKE, guide the user to use `scripts/setup-gke-hub.sh` with the appropriate tier flag:
-- For Full GKE Multi-Hub HA: `--tier terraform-ha`
-- For Hybrid VM + GKE: `--tier hybrid-gke`
+Ask the user for the target Hub mode: **New Full GKE Scion Hub**, **Existing GKE / Cloud Run Scion Hub**, or **Existing Single-VM Hub**.
 
-The full command syntax is:
-```bash
-DRY_RUN=1 scripts/setup-gke-hub.sh --tier <tier> --scion-repo <dir> --harnesses claude,antigravity --dry-run
-```
-After reviewing the plan, apply it using `--approve-apply`.
+1. **Fast host & GCP preflight (before any Cloud Build or Terraform apply):**
+   - Verify required local tools on `PATH`: `gcloud`, `gh`, `git`, `jq`, `openssl`, `python3`, `uv`, plus `terraform` (`>= 1.9`) and `kubectl` with `gke-gcloud-auth-plugin` for GKE modes.
+   - On Google Cloud organizations that restrict end-user OIDC/IAP tokens from workstations, set `USE_OPERATOR_SA=1` (or `HUB_IMPERSONATE_SA`) so `setup-gke-hub.sh` and `hub_client.py` impersonate `factory-operator@<hub-project>.iam.gserviceaccount.com`.
+   - Confirm that every harness model chosen in the roster is enabled in Vertex AI Model Garden for the target project (for example, `Gemini 4 Argon` with `GOOGLE_CLOUD_LOCATION=global`, or Anthropic Claude models before selecting the `claude` harness).
+2. **GKE bootstrap path:**
+   - **Turnkey new GKE Hub + factory (`Recommended` for fresh projects):** After Steps 1 to 4 compile `factory.yaml`, run `./scripts/scion-factory gke-up factory.yaml --env config/<slug>.env [--create-project --billing-account <id> --folder <id>]` (dry-run first, then `--apply`). `scripts/setup-gke-hub.sh` automatically clones the pinned `SCION_REF` when `--scion-repo` is omitted and builds `linux/amd64` images by default (`IMAGE_PLATFORMS=linux/amd64`).
+   - **Standalone Hub-only install:** Run `DRY_RUN=1 scripts/setup-gke-hub.sh --tier <terraform-ha|hybrid-gke> --harnesses <csv> --dry-run`, review the plan, and apply with `--approve-apply`.
 
 ## Step 1: Detect static facts and write the draft
 
@@ -72,8 +72,8 @@ Work through the `questions` in pillar order. For each question:
 | Pillar | Fields to fill |
 |---|---|
 | `1_mission_and_boundaries` | `project.name`, `project.mission`, `project.non_goals`, and the `vcs` section |
-| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""` or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
-| `3_roster_models_and_cost` | `team.build_roles`, `team.eval_roles`, `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode`, `team.max_wip`, `infrastructure.budget_usd` |
+| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` for Cloud Run Terraform HA, `"gke"` for Hybrid VM+GKE, or `""` for default), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
+| `3_roster_models_and_cost` | `team.build_roles`, optional `team.eval_roles` (omit `project.eval_slug` and place `evaluator` in `build_roles` for single-project `heartbeat_mode: delta`), `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode` (`delta` or `direct-lead`), `team.max_wip`, `infrastructure.budget_usd` |
 | `4_evaluation_pyramid_oracle` | `evaluation_pyramid.l1_health` through `evaluation_pyramid.l5_latency_slo` |
 | `5_backlog_waves_and_autonomy` | `waves[*].issues[*]` with `owner_role`, `acceptance_criteria`, and `requirements` (REQ- IDs) |
 | `6_knowledge_plane` | `knowledge_plane.sources`, `knowledge_plane.requirements`, `knowledge_plane.invariants`, `knowledge_plane.decisions`, `knowledge_plane.glossary` |
@@ -86,7 +86,7 @@ The draft specification starts with the default roster:
 
 Work through the team configuration with the human:
 
-1. **Deploy mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`""` or `"gke"`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy). With `none`, do not add `deployer` or `eval-deployer` roles.
+1. **Deploy & heartbeat mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` on Full GKE Cloud Run HA, `"gke"` on Hybrid VM+GKE, or `""`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy), and `team.heartbeat_mode`: `delta` (`Recommended` on GKE with Git: single Hub project, zero-LLM 1-minute `scion-factory-delta`, automatic 0-pod idle sleep) or `direct-lead` (15-minute LLM schedule across build + eval projects). With `deploy: none`, do not add `deployer` or `eval-deployer` roles.
 2. **Review proposed specialists:** Present the default roster and each item in `proposed_roles` with its evidence. For each specialist the human confirms, run:
    ```bash
    ./scripts/scion-factory add-role factory.yaml --role R --evidence "..."
@@ -173,9 +173,11 @@ Once the kit is compiled, perform automated provisioning:
 ./scripts/scion-factory provision factory.yaml --kit OUTPUT_DIR --env config/<slug>.env
 ```
 
-Review the dry-run output with the human first. After they approve, run the provision command with `--apply --go`.
+Review the dry-run output with the human first. After they approve:
+- For `team.heartbeat_mode: delta` on an existing Hub, run `--apply` (omit `--go`; `scion-factory-delta` wakes `lead` from GitHub deltas). For a brand-new GKE Hub + factory, run `./scripts/scion-factory gke-up factory.yaml --env config/<slug>.env --apply` (and tear down ephemeral trials with `./scripts/scion-factory gke-down ... --delete-project --apply`).
+- For `team.heartbeat_mode: direct-lead`, run `--apply --go`.
 
-Summarize what was generated, and point the human to `docs/setup-runbook.md` to deploy the factory to a Scion Hub.
+Summarize what was generated, and point the human to `docs/gke-setup-runbook.md` (GKE) or `docs/setup-runbook.md` (Single-VM).
 
 ## Add Git later
 

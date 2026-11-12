@@ -701,7 +701,7 @@ Inspect [`presets/`](presets/) for four complete `FactorySpec` examples:
 
 | Path | Contents |
 |---|---|
-| [`skills/scion-factory-bootstrap/`](skills/scion-factory-bootstrap/SKILL.md) | Portable agent skill driving Hub bootstrap, repository inspection, Socratic interview, compilation, and provisioning. |
+| [`skills/`](skills/) | Portable agent skills: [`scion-factory-bootstrap`](skills/scion-factory-bootstrap/SKILL.md), [`clean-room-reproducibility`](skills/clean-room-reproducibility/SKILL.md), and [`gke-hillclimb-verification`](skills/gke-hillclimb-verification/SKILL.md). |
 | [`scripts/scion_factory.py`](scripts/scion_factory.py) | Deterministic factory CLI (`inspect`, `grill`, `check`, `add-role`, `compile`, `enable-git`, `provision`, `gke-up`, `gke-down`). |
 | [`scripts/gke_lifecycle.py`](scripts/gke_lifecycle.py) and [`scripts/factory_delta.py`](scripts/factory_delta.py) | Ephemeral GKE Hub lifecycle (`gke-up` / `gke-down`) and zero-LLM GitHub delta orchestrator (`scion-factory-delta`). |
 | [`scripts/provision_factory.py`](scripts/provision_factory.py) | Nine-phase idempotent provisioner for GKE and Single-VM Scion factories. |
@@ -714,7 +714,7 @@ Inspect [`presets/`](presets/) for four complete `FactorySpec` examples:
 | [`templates/`](templates/README.md) | Shared coordination protocol (`_shared/agents.md`) and 10 reference role templates. |
 | [`presets/`](presets/) | Reference `FactorySpec` presets (`starter-service`, `psearch`, `acme-airlines`, `bananacast-gke`). |
 | [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) | Operator and agent runbook for Full GKE HA, Hybrid GKE, `gke-up` / `gke-down`, Workload Identity, and K8s `CronJob`s. |
-| [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) | Three-run GKE hillclimb scorecard, token and latency progression, and resilience drill evidence. |
+| [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) | GKE hillclimb scorecard, cold-start hardening, token and latency progression, and resilience drill evidence. |
 | [`docs/`](docs/) | Architecture (`architecture.md`), VM setup (`setup-runbook.md`), operations (`operations-runbook.md`), agent protocol, evaluation pyramid, grill playbook (`grill-me-playbook.md`), specs (`specs/`), plans (`plans/`), and lessons L1 to L34 (`lessons-learned.md`). |
 | [`docs/telemetry/`](docs/telemetry/README.md) | ASD-STE100 guides for Cloud Trace waterfalls, Cloud Monitoring counters, and the evaluation pipeline. |
 | [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) | Go patch for three-level stacked Cloud Trace waterfalls and cumulative metric epochs. |
@@ -734,7 +734,7 @@ Never commit secrets, PATs, real email addresses, GCP project IDs, cluster names
 ## Next steps
 
 - Follow [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) to deploy a Full GKE HA or Hybrid GKE Scion Hub.
-- Read [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) for the three-run GKE hillclimb scorecard and resilience drill results.
+- Read [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) for the GKE hillclimb scorecard, cold-start hardening, and resilience drill results.
 - Read [`docs/grill-me-playbook.md`](docs/grill-me-playbook.md) to prepare testable answers for the bootstrap interview.
 - Read [`docs/lessons-learned.md`](docs/lessons-learned.md) (L1 to L34) to inspect the production root causes behind every guardrail.
 - Follow [`docs/setup-runbook.md`](docs/setup-runbook.md) for Single-VM setups, separate sandbox projects, backups, alerts, and billing budgets.

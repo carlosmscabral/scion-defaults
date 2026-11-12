@@ -17,8 +17,9 @@
 
 # Google-managed Cloud Run Direct IAP (369001918367-*) rejects OIDC ID tokens unless a custom OAuth client is
 # manually bound via Console, and instead accepts Service Account OAuth2 access tokens in Proxy-Authorization.
-# When running under Direct IAP, swap SCION_TRANSPORT_TOKEN_FILE to a metadata-fetched SA access token (refreshed
-# every 25m) and unset SCION_TRANSPORT_TOKEN so `scion list|start|resume|message` works zero-click inside pods.
+# gke-metadata-server caches Workload Identity access tokens until 5 minutes before their 60-minute expiry
+# ([T+55m, T+60m)), so poll every 180s (not 25m, which lands at T+25m, T+50m, T+75m and misses [T+55m, T+60m))
+# and rewrite the token files only when the token bytes actually rotate.
 if [ "${SCION_TRANSPORT_MODE:-}" = "iap" ]; then
   case "${SCION_TRANSPORT_AUDIENCE:-}" in
     369001918367-*)
@@ -28,11 +29,19 @@ if [ "${SCION_TRANSPORT_MODE:-}" = "iap" ]; then
         else
           command -v python3 >/dev/null 2>&1 || return 1
           python3 - <<'PY' >/dev/null 2>&1
-import json, os, urllib.request, time
-def _write_atomic(path, content):
+import json, os, stat, time, urllib.request
+def _write_if_changed(path, content):
+    try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600:
+            with open(path, "r", encoding="utf-8") as existing:
+                if existing.read() == content:
+                    return
+    except OSError:
+        pass
     tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, path)
 home = os.environ.get("HOME", "")
@@ -59,8 +68,8 @@ for base in bases:
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 tok = (json.loads(resp.read().decode("utf-8", errors="replace")).get("access_token") or "").strip()
             if tok:
-                _write_atomic(out1, tok)
-                _write_atomic(out2, tok)
+                _write_if_changed(out1, tok)
+                _write_if_changed(out2, tok)
                 raise SystemExit(0)
         except SystemExit:
             raise
@@ -75,7 +84,7 @@ PY
       if _refresh_direct_iap_token && [ -s "${HOME}/.scion/iap-access-token" ]; then
         export SCION_TRANSPORT_TOKEN_FILE="${HOME}/.scion/iap-access-token"
         unset SCION_TRANSPORT_TOKEN
-        _iap_refresh="${FACTORY_CD_IAP_REFRESH_SEC:-1500}"
+        _iap_refresh="${FACTORY_CD_IAP_REFRESH_SEC:-180}"
         if [ "$_iap_refresh" -gt 0 ] 2>/dev/null; then
           _f_pid="$$"
           (

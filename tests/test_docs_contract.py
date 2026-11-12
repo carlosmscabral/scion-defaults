@@ -297,3 +297,21 @@ def test_docs_cover_gke_hillclimb_delta_orchestration_and_l34():
         assert not leaks, f"found unredacted real identifier in {rel}: {leaks}"
 
 
+def test_public_repo_skills_cover_gcp_gke_reproducibility_without_corp_leaks():
+    corp_re = re.compile(r"\b(cloudtop|jetski|agcis|google3|citc|piper|moma|buganizer|altostrat)\b", flags=re.IGNORECASE)
+    for rel in (
+        "skills/scion-factory-bootstrap/SKILL.md",
+        "skills/clean-room-reproducibility/SKILL.md",
+        "skills/gke-hillclimb-verification/SKILL.md",
+    ):
+        path = ROOT / rel
+        assert path.is_file(), f"missing public repo skill {rel}"
+        text = path.read_text()
+        assert text.startswith("---\nname: "), f"{rel} missing YAML frontmatter"
+        assert "\ndescription:" in text, f"{rel} missing description in frontmatter"
+        corp_hits = corp_re.findall(text)
+        assert not corp_hits, f"public skill {rel} contains Google-corp internal terms: {corp_hits}"
+        assert "\u2014" not in text, f"em-dash found in {rel}"
+
+
+

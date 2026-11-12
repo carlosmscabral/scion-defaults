@@ -61,7 +61,7 @@ For a completely serverless/managed infrastructure, use the Terraform configurat
    ```bash
    scripts/setup-gke-hub.sh --tier terraform-ha --scion-repo <dir> --harnesses claude,antigravity --approve-apply
    ```
-4. Verify connectivity using IAP `Proxy-Authorization` and the `/health` endpoint. On Cloud Run Direct IAP (`369001918367-*`), `scripts/hub_client.py` (for K8s `CronJob`s), `/etc/scion/hooks/10-direct-iap-token` (pre-start pod hook), and `config/harness/home/.local/bin/factory-cd.sh` (in-pod refresh) automatically mint Workload Identity Service Account access tokens with `cloud-platform`, `userinfo.email`, and `openid` scopes, requiring zero static Kubernetes Secrets or PATs.
+4. Verify connectivity using IAP `Proxy-Authorization` and the `/health` endpoint. On Cloud Run Direct IAP (`369001918367-*`), `scripts/hub_client.py` (for K8s `CronJob`s), `config/harness/home/.scion/hooks/pre-start.d/10-direct-iap-token` (pre-start pod hook), and `config/harness/home/.local/bin/factory-cd.sh` (3-minute in-pod refresh inside `gke-metadata-server`'s 5-minute pre-expiry window) automatically mint Workload Identity Service Account access tokens with `cloud-platform`, `userinfo.email`, and `openid` scopes, requiring zero static Kubernetes Secrets or PATs.
 
 ## Option B: Hybrid VM + GKE Tier
 
