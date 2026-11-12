@@ -644,6 +644,31 @@ if not re.search(r"(?m)^telemetry:\s*$", src):
     p.write_text(src.rstrip("\n") + "\n" + block)
 PY
   fi
+  if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/main.tf" ]]; then
+    # Conditioned Secret Manager IAM on a brand-new GCP project takes ~150-180s to propagate; upstream's
+    # 120s timer lets Pass 1 Cloud Run revision 00001 boot too early and fail its startup probe (Error code 9).
+    python3 - "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/main.tf" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+old = 'create_duration = "120s"'
+new = 'create_duration = "180s"'
+if new not in src and old in src:
+    p.write_text(src.replace(old, new, 1))
+PY
+  fi
+  if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/image-build/scripts/build-images.sh" ]]; then
+    # Suppress build-images.sh's standalone-harness warning when setup-gke-hub.sh just built scion-base at IMAGE_TAG.
+    python3 - "${SCION_REPO}/image-build/scripts/build-images.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+old = 'if [[ "${needs_scion_base}" != "true" || "${built_scion_base}" == "true" ]]; then'
+new = 'if [[ "${needs_scion_base}" != "true" || "${built_scion_base}" == "true" || "${SCION_BASE_JUST_BUILT:-0}" == "1" ]]; then'
+if new not in src and old in src:
+    p.write_text(src.replace(old, new, 1))
+PY
+  fi
   CLOUDRUN_IGNORE="${ABS_WORK_DIR}/gcloudignore-cloudrun"
   if [[ -f "${SCION_REPO}/image-build/gcloudignore-omni" ]]; then
     grep -Ev '^(/scripts/|#!include:)' "${SCION_REPO}/image-build/gcloudignore-omni" > "$CLOUDRUN_IGNORE" || true
@@ -723,7 +748,7 @@ for raw_h in "${H_ARR[@]}"; do
     step_target="$(resolve_harness_step "$raw_h")"
     if [[ "$DRY_RUN" == "1" || "$APPROVE_APPLY" == 1 ]]; then
       if ! image_exists_in_ar "${IMAGE_REGISTRY}/${step_target}:${IMAGE_TAG}"; then
-        submit_and_wait "$SCION_REPO/image-build/scripts/build-images.sh" \
+        SCION_BASE_JUST_BUILT=1 submit_and_wait "$SCION_REPO/image-build/scripts/build-images.sh" \
           --builder cloud-build --target "$step_target" --registry "$IMAGE_REGISTRY" --tag "$IMAGE_TAG"
       else
         echo "Skipping existing ${IMAGE_REGISTRY}/${step_target}:${IMAGE_TAG}"
@@ -814,37 +839,56 @@ if [[ "$TIER" == "terraform-ha" ]]; then
     _HUB_TARGET_PROJECT="$TARGET_PROJECT" \
     _HUB_TARGET_LOCATION="$TARGET_LOCATION" \
     _HUB_URL_OUT="$HUB_URL_OUT" \
+    _HUB_ENV_MAX_ATTEMPTS="${HUB_ENV_MAX_ATTEMPTS:-12}" \
+    _HUB_ENV_RETRY_SEC="${HUB_ENV_RETRY_SEC:-10}" \
     python3 - <<'PY' || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
-import os, sys
+import os, sys, time, urllib.error
 sys.path.insert(0, os.environ["_HUB_SCRIPT_DIR"])
-from hub_client import HubClient
-client = HubClient.from_env()
+from hub_client import HubAPIError, HubClient
+
 target_project = os.environ["_HUB_TARGET_PROJECT"]
 target_location = os.environ["_HUB_TARGET_LOCATION"]
-for key, val in [
-    ("GOOGLE_CLOUD_PROJECT", target_project),
-    ("GOOGLE_CLOUD_REGION", target_location),
-    ("GOOGLE_CLOUD_LOCATION", target_location),
-]:
-    # The Hub env API rejects SCION_* names (reserved control-plane namespace); cloud telemetry is
-    # configured through Hub server-config settings instead.
-    client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
-client.request(
-    "PUT",
-    "/api/v1/admin/server-config",
-    body={
-        "telemetry": {
-            "enabled": True,
-            "cloud": {
-                "enabled": True,
-                "provider": "gcp",
-                "gcp_project_id": target_project,
+max_attempts = max(int(os.environ.get("_HUB_ENV_MAX_ATTEMPTS", "12")), 1)
+retry_sec = float(os.environ.get("_HUB_ENV_RETRY_SEC", "10"))
+
+for attempt in range(1, max_attempts + 1):
+    try:
+        client = HubClient.from_env()
+        for key, val in [
+            ("GOOGLE_CLOUD_PROJECT", target_project),
+            ("GOOGLE_CLOUD_REGION", target_location),
+            ("GOOGLE_CLOUD_LOCATION", target_location),
+        ]:
+            # The Hub env API rejects SCION_* names (reserved control-plane namespace); cloud telemetry is
+            # configured through Hub server-config settings instead.
+            client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
+        client.request(
+            "PUT",
+            "/api/v1/admin/server-config",
+            body={
+                "telemetry": {
+                    "enabled": True,
+                    "cloud": {
+                        "enabled": True,
+                        "provider": "gcp",
+                        "gcp_project_id": target_project,
+                    },
+                }
             },
-        }
-    },
-    timeout=15,
-)
-print("Configured hub-scope Vertex AI and Cloud Telemetry defaults on", os.environ["_HUB_URL_OUT"])
+            timeout=15,
+        )
+        print("Configured hub-scope Vertex AI and Cloud Telemetry defaults on", os.environ["_HUB_URL_OUT"])
+        sys.exit(0)
+    except HubAPIError as exc:
+        if exc.status in (401, 403, 500, 502, 503, 504) and attempt < max_attempts:
+            time.sleep(retry_sec)
+            continue
+        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        if attempt < max_attempts:
+            time.sleep(retry_sec)
+            continue
+        sys.exit(1)
 PY
   fi
 

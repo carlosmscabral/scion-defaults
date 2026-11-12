@@ -567,6 +567,32 @@ def provision_factory(
             subprocess.run(cmd_push, cwd=ROOT_DIR, env=sub_base_env, check=True, stdout=sys.stderr)
         phases.append({"phase": "harness_and_templates", "ok": True})
 
+        # 8. schedules_and_leads (start lead BEFORE installing K8s delta CronJob so cold Autopilot pod boot
+        #    never races the 1-minute scion-factory-delta tick) & 9. control_plane
+        lead_started = False
+        if apply and is_delta and runtime == "kubernetes":
+            wait_sec = int(eff_env.get("AGENT_START_TIMEOUT_SEC", "420"))
+            poll_sec = float(eff_env.get("AGENT_START_POLL_SEC", "2.0"))
+            harness_auth = eff_env.get("HARNESS_AUTH", "vertex-ai")
+            lead_name = scion_factory._agent(spec, "lead")
+            build_kp_index = "/scion-volumes/knowledge-plane/INDEX.md"
+            vcs = spec.get("vcs", {}) or {}
+            vcs_enabled = vcs.get("enabled", True) is not False and bool(vcs.get("repo") or eff_env.get("GITHUB_REPO"))
+            c_body: dict = {
+                "name": lead_name,
+                "template": "lead",
+                "task": f"Read {build_kp_index} and stand by.",
+            }
+            if vcs_enabled:
+                c_body["branch"] = _resolve_branch(spec, "build_branch", eff_env)
+            if runtime_profile:
+                c_body["profile"] = runtime_profile
+            if harness_auth:
+                c_body["harnessAuth"] = harness_auth
+            client.ensure_agent_started(build_pid_id, lead_name, create_body=c_body, wait_sec=wait_sec, poll_sec=poll_sec)
+            _wait_for_agent_tmux(client, build_pid_id, lead_name, wait_sec=wait_sec, poll_sec=poll_sec)
+            lead_started = True
+
         # 8. control_plane
         merged_fp = ",".join(dict.fromkeys([p for p in [*factory_projects, *target_slugs] if p]))
         if runtime == "kubernetes":
@@ -632,18 +658,19 @@ def provision_factory(
             vcs = spec.get("vcs", {}) or {}
             vcs_enabled = vcs.get("enabled", True) is not False and bool(vcs.get("repo") or eff_env.get("GITHUB_REPO"))
 
-            c_body: dict = {
-                "name": lead_name,
-                "template": "lead",
-                "task": f"Read {build_kp_index} and stand by.",
-            }
-            if runtime == "kubernetes" and vcs_enabled:
-                c_body["branch"] = _resolve_branch(spec, "build_branch", eff_env)
-            if runtime_profile:
-                c_body["profile"] = runtime_profile
-            if harness_auth:
-                c_body["harnessAuth"] = harness_auth
-            client.ensure_agent_started(build_pid_id, lead_name, create_body=c_body, wait_sec=wait_sec, poll_sec=poll_sec)
+            if not lead_started:
+                c_body = {
+                    "name": lead_name,
+                    "template": "lead",
+                    "task": f"Read {build_kp_index} and stand by.",
+                }
+                if runtime == "kubernetes" and vcs_enabled:
+                    c_body["branch"] = _resolve_branch(spec, "build_branch", eff_env)
+                if runtime_profile:
+                    c_body["profile"] = runtime_profile
+                if harness_auth:
+                    c_body["harnessAuth"] = harness_auth
+                client.ensure_agent_started(build_pid_id, lead_name, create_body=c_body, wait_sec=wait_sec, poll_sec=poll_sec)
 
             if has_eval:
                 eval_lead_name = scion_factory._agent(spec, "eval-lead")

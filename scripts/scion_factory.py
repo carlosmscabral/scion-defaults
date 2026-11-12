@@ -1467,9 +1467,9 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
     if wake_mode(spec) == "delta" and _vcs_enabled(spec):
         reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
         return f"""## Briefs
-- Write each brief to `{BRIEFS_DIR}/<issue>-<agent>.md`, start/resume `<agent>` on demand if not yet running, then send
-  `scion message <agent> "{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>"`.
-- Never inline a brief in the message: shell metacharacters and long prompts break.
+- Write each brief to `{BRIEFS_DIR}/<issue>-<agent>.md` and update `/scion-volumes/scratchpad/STATE.json` **before** launching or messaging `<agent>`.
+- **Single-turn launch (never `scion start` + `scion message` back-to-back):** When `<agent>` does not exist yet, pass `{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>` directly as the `scion start` prompt and do **not** send a follow-up `scion message` (sending both queues a wasted duplicate second turn). Use `scion message <agent> "{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>"` **only** when `<agent>` is already `running` (or right after `scion resume <agent>` on a `stopped` pod). Start `{reviewer_slug}` on stand-by (`"{lead} -> {reviewer_slug}: read /scion-volumes/knowledge-plane/INDEX.md and stand by for writer handoffs"`) with no extra message before a writer pushes `origin/factory/issue-<N>`.
+- Never inline a brief body in the prompt or message: shell metacharacters and long prompts break.
 - For writers, name branch `factory/issue-<N>`, the deliverables (exact paths), the acceptance checks, and the direct
   handoff termination line ("Push `origin/factory/issue-<N>` and message `{reviewer_slug}` directly without waking `{lead}`").
   For reviewers and `evaluator`, name `{REPORTS_DIR}/<N>-review.md` (or `<N>-eval.md`) and report to `{lead}` on `PASS` or second `FAIL`.
@@ -1826,8 +1826,8 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
                else "as your Primary Responsibility says")
         if role == lead_role:
             steps = [
-                "If woken solely by a bare system `state-change` (`COMPLETED`) notification with no `DELTA:` payload "
-                "and no actionable peer message, run **zero** shell commands and exit immediately.",
+                "If woken solely by a bare system `state-change` (`COMPLETED`) notification or an initial stand-by prompt (`stand by`) with no `DELTA:` payload "
+                "and no actionable peer message, read `/scion-volumes/knowledge-plane/INDEX.md` once (on stand-by only) and exit immediately via `sciontool status task_completed \"standing by\"` without polling GitHub or starting specialists.",
                 f"Read `/scion-volumes/scratchpad/STATE.json`, {kp_ref}, and the incoming `DELTA:` or peer message "
                 f"(reconcile against {intake} or `--label status:po-decision --label {_factory_label(spec)}` when needed).",
                 "Size active issues, write briefs to `/scion-volumes/scratchpad/briefs/<N>-<agent>.md`, update "

@@ -777,3 +777,80 @@ def test_delta_handles_concurrent_409_start_in_progress_and_skips_restart_when_a
     )
     assert res["woke_lead"] is False
     assert res["action"] == "start_in_progress"
+
+
+def test_delta_ignores_go_zero_timestamps_and_suppresses_label_echo_when_specialists_between_turns(delta_hub):
+    assert factory_delta._parse_epoch("0001-01-01T00:00:00Z") is None
+    assert factory_delta._parse_epoch(0) is None
+
+    store = FakeDeltaStore()
+    import datetime
+
+    t0 = datetime.datetime(2026, 11, 12, 0, 35, 0, tzinfo=datetime.timezone.utc).timestamp()
+    delta_hub.agents["uuid-bc"] = {
+        "lead": {
+            "id": "id-lead",
+            "slug": "lead",
+            "name": "lead",
+            "template": "lead",
+            "phase": "stopped",
+            "lastActivityEvent": "0001-01-01T00:00:00Z",
+        }
+    }
+    client = hub_client.HubClient(base_url=delta_hub.url, token="tok-owner")
+
+    issues_ready = [
+        {"number": 366, "title": "Auth", "labels": [{"name": "status:ready"}], "comments": 0},
+        {"number": 368, "title": "Config", "labels": [{"name": "status:ready"}], "comments": 0},
+    ]
+    r1 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0, github_fetcher=lambda *_: (issues_ready, {})
+    )
+    assert r1["woke_lead"] is True
+    # Starting a `stopped` lead does NOT pass forceResume=True
+    start_reqs = [r for r in delta_hub.requests if r["method"] == "POST" and r["path"].endswith("/start")]
+    assert start_reqs and start_reqs[-1]["body"] == {}
+
+    # Freshly spawned backend has Go zero lastActivityEvent ("0001-01-01T00:00:00Z") and real created timestamp:
+    # must NOT be flagged as ABNORMAL_CHILDREN, and status:in-review label transition while idle (<120s) is suppressed!
+    delta_hub.agents["uuid-bc"]["lead"]["activity"] = "idle"
+    delta_hub.agents["uuid-bc"]["lead"]["lastActivityEvent"] = "2026-11-12T00:35:30Z"
+    delta_hub.agents["uuid-bc"]["backend"] = {
+        "id": "id-be",
+        "slug": "backend",
+        "name": "backend",
+        "template": "backend",
+        "phase": "running",
+        "activity": "idle",
+        "lastActivityEvent": "0001-01-01T00:00:00Z",
+        "created": "2026-11-12T00:35:40Z",
+    }
+    delta_hub.agents["uuid-bc"]["frontend"] = {
+        "id": "id-fe",
+        "slug": "frontend",
+        "name": "frontend",
+        "template": "frontend",
+        "phase": "stopped",
+        "created": "2026-11-12T00:35:20Z",
+    }
+    issues_in_review = [
+        {"number": 368, "title": "Config", "labels": [{"name": "status:in-review"}], "comments": 2},
+    ]
+    r2 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 60, github_fetcher=lambda *_: (issues_in_review, {})
+    )
+    assert r2["woke_lead"] is False
+    assert r2["action"] == "suppressed_in_flight_echo"
+    assert r2["abnormal_children_count"] == 0
+
+    # If a genuinely new issue (#370) arrives while frontend is stopped (but not stalled), STALLED_WIP is NOT appended
+    issues_with_new = [
+        {"number": 368, "title": "Config", "labels": [{"name": "status:in-review"}], "comments": 2},
+        {"number": 370, "title": "New slice", "labels": [{"name": "status:ready"}], "comments": 0},
+    ]
+    r3 = factory_delta.run_delta_tick(
+        client, store, project_slug="bananacast", lead_slug="lead", apply=True, now=t0 + 90, github_fetcher=lambda *_: (issues_with_new, {})
+    )
+    assert r3["woke_lead"] is True
+    assert "STALLED_WIP" not in delta_hub.messages[-1]["body"]["message"]
+

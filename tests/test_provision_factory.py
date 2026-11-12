@@ -500,9 +500,10 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     )
     assert last_env_put < first_agent_post
 
-    # 3. Delta mode skips Scion LLM schedule creation completely
+    # 3. Delta mode skips Scion LLM schedule creation completely, and starts lead + tmux BEFORE installing K8s CronJobs
     assert fake_hub.schedules.get(build_pid, []) == []
     assert not any(r["method"] == "POST" and r["path"].endswith("/schedules") for r in fake_hub.requests)
+    assert fake_hub.exec_commands.get((build_pid, "lead")) == [["tmux", "has-session", "-t", "scion"]]
 
     # 4. Control plane enables scion-factory-delta CronJob + GitHub auth Secret with exact flags
     klog_text = (tmp_path / "kubectl.log").read_text()

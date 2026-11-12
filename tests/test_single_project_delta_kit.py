@@ -315,6 +315,8 @@ def test_compiled_delta_kit_uses_issue_branches_direct_reviewer_handoff_agent_co
     assert "<!-- scion-agent:" in lead_prompt
     assert "before" in lead_prompt.lower() and "status:po-decision" in lead_prompt
     assert "state-change" in lead_prompt and "COMPLETED" in lead_prompt
+    assert "Single-turn launch" in lead_prompt
+    assert "stand-by prompt" in lead_prompt
 
     # 5. Knowledge-plane shared-dir path first + conditional kp-check.py on K8s/delta
     for text in (shared_agents, lead_prompt, backend_prompt, reviewer_prompt, evaluator_prompt):

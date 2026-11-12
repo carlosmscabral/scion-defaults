@@ -57,7 +57,8 @@ def _parse_epoch(value: Any) -> float | None:
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        num = float(value)
+        return num if num > 0 else None
     text = str(value).strip()
     m = re.match(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d+))?", text)
     if not m:
@@ -67,7 +68,10 @@ def _parse_epoch(value: Any) -> float | None:
         "%Y-%m-%dT%H:%M:%S",
     ).replace(tzinfo=datetime.timezone.utc)
     frac = float(f"0.{m.group(3)}") if m.group(3) else 0.0
-    return dt.timestamp() + frac
+    ts = dt.timestamp() + frac
+    # Go zero time.Time serializes as "0001-01-01T00:00:00Z" (negative epoch), which otherwise makes
+    # freshly started specialists look silent for >2,000 years before their first activity event.
+    return ts if ts > 0 else None
 
 
 def classify_github_issues(
@@ -555,17 +559,31 @@ def run_delta_tick(
     cur_actionable_nums = sorted({int(iss.get("number", 0)) for iss in actionable if int(iss.get("number", 0)) > 0})
     prev_dispatched = {int(x) for x in (state.get("dispatched_issues") or []) if int(x) > 0}
 
+    # Detect specialist pod eviction / SIGTERM stop leaving open issues stranded with zero busy workers.
+    last_progress_ts = max(float(state.get("last_wake_ts") or 0.0), latest_activity_ts)
+    stalled_wip = bool(
+        actionable
+        and not po_replies
+        and not abnormal_children
+        and not lead_busy
+        and not busy_children
+        and stopped_children
+        and stalled_wip_sec > 0
+        and (now_ts - last_progress_ts) >= stalled_wip_sec
+        and (now_ts - float(state.get("stalled_wip_ts") or 0.0)) >= max(stalled_wip_sec, 300)
+    )
+
     # Suppress self-inflicted mid-wave echo wakes when lead/specialists move already-dispatched issues
-    # between status:ready -> status:in-progress -> status:verified while pods are actively working.
+    # between status:ready -> status:in-progress -> status:in-review -> status:verified, unless WIP is stalled.
     in_flight_echo = bool(
         has_actionable_work
         and fingerprint != state["last_fingerprint"]
         and not po_replies
         and not abnormal_children
+        and not stalled_wip
         and prev_dispatched
         and cur_actionable_nums
         and set(cur_actionable_nums).issubset(prev_dispatched)
-        and (lead_busy or busy_children)
     )
     if in_flight_echo:
         if apply:
@@ -586,20 +604,6 @@ def run_delta_tick(
             "waiting_po_count": len(classified["waiting_po"]),
             "abnormal_children_count": len(abnormal_children),
         }
-
-    # Detect specialist pod eviction / SIGTERM stop leaving open issues stranded with zero busy workers.
-    last_progress_ts = max(float(state.get("last_wake_ts") or 0.0), latest_activity_ts)
-    stalled_wip = bool(
-        actionable
-        and not po_replies
-        and not abnormal_children
-        and not lead_busy
-        and not busy_children
-        and stopped_children
-        and stalled_wip_sec > 0
-        and (now_ts - last_progress_ts) >= stalled_wip_sec
-        and (now_ts - float(state.get("stalled_wip_ts") or 0.0)) >= max(stalled_wip_sec, 300)
-    )
 
     # 1. Actionable work exists and fingerprint changed (or WIP stalled after specialist stop) -> wake lead
     if has_actionable_work and (fingerprint != state["last_fingerprint"] or stalled_wip):
@@ -647,7 +651,7 @@ def run_delta_tick(
                         pid,
                         resolved_lead,
                         create_body=create_body,
-                        force_resume=True,
+                        force_resume=(lead_phase in ("error", "halted")),
                     )
                 except HubAPIError as err:
                     # Provisioning or a concurrent start may already be launching lead (HTTP 409 start_in_progress);
@@ -685,7 +689,7 @@ def run_delta_tick(
                     "abnormal_children_count": len(abnormal_children),
                 }
 
-            stalled_stopped = stopped_children if (stalled_wip or (stopped_children and not busy_children and not lead_busy and prev_dispatched)) else None
+            stalled_stopped = stopped_children if stalled_wip else None
             msg = _format_delta_message(
                 classified,
                 abnormal_children,

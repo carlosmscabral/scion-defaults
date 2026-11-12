@@ -1512,3 +1512,138 @@ def test_setup_gke_hub_seeds_cloud_telemetry_into_hub_settings_template_idempote
     assert rendered.count("\ntelemetry:\n") == 1
     assert "provider: gcp" in rendered
     assert "gcp_project_id: ${project_id}" in rendered
+
+
+def test_setup_gke_hub_patches_iam_sleep_suppresses_scion_base_warning_and_retries_iap_403(fake_hub, tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    hub_tf_main = scion_repo / "deploy" / "terraform" / "modules" / "hub-cloudrun" / "main.tf"
+    hub_tf_main.parent.mkdir(parents=True, exist_ok=True)
+    hub_tf_main.write_text('resource "time_sleep" "iam_propagation" {\n  create_duration = "120s"\n}\n')
+
+    build_script = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_script.write_text(
+        '#!/usr/bin/env bash\n'
+        'needs_scion_base="false"\n'
+        'built_scion_base="false"\n'
+        'if [[ "$*" == *"--target scion-antigravity"* ]]; then needs_scion_base="true"; fi\n'
+        'if [[ "${needs_scion_base}" != "true" || "${built_scion_base}" == "true" ]]; then\n'
+        '  echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+        '  exit 0\n'
+        'fi\n'
+        'echo "Warning: this build does not (re)build scion-base." >&2\n'
+        'echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+    )
+    build_script.chmod(0o755)
+
+    # First 2 hub-scope PUT attempts simulate Direct IAP 403 propagation delay, then succeed!
+    iap_attempts = {"count": 0}
+    orig_deny = getattr(fake_hub, "deny_hub_scope_env", False)
+
+    import http.server
+    import threading
+
+    state = {"put_calls": 0, "env": {}, "server_config": {}}
+
+    class RetryHubHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            state["put_calls"] += 1
+            if state["put_calls"] <= 2:
+                self.send_response(403)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Access denied while IAP propagates")
+                return
+            import json as _json
+            body = _json.loads(raw.decode("utf-8"))
+            if self.path.startswith("/api/v1/env/"):
+                state["env"][self.path.rsplit("/", 1)[-1]] = body
+            elif self.path == "/api/v1/admin/server-config":
+                state["server_config"] = body
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RetryHubHandler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    retry_url = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        'case "$*" in\n'
+        '  *"builds get-default-service-account"*) echo "projects/demo/serviceAccounts/123-compute@developer.gserviceaccount.com" ;;\n'
+        '  *"builds submit"*) echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]." ;;\n'
+        '  *"builds describe"*) echo "SUCCESS" ;;\n'
+        '  *"run services describe"*) echo "https://tfha-e2e.example.run.app" ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+    (fake_bin / "terraform").write_text(
+        '#!/usr/bin/env bash\n'
+        'if [[ "$*" == *"output -raw"* ]]; then echo "https://tfha-e2e.example.run.app"; fi\n'
+        'exit 0\n'
+    )
+    (fake_bin / "terraform").chmod(0o755)
+    (fake_bin / "kubectl").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (fake_bin / "kubectl").chmod(0o755)
+
+    try:
+        res = subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/setup-gke-hub.sh"),
+                "--tier",
+                "terraform-ha",
+                "--hub-mode",
+                "cloudrun",
+                "--scion-repo",
+                str(scion_repo),
+                "--work-dir",
+                str(tmp_path / "work-retry"),
+                "--image-tag",
+                "v20261112",
+                "--harnesses",
+                "antigravity",
+                "--approve-apply",
+            ],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DRY_RUN": "0",
+                "BUILD_POLL_SEC": "0.01",
+                "HUB_ENV_RETRY_SEC": "0.01",
+                "HUB_PROJECT": "demo-hub-proj",
+                "HUB_REGION": "us-east1",
+                "HUB_ZONE": "us-east1-b",
+                "HUB_NAME": "tfha-e2e",
+                "PO_EMAIL": "admin@example.com",
+                "IAP_OAUTH_CLIENT_ID": "369001918367-test.apps.googleusercontent.com",
+                "HUB_API_BASE_URL": retry_url,
+                "SCION_HUB_TOKEN": "tok-admin",
+            },
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        srv.shutdown()
+        fake_hub.deny_hub_scope_env = orig_deny
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert 'create_duration = "180s"' in hub_tf_main.read_text()
+    assert "does not (re)build scion-base" not in (res.stdout + res.stderr)
+    assert "Traceback" not in res.stderr
+    assert "Warning:" not in (res.stdout + res.stderr)
+    assert state["put_calls"] >= 6
+    assert state["env"]["GOOGLE_CLOUD_PROJECT"]["value"] == "demo-hub-proj"
+    assert state["server_config"]["telemetry"]["cloud"]["gcp_project_id"] == "demo-hub-proj"
+
