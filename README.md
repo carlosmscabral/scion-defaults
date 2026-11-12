@@ -10,7 +10,7 @@ A compiled factory kit includes:
 - A serverless Firestore control plane for agent status, evaluation runs, and watchdog state.
 - A seeded multi-wave issue backlog. Git is optional; you can start without Git and enable it later.
 
-Every default and interview question traces to production runs documented in [`docs/lessons-learned.md`](docs/lessons-learned.md) (lessons L1–L33). Those runs include a 10-agent hybrid search factory, a 14-agent airline-operations factory, a Kubernetes monorepo factory, and a 30-issue overnight run. This document follows the Google Developer Documentation Style Guide and the **ASD-STE100** Simplified Technical English standard.
+Every default and interview question traces to production runs documented in [`docs/lessons-learned.md`](docs/lessons-learned.md) (lessons L1 to L34). Those runs include a 10-agent hybrid search factory, a 14-agent airline-operations factory, a Kubernetes monorepo factory, and a 30-issue overnight run. This document follows the Google Developer Documentation Style Guide and the **ASD-STE100** Simplified Technical English standard.
 
 > [!IMPORTANT]
 > Always run this toolkit through an agentic coding assistant. The CLI scripts do not interview you or make architecture decisions. Your coding agent conducts the interview, while the scripts inspect, validate, compile, and provision deterministically.
@@ -34,10 +34,10 @@ The workflow separates judgment tasks from repeatable automation. Your coding ag
 
 | Component | Purpose | Type |
 |---|---|---|
-| [`skills/scion-factory-bootstrap/SKILL.md`](skills/scion-factory-bootstrap/SKILL.md) | Guides your coding agent to inspect your repository, ask one topic at a time, and challenge vague answers using lessons L1–L33. | Agentic skill |
-| [`scripts/scion-factory`](scripts/scion_factory.py) | Detects repository facts, writes a draft `factory.yaml`, checks readiness, adds specialist roles (`add-role`), compiles the kit, enables Git (`enable-git`), and runs `provision`. It makes zero LLM calls and never blocks on interactive input. | Deterministic CLI |
+| [`skills/scion-factory-bootstrap/SKILL.md`](skills/scion-factory-bootstrap/SKILL.md) | Guides your coding agent to inspect your repository, ask one topic at a time, and challenge vague answers using lessons L1 to L34. | Agentic skill |
+| [`scripts/scion-factory`](scripts/scion_factory.py) | Detects repository facts, writes a draft `factory.yaml`, checks readiness, adds specialist roles (`add-role`), compiles the kit, enables Git (`enable-git`), and runs `provision`, `gke-up`, and `gke-down`. It makes zero LLM calls and never blocks on interactive input. | Deterministic CLI |
 | [`scripts/provision_factory.py`](scripts/provision_factory.py) and [`scripts/hub_client.py`](scripts/hub_client.py) | Provision projects, Workload Identity, shared directories, templates, schedules, and leads over the Hub HTTPS API. Supports IAP OIDC and local SQLite fallback. | Transport-agnostic control |
-| [`scripts/setup-gke-hub.sh`](scripts/setup-gke-hub.sh) and [`scripts/install-k8s-control-plane.py`](scripts/install-k8s-control-plane.py) | Bootstrap a GKE-backed Scion Hub and install Kubernetes `CronJob` loops for Firestore sync and self-healing watchdog checks. | Infrastructure automation |
+| [`scripts/setup-gke-hub.sh`](scripts/setup-gke-hub.sh), [`scripts/install-k8s-control-plane.py`](scripts/install-k8s-control-plane.py), and [`scripts/factory_delta.py`](scripts/factory_delta.py) | Bootstrap a GKE-backed Scion Hub and install Kubernetes `CronJob` loops for Firestore sync, self-healing watchdog checks, and zero-LLM delta wakes. | Infrastructure automation |
 | Generated factory kit | A multi-agent build and evaluation system that runs on GKE pods or Docker containers. | Multi-agent system |
 
 ```mermaid
@@ -137,6 +137,8 @@ Review the planned actions across preflight, sandbox IAM, repository seeding, Hu
   --apply \
   --go
 ```
+
+For a new ephemeral GKE Hub, run `./scripts/scion-factory gke-up` and tear it down with `./scripts/scion-factory gke-down`. See [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) and [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) for single-project delta mode (`scripts/factory_delta.py`) and measured GKE benchmarks.
 
 ## Set up a factory end to end
 
@@ -517,7 +519,7 @@ Your coding agent asks about seven areas, one topic at a time, and rejects vague
 | Topic | Decisions you make | Production lesson |
 |---|---|---|
 | Mission and boundaries | Product mission, at least two explicit non-goals, Git mode, repository URL, and build/evaluation branch names. | Missing non-goals cause scope creep or repeated PO escalations (L4, L25). |
-| Deploy target and runtime | Cloud Run `service` vs. `deploy: none` (library, CLI, package), plus `infrastructure.runtime` (`kubernetes` on GKE or `docker` on VM), `runtime_profile`, and `worker_sa_name`. | `deploy: none` skips deployer accounts and grades code and contracts directly; GKE pods default to `block` identity unless Workload Identity is mapped (L29, L32, L33). |
+| Deploy target and runtime | Cloud Run `service` vs. `deploy: none` (library, CLI, package), plus `infrastructure.runtime` (`kubernetes` on GKE or `docker` on VM), `runtime_profile`, and `worker_sa_name`. | `deploy: none` skips deployer accounts and grades code and contracts directly; GKE pods default to `block` identity unless Workload Identity is mapped (L29, L32, L33, L34). |
 | Build, data, and IAM | Exact build, test, and lint commands, serverless data stores, and required IAM roles for deployer and runtime service accounts. | A missing IAM role blocked Wave 1 mid-sprint in production (L5). |
 | Team and specialists | Build and evaluation rosters, default specialists (`researcher`, `doc-writer`, `investigator`), discovered domain specialists, and dropped defaults with reasons. Also sets `autonomy` (`standard`, `supervised`, `autonomous`), harness/model per role, heartbeat mode, WIP limit, and budget. | Explicit specialist roles and autonomy boundaries prevent bottlenecks, while cheap idle heartbeats protect token budgets (L6, L9, L22, L29). |
 | Evaluation pyramid | Health endpoint, L2 API contract invariants, numeric L3 domain quality metric and threshold, safety invariants, and p50/p95/p99 latency targets. | Without a numeric oracle, evaluation agents cannot grade waves or file regressions (L15, L25). |
@@ -688,29 +690,32 @@ flowchart TB
 
 ### Reference presets
 
-Inspect [`presets/`](presets/) for three complete `FactorySpec` examples:
+Inspect [`presets/`](presets/) for four complete `FactorySpec` examples:
 
 - [`starter-service.factory.yaml`](presets/starter-service.factory.yaml): Double-entry ledger API demonstrating a non-search service factory.
 - [`psearch.factory.yaml`](presets/psearch.factory.yaml): 10-agent hybrid search software factory.
 - [`acme-airlines.factory.yaml`](presets/acme-airlines.factory.yaml): 14-agent airline-operations software factory with dedicated sensor roles.
+- [`bananacast-gke.factory.yaml`](presets/bananacast-gke.factory.yaml): Single-project GKE delta factory with Antigravity agents on Gemini 4 Argon.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | [`skills/scion-factory-bootstrap/`](skills/scion-factory-bootstrap/SKILL.md) | Portable agent skill driving Hub bootstrap, repository inspection, Socratic interview, compilation, and provisioning. |
-| [`scripts/scion_factory.py`](scripts/scion_factory.py) | Deterministic factory CLI (`inspect`, `grill`, `check`, `add-role`, `compile`, `enable-git`, `provision`). |
+| [`scripts/scion_factory.py`](scripts/scion_factory.py) | Deterministic factory CLI (`inspect`, `grill`, `check`, `add-role`, `compile`, `enable-git`, `provision`, `gke-up`, `gke-down`). |
+| [`scripts/gke_lifecycle.py`](scripts/gke_lifecycle.py) and [`scripts/factory_delta.py`](scripts/factory_delta.py) | Ephemeral GKE Hub lifecycle (`gke-up` / `gke-down`) and zero-LLM GitHub delta orchestrator (`scion-factory-delta`). |
 | [`scripts/provision_factory.py`](scripts/provision_factory.py) | Nine-phase idempotent provisioner for GKE and Single-VM Scion factories. |
 | [`scripts/hub_client.py`](scripts/hub_client.py) | Stdlib-only Scion Hub HTTPS client with IAP/Serverless OIDC, cold-Autopilot `503` polling, and local SQLite fallback. |
 | [`scripts/setup-gke-hub.sh`](scripts/setup-gke-hub.sh) | Idempotent bootstrapper for Full GKE Multi-Hub HA (`deploy/terraform/`) and Hybrid GKE (`gke_target`) Hubs. |
-| [`scripts/install-k8s-control-plane.py`](scripts/install-k8s-control-plane.py) | Kubernetes manifest renderer and installer for `scion-factory-sync` and `scion-factory-watchdog` `CronJob`s. |
+| [`scripts/install-k8s-control-plane.py`](scripts/install-k8s-control-plane.py) | Kubernetes manifest renderer and installer for `scion-factory-sync`, `scion-factory-watchdog`, and `scion-factory-delta` `CronJob`s. |
 | [`scripts/knowledge_plane.py`](scripts/knowledge_plane.py) | Repository doc detector, knowledge-plane compiler, and `kp-check.py` link/ID validator. |
-| [`scripts/`](scripts/README.md) | Admin CLI (`scion-admin.py`), template pusher, preflight, sandbox IAM, telemetry, watchdog, Firestore store, backups, and alerts. |
+| [`scripts/`](scripts/README.md) | Admin CLI (`scion-admin.py`), hillclimb runner (`run_hillclimb_wave.py`), template pusher, preflight, sandbox IAM, telemetry, watchdog, Firestore store, backups, and alerts. |
 | [`config/`](config/) | `factory.schema.json`, `factory.env.example`, `factory-cd.sh` monorepo launcher, Hub settings, model catalog, and Firestore rules/indexes. |
 | [`templates/`](templates/README.md) | Shared coordination protocol (`_shared/agents.md`) and 10 reference role templates. |
-| [`presets/`](presets/) | Reference `FactorySpec` presets (`starter-service`, `psearch`, `acme-airlines`). |
-| [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) | Operator and agent runbook for Full GKE HA, Hybrid GKE, Workload Identity, Artifact Registry images, and K8s `CronJob`s. |
-| [`docs/`](docs/) | Architecture (`architecture.md`), VM setup (`setup-runbook.md`), operations (`operations-runbook.md`), agent protocol, evaluation pyramid, grill playbook (`grill-me-playbook.md`), specs (`specs/`), plans (`plans/`), and lessons L1–L33 (`lessons-learned.md`). |
+| [`presets/`](presets/) | Reference `FactorySpec` presets (`starter-service`, `psearch`, `acme-airlines`, `bananacast-gke`). |
+| [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) | Operator and agent runbook for Full GKE HA, Hybrid GKE, `gke-up` / `gke-down`, Workload Identity, and K8s `CronJob`s. |
+| [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) | Three-run GKE hillclimb scorecard, token and latency progression, and resilience drill evidence. |
+| [`docs/`](docs/) | Architecture (`architecture.md`), VM setup (`setup-runbook.md`), operations (`operations-runbook.md`), agent protocol, evaluation pyramid, grill playbook (`grill-me-playbook.md`), specs (`specs/`), plans (`plans/`), and lessons L1 to L34 (`lessons-learned.md`). |
 | [`docs/telemetry/`](docs/telemetry/README.md) | ASD-STE100 guides for Cloud Trace waterfalls, Cloud Monitoring counters, and the evaluation pipeline. |
 | [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) | Go patch for three-level stacked Cloud Trace waterfalls and cumulative metric epochs. |
 
@@ -729,8 +734,9 @@ Never commit secrets, PATs, real email addresses, GCP project IDs, cluster names
 ## Next steps
 
 - Follow [`docs/gke-setup-runbook.md`](docs/gke-setup-runbook.md) to deploy a Full GKE HA or Hybrid GKE Scion Hub.
+- Read [`docs/gke-hillclimb-report.md`](docs/gke-hillclimb-report.md) for the three-run GKE hillclimb scorecard and resilience drill results.
 - Read [`docs/grill-me-playbook.md`](docs/grill-me-playbook.md) to prepare testable answers for the bootstrap interview.
-- Read [`docs/lessons-learned.md`](docs/lessons-learned.md) (L1–L33) to inspect the production root causes behind every guardrail.
+- Read [`docs/lessons-learned.md`](docs/lessons-learned.md) (L1 to L34) to inspect the production root causes behind every guardrail.
 - Follow [`docs/setup-runbook.md`](docs/setup-runbook.md) for Single-VM setups, separate sandbox projects, backups, alerts, and billing budgets.
 - Use [`docs/operations-runbook.md`](docs/operations-runbook.md) for day-2 factory operations, wave releases, and incident recovery.
 - Follow [`docs/telemetry/README.md`](docs/telemetry/README.md) to reproduce stacked Cloud Trace waterfalls and Firestore dashboards.

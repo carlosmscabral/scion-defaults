@@ -1,4 +1,4 @@
-# `scion-defaults` — Canonical Agent & Operator Guidelines
+# `scion-defaults` - Canonical Agent & Operator Guidelines
 
 This repository (`duboc/scion-defaults`) is the canonical blueprint, automation toolkit, and template catalog for deploying and operating an **always-on, self-healing multi-agent software factory on [Scion](https://github.com/GoogleCloudPlatform/scion)**.
 
@@ -6,15 +6,15 @@ This repository (`duboc/scion-defaults`) is the canonical blueprint, automation 
 
 | Path | Purpose |
 |---|---|
-| [`README.md`](README.md) | Overview, architecture, what we built, and 12-step replication quickstart |
+| [`README.md`](README.md) | Overview, architecture, starting prompts, GKE and Single-VM setup, and replication reference |
 | [`config/`](config/) | Parameterized environment (`factory.env.example`), the monorepo start-folder launcher (`harness/home/.local/bin/factory-cd.sh`), Hub `settings.yaml`, OpenCode Vertex AI model catalog (`opencode-models.json`), heartbeat prompt, and the Firestore control-plane contract, indexes, and rules (`firestore/`) |
-| [`scripts/`](scripts/README.md) | Idempotent provisioning, admin API client (`scion-admin.py`), template rendering/pushing, telemetry setup, harness patching, 1-minute Firestore status sync (`sync-factory-agents.py` + `factory_store.py`), 5-minute self-healing watchdog, backups, and alerting |
+| [`scripts/`](scripts/README.md) | Idempotent provisioning (`provision_factory.py`), GKE full-lifecycle CLI (`gke_lifecycle.py` for `gke-up` / `gke-down`), zero-LLM event-driven delta orchestrator (`factory_delta.py`), hillclimb runner (`run_hillclimb_wave.py`), admin API client (`scion-admin.py`), template rendering/pushing, telemetry setup, harness patching, 1-minute Firestore status sync (`sync-factory-agents.py` + `factory_store.py`), 5-minute self-healing watchdog, backups, and alerting |
 | [`templates/`](templates/README.md) | Shared multi-agent coordination protocol (`_shared/agents.md`) + 10 role templates (`lead`, `backend`, `frontend`, `reviewer`, `deployer`, `eval-lead`, `factory-analyst`, `search-evaluator`, `ui-craftsman`, `eval-deployer`) |
-| [`docs/`](docs/) | Architecture (`architecture.md`), setup runbook (`setup-runbook.md`), GKE setup runbook (`gke-setup-runbook.md`), operations runbook (`operations-runbook.md`), agent protocol (`agent-protocol.md`), 5-layer evaluation pyramid (`verification-and-eval.md`), 33 lessons learned (`lessons-learned.md`), and v2 orchestration spec (`specs/`) |
+| [`docs/`](docs/) | Architecture (`architecture.md`), setup runbook (`setup-runbook.md`), GKE setup runbook (`gke-setup-runbook.md`), GKE 3-run hillclimb report (`gke-hillclimb-report.md`), operations runbook (`operations-runbook.md`), agent protocol (`agent-protocol.md`), 5-layer evaluation pyramid (`verification-and-eval.md`), 34 lessons learned (`lessons-learned.md`), and v2 orchestration spec (`specs/`) |
 | [`docs/telemetry/`](docs/telemetry/README.md) | ASD-STE100 documentation for reproducing telemetry, the evaluation data pipeline, and harness hooks / stacked Cloud Trace waterfalls |
 | [`docs/grill-me-playbook.md`](docs/grill-me-playbook.md) | 5-pillar Socratic "Grill-Me" inquiry and domain-agnostic boilerplate compiler guide |
-| [`skills/scion-factory-bootstrap/SKILL.md`](skills/scion-factory-bootstrap/SKILL.md) | Portable Agent Skill to interview users, challenge vague specs using L1–L33, and compile new Scion factories |
-| [`presets/`](presets/) | Reference `FactorySpec` presets (`starter-service.factory.yaml`, `psearch.factory.yaml`, `acme-airlines.factory.yaml`) |
+| [`skills/scion-factory-bootstrap/SKILL.md`](skills/scion-factory-bootstrap/SKILL.md) | Portable Agent Skill to interview users, challenge vague specs using L1 to L34, and compile new Scion factories |
+| [`presets/`](presets/) | Reference `FactorySpec` presets (`starter-service.factory.yaml`, `psearch.factory.yaml`, `acme-airlines.factory.yaml`, `bananacast-gke.factory.yaml`) |
 | [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) | Source patch (`sciontool-stacked-traces.patch`) and `tracestate.go` for 3-level stacked Cloud Trace waterfalls and Cloud Monitoring `CUMULATIVE` epoch export |
 
 ## Security & Hygiene Rules (Mandatory)
