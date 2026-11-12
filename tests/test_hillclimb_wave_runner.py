@@ -484,7 +484,7 @@ def test_run_hillclimb_wave_dry_run_and_mocked_lifecycle_preserves_main_and_runs
                             return subprocess.CompletedProcess(
                                 cmd,
                                 0,
-                                stdout="/home/scion/.gemini/jetski/brain/conv-po/.system_generated/logs/transcript_full.jsonl\n",
+                                stdout="/home/scion/.gemini/antigravity-cli/brain/conv-po/.system_generated/logs/transcript_full.jsonl\n",
                                 stderr="",
                             )
                         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")

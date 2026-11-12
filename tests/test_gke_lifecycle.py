@@ -158,8 +158,8 @@ def test_extract_pod_and_transcript_metrics_counts_errors_and_tokens_accurately(
     backup_dir = tmp_path / "scion-gke-hc1-a1b2c3-20261110T210000Z"
     lead_pod = backup_dir / "pods" / "lead"
     backend_pod = backup_dir / "pods" / "backend"
-    lead_logs = lead_pod / ".gemini" / "jetski" / "brain" / "conv-1" / ".system_generated" / "logs"
-    backend_logs = backend_pod / ".gemini" / "jetski" / "brain" / "conv-2" / ".system_generated" / "logs"
+    lead_logs = lead_pod / ".gemini" / "antigravity-cli" / "brain" / "conv-1" / ".system_generated" / "logs"
+    backend_logs = backend_pod / ".gemini" / "antigravity-cli" / "brain" / "conv-2" / ".system_generated" / "logs"
     lead_logs.mkdir(parents=True)
     backend_logs.mkdir(parents=True)
 
@@ -567,7 +567,7 @@ def test_gke_lifecycle_keys_pods_by_pod_name_dedups_mirrors_and_recovers_scratch
                     return subprocess.CompletedProcess(
                         cmd,
                         0,
-                        stdout=f"/home/scion/.gemini/jetski/brain/conv-gen-{pod_generation[0]}/.system_generated/logs/transcript_full.jsonl\n",
+                        stdout=f"/home/scion/.gemini/antigravity-cli/brain/conv-gen-{pod_generation[0]}/.system_generated/logs/transcript_full.jsonl\n",
                         stderr="",
                     )
                 if "transcript_full.jsonl" in joined:
@@ -592,7 +592,7 @@ def test_gke_lifecycle_keys_pods_by_pod_name_dedups_mirrors_and_recovers_scratch
         / "backend"
         / "pod-mirror-stale"
         / ".gemini"
-        / "jetski"
+        / "antigravity-cli"
         / "brain"
         / "conv-gen-2"
         / ".system_generated"
@@ -608,7 +608,7 @@ def test_gke_lifecycle_keys_pods_by_pod_name_dedups_mirrors_and_recovers_scratch
         / "backend"
         / "scion-backend-2"
         / ".gemini"
-        / "jetski"
+        / "antigravity-cli"
         / "brain"
         / "conv-gen-2"
         / ".system_generated"
@@ -639,11 +639,11 @@ def test_gke_lifecycle_keys_pods_by_pod_name_dedups_mirrors_and_recovers_scratch
             f"2026-11-10T22:00:00Z INFO started with {secret_tok}\n"
             "2026-11-10T22:01:00Z ERROR hub auth_lost during refresh\n"
         ),
-        ".telemetry/lead/scion-lead-0/.gemini/jetski/brain/conv-lead/.system_generated/logs/transcript_full.jsonl": (
+        ".telemetry/lead/scion-lead-0/.gemini/antigravity-cli/brain/conv-lead/.system_generated/logs/transcript_full.jsonl": (
             '{"type":"USER_INPUT","content":"DELTA: ACTIONABLE: #1"}\n'
             '{"type":"PLANNER_RESPONSE","input_tokens":700,"cache_read_tokens":200,"output_tokens":80,"tool_calls":[{"name":"run_command","args":{"CommandLine":"scion start backend -t backend"}}]}\n'
         ),
-        ".telemetry/reviewer/scion-reviewer-0/.gemini/jetski/brain/conv-rev/.system_generated/logs/transcript_full.jsonl": (
+        ".telemetry/reviewer/scion-reviewer-0/.gemini/antigravity-cli/brain/conv-rev/.system_generated/logs/transcript_full.jsonl": (
             '{"type":"PLANNER_RESPONSE","input_tokens":400,"output_tokens":50}\n'
         ),
     }

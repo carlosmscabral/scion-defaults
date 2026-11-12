@@ -135,7 +135,7 @@ def test_pre_stop_persist_telemetry_hook_and_factory_cd_mirror_logs_and_transcri
     scratch1.mkdir()
     (home1 / ".scion").mkdir(parents=True)
     (home1 / ".scion" / "agent.log").write_text("2026-11-10T22:00:00Z INFO agent started\n")
-    t1 = home1 / ".gemini" / "jetski" / "brain" / "conv-abc" / ".system_generated" / "logs" / "transcript_full.jsonl"
+    t1 = home1 / ".gemini" / "antigravity-cli" / "brain" / "conv-abc" / ".system_generated" / "logs" / "transcript_full.jsonl"
     t1.parent.mkdir(parents=True)
     t1.write_text('{"type":"USER_INPUT","content":"hello"}\n')
 
@@ -155,7 +155,7 @@ def test_pre_stop_persist_telemetry_hook_and_factory_cd_mirror_logs_and_transcri
     mirrored_root1 = scratch1 / ".telemetry" / "backend" / "scion-backend-pod-1"
     assert (mirrored_root1 / "agent.log").read_text() == "2026-11-10T22:00:00Z INFO agent started\n"
     assert (
-        mirrored_root1 / ".gemini" / "jetski" / "brain" / "conv-abc" / ".system_generated" / "logs" / "transcript_full.jsonl"
+        mirrored_root1 / ".gemini" / "antigravity-cli" / "brain" / "conv-abc" / ".system_generated" / "logs" / "transcript_full.jsonl"
     ).read_text() == '{"type":"USER_INPUT","content":"hello"}\n'
 
     # 2. factory-cd.sh periodic + EXIT trap sync when scratchpad exists
@@ -200,7 +200,7 @@ def test_pre_stop_persist_telemetry_hook_and_factory_cd_mirror_logs_and_transcri
     mirrored_root2 = scratch2 / ".telemetry" / "lead" / "scion-lead-pod-0"
     assert (mirrored_root2 / "agent.log").read_text() == "logged before pod deletion\n"
     assert (
-        mirrored_root2 / ".gemini" / "jetski" / "brain" / "conv-xyz" / ".system_generated" / "logs" / "transcript_full.jsonl"
+        mirrored_root2 / ".gemini" / "antigravity-cli" / "brain" / "conv-xyz" / ".system_generated" / "logs" / "transcript_full.jsonl"
     ).read_text() == '{"type":"PLANNER_RESPONSE","output_tokens":42}\n'
 
 import threading
