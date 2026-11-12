@@ -868,7 +868,11 @@ def main(argv: list[str] | None = None) -> int:
         or os.environ.get("FACTORY_PROJECTS", "")
         or os.environ.get("BUILD_PROJECT", "")
     )
-    projects = [p.strip() for p in raw_projects.split(",") if p.strip() and not p.strip().endswith("-eval")]
+    projects = [
+        p.strip()
+        for p in raw_projects.split(",")
+        if p.strip() and p.strip() != "global" and not p.strip().endswith("-eval")
+    ]
     if not projects:
         print("error: set --project-slug or FACTORY_PROJECTS", file=sys.stderr)
         return 1
@@ -888,25 +892,35 @@ def main(argv: list[str] | None = None) -> int:
     store = factory_store.store_from_env(dry_run=not effective_apply)
 
     results = []
+    ok_count = 0
     for idx, slug in enumerate(projects):
         per_project_lead = lead_slug if (len(projects) == 1 or idx == 0) else ""
-        summary = run_delta_tick(
-            client,
-            store,
-            project_slug=slug,
-            lead_slug=per_project_lead,
-            github_repo=github_repo,
-            issue_label=issue_label,
-            github_token=github_token,
-            apply=effective_apply,
-            idle_grace_sec=idle_grace_sec,
-            max_turns_before_rotate=max_turns,
-            child_silence_sec=child_silence_sec,
-            build_branch=build_branch,
-            runtime_profile=runtime_profile,
-        )
-        results.append(summary)
+        try:
+            summary = run_delta_tick(
+                client,
+                store,
+                project_slug=slug,
+                lead_slug=per_project_lead,
+                github_repo=github_repo,
+                issue_label=issue_label,
+                github_token=github_token,
+                apply=effective_apply,
+                idle_grace_sec=idle_grace_sec,
+                max_turns_before_rotate=max_turns,
+                child_silence_sec=child_silence_sec,
+                build_branch=build_branch,
+                runtime_profile=runtime_profile,
+            )
+            ok_count += 1
+            results.append(summary)
+        except HubAPIError as exc:
+            if exc.status == 403 and len(projects) > 1:
+                results.append({"project_slug": slug, "skipped_forbidden": True})
+                continue
+            raise
 
+    if ok_count == 0 and results:
+        return 1
     print(json.dumps({"apply": effective_apply, "results": results}))
     return 0
 

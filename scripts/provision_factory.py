@@ -316,7 +316,11 @@ def provision_factory(
             sub_base_env["SCION_HUB_TOKEN"] = eff_env["HUB_TOKEN"]
 
         # 1. preflight
-        factory_projects = [p.strip() for p in eff_env.get("FACTORY_PROJECTS", "").split(",") if p.strip()]
+        factory_projects = [
+            p.strip()
+            for p in eff_env.get("FACTORY_PROJECTS", "").split(",")
+            if p.strip() and p.strip() != "global"
+        ]
         if eff_env.get("HUB_URL"):
             hub_preflight = _load_hub_preflight()
             report = hub_preflight.build_api_report(
@@ -331,7 +335,8 @@ def provision_factory(
                 k8s_ready=True,
             )
             if report.get("existing_projects"):
-                factory_projects = list(dict.fromkeys(factory_projects + list(report["existing_projects"])))
+                existing_non_global = [p for p in report["existing_projects"] if p and p != "global"]
+                factory_projects = list(dict.fromkeys(factory_projects + existing_non_global))
             phases.append({"phase": "preflight", "ok": True})
         else:
             phases.append({"phase": "preflight", "ok": True, "local": True})
@@ -594,7 +599,7 @@ def provision_factory(
             lead_started = True
 
         # 8. control_plane
-        merged_fp = ",".join(dict.fromkeys([p for p in [*factory_projects, *target_slugs] if p]))
+        merged_fp = ",".join(dict.fromkeys([p for p in [*factory_projects, *target_slugs] if p and p != "global"]))
         if runtime == "kubernetes":
             cmd_cp = [sys.executable, str(ROOT_DIR / "scripts" / "install-k8s-control-plane.py")]
             if eff_env.get("HUB_K8S_NAMESPACE"):

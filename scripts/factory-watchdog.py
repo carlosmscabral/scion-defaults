@@ -934,11 +934,11 @@ def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "k
         alerted = {}
     state["alerted"] = alerted
 
-    projects = client.list_projects()
+    projects = [p for p in client.list_projects() if p.get("slug") != "global"]
     factory_projects = os.environ.get("FACTORY_PROJECTS")
     if factory_projects:
-        factory_projects = [p.strip() for p in factory_projects.split(",") if p.strip()]
-        projects = [p for p in projects if p["slug"] in factory_projects]
+        allowed = [p.strip() for p in factory_projects.split(",") if p.strip() and p.strip() != "global"]
+        projects = [p for p in projects if p["slug"] in allowed]
 
     # Check 2: Schedule Guard
     for p in projects:
@@ -961,7 +961,12 @@ def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "k
         pid = p.get("id") or p["slug"]
         proj_slug = p.get("slug") or pid
         delta_active, lead_sleeping = _project_delta_status(store, proj_slug)
-        agents = client.list_agents(pid)
+        try:
+            agents = client.list_agents(pid)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 403 and len(projects) > 1:
+                continue
+            raise
         for a in agents:
             slug = a.get("slug") or a.get("name")
             if not slug: continue

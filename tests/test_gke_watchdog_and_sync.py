@@ -498,4 +498,38 @@ def test_install_k8s_control_plane_enable_delta_renders_cronjob_and_github_secre
     assert "scion-factory-delta" in stdin_payload
 
 
+def test_sync_watchdog_and_delta_skip_builtin_global_project_without_403(fake_hub, fake_firestore, monkeypatch):
+    fake_hub.projects_by_slug = {
+        "global": {"id": "uuid-global", "slug": "global"},
+        "demo": {"id": "uuid-demo", "slug": "demo"},
+    }
+    fake_hub.agents_by_project = {
+        "uuid-demo": [{"id": "ag-1", "slug": "lead", "phase": "running", "activity": "idle", "harnessConfig": "antigravity-factory"}]
+    }
+    res_sync = subprocess.run(
+        [sys.executable, "scripts/sync-factory-agents.py", "--dry-run"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "SCION_HOME": "/nonexistent-scion-home",
+            "HUB_URL": fake_hub.url,
+            "SCION_HUB_TOKEN": "tok-admin",
+            "FACTORY_PROJECTS": "global,demo",
+            "FIRESTORE_PROJECT": "sandbox-proj",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert res_sync.returncode == 0, res_sync.stderr
+    assert "demo__lead" in res_sync.stdout
+    assert not any("uuid-global" in r["path"] or "/global/" in r["path"] for r in fake_hub.requests)
+
+    client = hub_client.HubClient(base_url=fake_hub.url, token="tok-admin")
+    state = factory_store.load_control_state(fake_firestore, "watchdog__default")
+    monkeypatch.setenv("FACTORY_PROJECTS", "global,demo")
+    watchdog_mod.run_api_watchdog(client, state, apply=False, runtime="kubernetes", store=fake_firestore)
+    assert not any("uuid-global" in r["path"] or "/global/" in r["path"] for r in fake_hub.requests)
+
+
+
 

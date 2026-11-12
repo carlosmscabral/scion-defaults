@@ -410,6 +410,9 @@ def _single_project_delta_gke_spec() -> dict:
 
 
 def test_provision_single_project_delta_creates_one_project_no_schedule_and_enables_delta_cronjob(fake_hub, tmp_path):
+    # Simulate Hub built-in `global` project materialized by `PUT /api/v1/env/*` (scope=hub) during setup-gke-hub.sh:
+    # preflight and provision MUST exclude `global` from FACTORY_PROJECTS so CronJobs never 403 on `/projects/global/agents`.
+    fake_hub.projects_by_slug["global"] = {"id": "uuid-global", "slug": "global", "name": "global"}
     spec = _single_project_delta_gke_spec()
     spec_path = tmp_path / "factory.yaml"
     kit_dir = tmp_path / "kit"
@@ -439,8 +442,8 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     out = json.loads(r_apply.stdout)
     assert out["ok"] is True, out
 
-    # 1. Single project ONLY across phases 4-9 (no -eval project, no eval-lead started)
-    assert set(fake_hub.projects_by_slug) == {"bananacast-hc1"}
+    # 1. Single project ONLY across phases 4-9 (no -eval project, no eval-lead started; built-in `global` untouched)
+    assert set(fake_hub.projects_by_slug) - {"global"} == {"bananacast-hc1"}
     build_pid = fake_hub.projects_by_slug["bananacast-hc1"]["id"]
     assert out["factory_projects"] == [build_pid]
     assert fake_hub.agents_by_project[build_pid] == ["lead"]
@@ -515,6 +518,7 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     assert '"name": "BUILD_BRANCH", "value": "factory/gke-hc1"' in klog_text
     assert '"name": "RUNTIME_PROFILE", "value": "remote"' in klog_text
     assert '"name": "FACTORY_PROJECTS", "value": "proj-1,bananacast-hc1"' in klog_text
+    assert '"global,' not in klog_text
     assert "bananacast-hc1-eval" not in klog_text
 
 
