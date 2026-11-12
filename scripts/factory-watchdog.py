@@ -901,7 +901,32 @@ def install_cron():
 # Main entrypoint
 # ---------------------------------------------------------------------------
 
-def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernetes") -> None:
+def _project_delta_status(store, project_slug: str) -> tuple[bool, bool]:
+    if store is None or not project_slug or not hasattr(store, "get_document"):
+        return False, False
+    try:
+        doc = store.get_document("factory_control_state", f"delta__{project_slug}")
+    except Exception:
+        return False, False
+    if not isinstance(doc, dict):
+        return False, False
+    if "lead_sleeping" in doc:
+        return True, bool(doc.get("lead_sleeping"))
+    if isinstance(doc.get("state_json"), str):
+        try:
+            parsed = json.loads(doc["state_json"])
+            if isinstance(parsed, dict):
+                return True, bool(parsed.get("lead_sleeping"))
+        except Exception:
+            pass
+    return True, False
+
+
+def _is_project_lead_sleeping(store, project_slug: str) -> bool:
+    return _project_delta_status(store, project_slug)[1]
+
+
+def run_api_watchdog(client, state: dict, apply: bool = False, runtime: str = "kubernetes", store=None) -> None:
     alerted = state.get("alerted")
     if isinstance(alerted, list):
         alerted = {k: 0 for k in alerted}
@@ -909,11 +934,11 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
         alerted = {}
     state["alerted"] = alerted
 
-    projects = client.list_projects()
+    projects = [p for p in client.list_projects() if p.get("slug") != "global"]
     factory_projects = os.environ.get("FACTORY_PROJECTS")
     if factory_projects:
-        factory_projects = [p.strip() for p in factory_projects.split(",") if p.strip()]
-        projects = [p for p in projects if p["slug"] in factory_projects]
+        allowed = [p.strip() for p in factory_projects.split(",") if p.strip() and p.strip() != "global"]
+        projects = [p for p in projects if p["slug"] in allowed]
 
     # Check 2: Schedule Guard
     for p in projects:
@@ -934,7 +959,14 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
     # Check 3: Agent health + hung subprocess reaping
     for p in projects:
         pid = p.get("id") or p["slug"]
-        agents = client.list_agents(pid)
+        proj_slug = p.get("slug") or pid
+        delta_active, lead_sleeping = _project_delta_status(store, proj_slug)
+        try:
+            agents = client.list_agents(pid)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 403 and len(projects) > 1:
+                continue
+            raise
         for a in agents:
             slug = a.get("slug") or a.get("name")
             if not slug: continue
@@ -950,8 +982,13 @@ def run_api_watchdog(client, state: dict, apply: bool, runtime: str = "kubernete
                                 client.exec_agent(pid, slug, ["kill", "-9", str(h["pid"])], timeout=5)
                 except Exception:
                     pass
-            elif phase in ("error", "stopped"):
-                if phase == "stopped" and not should_wake(slug, a.get("template", "")):
+            elif phase in ("error", "halted", "stopped"):
+                if lead_sleeping:
+                    continue
+                is_lead_role = should_wake(slug, a.get("template", ""))
+                if delta_active and not is_lead_role:
+                    continue
+                if phase == "stopped" and not is_lead_role:
                     continue
                     
                 key = f"{pid}/{slug}"
@@ -1056,7 +1093,7 @@ def main():
             else:
                 state = {"restarts": {}, "alerted": [], "last_user_msg_ts": ""}
                 
-        run_api_watchdog(client, state, apply=args.apply, runtime=os.environ.get("AGENT_RUNTIME", "kubernetes"))
+        run_api_watchdog(client, state, apply=args.apply, runtime=os.environ.get("AGENT_RUNTIME", "kubernetes"), store=store)
         
         if args.apply:
             if backend == "firestore":

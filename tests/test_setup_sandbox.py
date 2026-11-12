@@ -174,3 +174,79 @@ def test_setup_sandbox_kubernetes_mode_creates_worker_sa_and_keeps_docker_deploy
     # K8s Role + RoleBinding allowing Hub SA to list/get serviceaccounts for discoverAssignKSA
     assert 'resources: ["serviceaccounts"]' in calls
     assert "name: scion-prod-hub@hub-proj.iam.gserviceaccount.com" in calls
+
+def test_setup_sandbox_gke_mode_grants_cloud_telemetry_writer_roles(tmp_path):
+    k8s_env = (
+        "AGENT_RUNTIME=kubernetes\nSANDBOX_PROJECT=sandbox\nSANDBOX_REGION=us-central1\n"
+        "HUB_PROJECT=hub-proj\nHUB_REGION=us-east1\nHUB_URL=https://scion-prod-123456.us-east1.run.app\n"
+        "HUB_K8S_NAMESPACE=scion-prod\nHUB_SA=scion-prod-hub\nDATA_BUCKET=sandbox-data\n"
+        "DEPLOYER_SA_NAME=agent-deployer\nRUNTIME_SA_NAME=app-serving\n"
+    )
+    res, calls = _sandbox_with_kubectl(tmp_path, k8s_env, "0")
+    assert res.returncode == 0, res.stdout + res.stderr
+    out = res.stdout + res.stderr
+    for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
+        assert f"--member=serviceAccount:agent-worker@sandbox.iam.gserviceaccount.com --role={role}" in calls
+
+    # When the Hub's pod KSA GSA (<hub_namespace>-agent@<hub_project>) exists, sciontool PID 1 exports
+    # telemetry as that identity before the metadata server starts, so it also gets telemetry writer roles.
+    bindir = tmp_path / "bin-hub-agent"
+    bindir.mkdir()
+    (bindir / "gcloud").write_text(
+        FAKE_GCLOUD.replace(
+            '*"service-accounts describe"*) exit 1 ;;',
+            '*"service-accounts describe scion-prod-agent@hub-proj.iam.gserviceaccount.com"*) exit 0 ;;\n  *"service-accounts describe"*) exit 1 ;;',
+        )
+    )
+    (bindir / "gcloud").chmod(0o755)
+    (bindir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "sleep").chmod(0o755)
+    (bindir / "kubectl").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "kubectl").chmod(0o755)
+    st_ag = tmp_path / "state-hub-agent"
+    st_ag.mkdir()
+    ef_ag = tmp_path / "factory-hub-agent.env"
+    ef_ag.write_text(k8s_env)
+    r_ag = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FACTORY_ENV": str(ef_ag), "FAKE_STATE": str(st_ag), "DRY_RUN": "0"},
+        capture_output=True,
+        text=True,
+    )
+    assert r_ag.returncode == 0, r_ag.stdout + r_ag.stderr
+    calls_ag = (st_ag / "calls").read_text()
+    for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
+        assert f"--member=serviceAccount:scion-prod-agent@hub-proj.iam.gserviceaccount.com --role={role}" in calls_ag
+
+
+def test_setup_sandbox_retries_cloudresourcemanager_429_rate_limit_and_409_aborted(tmp_path):
+    bindir = tmp_path / "bin-429"
+    bindir.mkdir()
+    gcloud_429 = FAKE_GCLOUD.replace(
+        'echo "ERROR: (gcloud.projects.add-iam-policy-binding) INVALID_ARGUMENT: Service account x does not exist." >&2',
+        'echo "ERROR: (gcloud.projects.add-iam-policy-binding) HttpError status: 429 RATE_LIMIT_EXCEEDED RESOURCE_EXHAUSTED Quota exceeded" >&2',
+    )
+    (bindir / "gcloud").write_text(gcloud_429)
+    (bindir / "gcloud").chmod(0o755)
+    (bindir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "sleep").chmod(0o755)
+    (bindir / "kubectl").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "kubectl").chmod(0o755)
+
+    state = tmp_path / "state-429"
+    state.mkdir()
+    env_file = tmp_path / "factory-429.env"
+    env_file.write_text(
+        "AGENT_RUNTIME=kubernetes\nSANDBOX_PROJECT=sandbox\nSANDBOX_REGION=us-east1\n"
+        "HUB_PROJECT=sandbox\nHUB_REGION=us-east1\nHUB_K8S_NAMESPACE=tfha-prod\nDATA_BUCKET=sandbox-data\n"
+    )
+    res = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FACTORY_ENV": str(env_file), "FAKE_STATE": str(state), "DRY_RUN": "0"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "retrying in 10s" in res.stderr
+    assert "done" in res.stdout
+

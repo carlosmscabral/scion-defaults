@@ -600,6 +600,17 @@ def inspect_repository(repo_path: str | Path) -> dict[str, Any]:
 
 DEPLOY_MODES = ("service", "none")
 AUTONOMY_LEVELS = ("supervised", "standard", "autonomous")
+WAKE_MODES = ("direct-lead", "dedicated-sensor", "delta")
+
+
+def has_eval_project(spec: dict[str, Any]) -> bool:
+    """True when `project.eval_slug` names a separate evaluation Hub project; False for single-project factories."""
+    return bool(str((spec.get("project") or {}).get("eval_slug") or "").strip())
+
+
+def wake_mode(spec: dict[str, Any]) -> str:
+    """`team.heartbeat_mode`: `direct-lead` when absent, or `dedicated-sensor` / `delta`."""
+    return str((spec.get("team") or {}).get("heartbeat_mode") or "direct-lead")
 
 
 def deploy_mode(spec: dict[str, Any]) -> str:
@@ -687,12 +698,21 @@ def normalize_team(spec: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
 
     A role in `team.dropped_defaults` is never added. A roster role with the same `default_kind` as a missing
     always-role counts as that role, so a renamed implementer doesn't get a second `backend`.
+    When `has_eval_project(spec)` is False, `ALWAYS_EVAL` is skipped and `evaluator` is appended to `build_roles`
+    unless `evaluator` is in `team.dropped_defaults`.
     """
     out = copy.deepcopy(spec)
     team = out.setdefault("team", {})
     dropped = _dropped_defaults(out)
     notes: list[str] = []
-    for key, always in (("build_roles", role_library.ALWAYS_BUILD), ("eval_roles", role_library.ALWAYS_EVAL)):
+    if has_eval_project(out):
+        groups: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("build_roles", role_library.ALWAYS_BUILD),
+            ("eval_roles", role_library.ALWAYS_EVAL),
+        )
+    else:
+        groups = (("build_roles", role_library.ALWAYS_BUILD + ("evaluator",)),)
+    for key, always in groups:
         roster = team.get(key)
         if not isinstance(roster, list):
             roster = []
@@ -743,7 +763,7 @@ def add_role(spec_path: str | Path, role: str, team: str | None = None, evidence
 
 
 def _team_readiness(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Errors and warnings for the deploy / autonomy enums, explicit drops, and missing default roles."""
+    """Errors and warnings for the deploy / autonomy / heartbeat enums, explicit drops, and missing default roles."""
     errors: list[str] = []
     mode = deploy_mode(spec)
     if mode not in DEPLOY_MODES:
@@ -752,7 +772,13 @@ def _team_readiness(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     level = autonomy(spec)
     if level not in AUTONOMY_LEVELS:
         errors.append(f"team.autonomy must be one of {', '.join(AUTONOMY_LEVELS)} (got {level!r})")
-    drops = (spec.get("team") or {}).get("dropped_defaults")
+    team_cfg = spec.get("team") or {}
+    wmode = wake_mode(spec)
+    if wmode not in WAKE_MODES:
+        errors.append(f"team.heartbeat_mode must be one of {', '.join(WAKE_MODES)} (got {wmode!r})")
+    elif wmode != "delta" and team_cfg and _is_vague(team_cfg.get("heartbeat_cron")):
+        errors.append("team.heartbeat_cron is required unless team.heartbeat_mode is delta")
+    drops = team_cfg.get("dropped_defaults")
     if drops is not None and not isinstance(drops, list):
         errors.append("team.dropped_defaults must be a list of {role, reason}")
         drops = []
@@ -790,9 +816,11 @@ def _is_vague(val: Any) -> bool:
 def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     """Validate whether a FactorySpec is concrete enough to compile boilerplate."""
     missing: list[str] = []
+    has_eval = has_eval_project(spec)
 
     project = spec.get("project") or {}
-    for key in ("name", "slug", "eval_slug", "mission"):
+    proj_keys = ("name", "slug", "eval_slug", "mission") if has_eval else ("name", "slug", "mission")
+    for key in proj_keys:
         if _is_vague(project.get(key)):
             missing.append(f"project.{key} is missing or vague")
     if not isinstance(project.get("non_goals"), list) or len(project.get("non_goals", [])) < 1:
@@ -802,10 +830,11 @@ def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     if vcs.get("enabled"):
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", str(vcs.get("repo") or "")):
             missing.append("vcs.repo must be OWNER/NAME when vcs.enabled is true")
-        for key in ("build_branch", "eval_branch"):
+        vcs_keys = ("build_branch", "eval_branch") if has_eval else ("build_branch",)
+        for key in vcs_keys:
             if _is_vague(vcs.get(key)):
                 missing.append(f"vcs.{key} is missing")
-        if vcs.get("build_branch") and vcs.get("build_branch") == vcs.get("eval_branch"):
+        if has_eval and vcs.get("build_branch") and vcs.get("build_branch") == vcs.get("eval_branch"):
             missing.append("vcs.eval_branch must differ from vcs.build_branch (orphan branch isolation, Lesson L25)")
 
     stack = spec.get("stack") or {}
@@ -817,7 +846,8 @@ def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     serves = deploy_mode(spec) != "none"
     infra = spec.get("infrastructure") or {}
     if serves:
-        for key in ("serving_service", "eval_service"):
+        svc_keys = ("serving_service", "eval_service") if has_eval else ("serving_service",)
+        for key in svc_keys:
             if _is_vague(infra.get(key)):
                 missing.append(f"infrastructure.{key} is missing")
         if not isinstance(infra.get("deployer_iam_roles"), list) or len(infra.get("deployer_iam_roles", [])) < 1:
@@ -828,7 +858,7 @@ def evaluate_spec_readiness(spec: dict[str, Any]) -> dict[str, Any]:
     eval_roles = team.get("eval_roles") or []
     if len(build_roles) < 3:
         missing.append("team.build_roles must define at least 3 build roles (e.g. lead, implementer, reviewer)")
-    if len(eval_roles) < 2:
+    if has_eval and len(eval_roles) < 2:
         missing.append("team.eval_roles must define at least 2 independent evaluation roles (Lesson L25)")
     for role_spec in list(build_roles) + list(eval_roles):
         if _is_vague(role_spec.get("responsibility")):
@@ -964,12 +994,18 @@ def _render_shared_agents_md(spec: dict[str, Any]) -> str:
     if not subdir:
         return text
     team = ", ".join(f"`{_agent(spec, r['role'])}`" for r in spec["team"]["build_roles"])
-    evals = ", ".join(f"`{_agent(spec, r['role'])}`" for r in spec["team"]["eval_roles"])
+    eval_roles = spec["team"].get("eval_roles") or []
+    evals = ", ".join(f"`{_agent(spec, r['role'])}`" for r in eval_roles)
+    roster_line = (
+        f"- Agent names carry the factory prefix: build team {team}; evaluation team {evals}. Message them with these names."
+        if has_eval_project(spec)
+        else f"- Agent names carry the factory prefix: build team {team}. Message them with these names."
+    )
     return _monorepo_paths(spec, text) + f"""
 ## 8. Monorepo Product Folder
 - This factory owns `{subdir}` in the repository. Your terminal starts there; the rest of the repository is read-only
   context unless the lead assigns work outside the folder. Use `git rev-parse --show-toplevel` for the root.
-- Agent names carry the factory prefix: build team {team}; evaluation team {evals}. Message them with these names.
+{roster_line}
 - Build and test only what the work touches, inside `{subdir}`; a whole-repository build is not a verification step.
 - Other factories share this repository's issues. Your backlog is the issues labeled `{_factory_label(spec)}`: add
   `--label {_factory_label(spec)}` to every `gh issue list` and `gh issue create`, and leave other issues alone.
@@ -985,24 +1021,47 @@ def _render_shared_agents_md_base(spec: dict[str, Any]) -> str:
     lint = stack.get("lint_command") or "true"
     git = _vcs_enabled(spec)
     serves = deploy_mode(spec) != "none"
+    has_eval = has_eval_project(spec)
+    is_delta = wake_mode(spec) == "delta"
 
     if git:
-        if serves:
+        if has_eval:
+            if serves:
+                topology = (
+                    f"- **Build Project (`{proj['slug']}`):** Pushes application code to `{vcs['build_branch']}` in "
+                    f"`{vcs['repo']}` and deploys `{infra['serving_service']}`.\n"
+                    f"- **Eval Project (`{proj['eval_slug']}`):** Pushes the independent evaluation control tower to the "
+                    f"disjoint orphan branch `{vcs['eval_branch']}` and deploys `{infra['eval_service']}` (Lesson L25)."
+                )
+            else:
+                topology = (
+                    f"- **Build Project (`{proj['slug']}`):** Pushes code to `{vcs['build_branch']}` in `{vcs['repo']}`. "
+                    "Nothing to deploy (`infrastructure.deploy: none`): a verified commit is the result.\n"
+                    f"- **Eval Project (`{proj['eval_slug']}`):** Pushes the independent evaluation control tower to the "
+                    f"disjoint orphan branch `{vcs['eval_branch']}` and grades the code of `{vcs['build_branch']}`'s "
+                    "commits (Lesson L25)."
+                )
+        elif serves:
             topology = (
-                f"- **Build Project (`{proj['slug']}`):** Pushes application code to `{vcs['build_branch']}` in "
-                f"`{vcs['repo']}` and deploys `{infra['serving_service']}`.\n"
-                f"- **Eval Project (`{proj['eval_slug']}`):** Pushes the independent evaluation control tower to the "
-                f"disjoint orphan branch `{vcs['eval_branch']}` and deploys `{infra['eval_service']}` (Lesson L25)."
+                f"- **Build Project (`{proj['slug']}`):** Single-project factory pushing application code to "
+                f"`{vcs['build_branch']}` in `{vcs['repo']}`, deploying `{infra['serving_service']}`, and running "
+                "on-demand L1–L5 verification in-project."
             )
         else:
             topology = (
-                f"- **Build Project (`{proj['slug']}`):** Pushes code to `{vcs['build_branch']}` in `{vcs['repo']}`. "
-                "Nothing to deploy (`infrastructure.deploy: none`): a verified commit is the result.\n"
-                f"- **Eval Project (`{proj['eval_slug']}`):** Pushes the independent evaluation control tower to the "
-                f"disjoint orphan branch `{vcs['eval_branch']}` and grades the code of `{vcs['build_branch']}`'s "
-                "commits (Lesson L25)."
+                f"- **Build Project (`{proj['slug']}`):** Single-project factory pushing verified code to "
+                f"`{vcs['build_branch']}` in `{vcs['repo']}` and running on-demand L1–L5 code verification in-project. "
+                "Nothing to deploy (`infrastructure.deploy: none`): a verified commit is the result."
             )
         flabel = _factory_label(spec)
+        delta_backlog_note = (
+            "- **Shared-PAT comment attribution (`L14`):** Every GitHub issue body or comment posted by an agent MUST "
+            "begin with `<!-- scion-agent: <agent-slug> -->` on line 1. When escalating to `status:po-decision`, post "
+            "your `<!-- scion-agent: <agent-slug> -->` comment *before* adding `status:po-decision` so the delta "
+            "controller distinguishes agent comments from human PO replies.\n"
+            if is_delta
+            else ""
+        )
         backlog = f"""## 3. Backlog & Status (Lessons L1, L18)
 - The backlog is GitHub issues in `{vcs['repo']}`. Status labels move `status:ready` -> `status:in-progress` -> `status:in-review` -> `status:verified` (or `status:blocked`).
 - This factory's issues carry `{flabel}`: add `--label {flabel}` to every `gh issue list` and `gh issue create`.
@@ -1017,7 +1076,7 @@ def _render_shared_agents_md_base(spec: dict[str, Any]) -> str:
   `gh issue list -R {vcs['repo']} --label status:po-decision` is the PO's whole inbox.
 - **Tell, don't page:** progress and "tell" notices are comments on the issue concerned and on the pinned digest
   issue `{_digest_title(spec)}` (labels `digest` and `{flabel}`), never a Scion message to the PO.
-"""
+{delta_backlog_note}"""
         asks = "; ".join(a[:1].lower() + a[1:] for a in _po_asks(spec))
         escalation = (
             f"- **Narrow PO escalation (L4):** Only the lead asks the PO, and only for a decision in the \"Waits for the "
@@ -1025,16 +1084,36 @@ def _render_shared_agents_md_base(spec: dict[str, Any]) -> str:
             "issue, then sends `scion message user:<PO_USER> \"<one line> <issue URL>\"`. Every message to the PO raises "
             "an ERROR alert (watchdog), so nothing else goes by message. Everyone else escalates to their lead."
         )
-        k8s_clone_note = (
-            "\n- **Per-Pod Clones (`runtime: kubernetes`):** Each agent pod owns an isolated `/workspace` clone and shares "
-            "`/scion-volumes/scratchpad` plus `origin` (never uncommitted local files). Before requesting review on uncommitted "
-            "work, write `git diff HEAD > /scion-volumes/scratchpad/patches/issue-<N>.patch` (or push `factory/issue-<N>`) so "
-            "your reviewer pod can apply, test, and audit the exact diff before trunk merge."
-            if runtime_mode(spec) == "kubernetes"
-            else ""
-        )
-        integrate = f"""## 4. Pre-Commit Verification & Commit Slot (Lesson L18)
-Before committing or pushing to your team's trunk (`{vcs['build_branch']}` in `{proj['slug']}`, `{vcs['eval_branch']}` in `{proj['eval_slug']}`), ask your lead for the commit slot, then:{k8s_clone_note}
+        if is_delta:
+            build_roles = spec["team"]["build_roles"]
+            lead_slug = _agent(spec, _team_lead(build_roles, "lead"))
+            reviewer_slug = _kind_agent_slug(spec, build_roles, "reviewer", "reviewer")
+            bbranch = vcs["build_branch"]
+            integrate = f"""## 4. Issue Branches & Direct Peer Review Handoff (Delta Mode)
+Each agent runs in an isolated `/workspace` clone sharing `origin` and `/scion-volumes/scratchpad` (never write `.patch` files to `/scion-volumes/scratchpad/patches/`, and never wait on a commit slot before pushing an issue branch):
+1. **Writers (`factory/issue-<N>`):** Fetch `origin/{bbranch}`, create/reset branch `factory/issue-<N>` from `origin/{bbranch}` (`git fetch origin {bbranch} && git checkout -B factory/issue-<N> origin/{bbranch}`), implement with TDD, and run local verification: `{stack['build_command']}`, `{stack['test_command']}`, and `{lint}`.
+2. **Clean staging & direct push:** Stage **only** explicit paths (`git add -- <files>`), verify `git diff --cached --name-only` contains no `.scion/`, `.agents/`, `.env`, or secrets, commit, and push directly to `origin/factory/issue-<N>` (`git push -u origin HEAD:factory/issue-<N>`). If a push is rejected by GitHub token scope limits (for example `.github/workflows/*` without `workflow` scope), save restricted files under `/scion-volumes/scratchpad/pending-<issue>/`, push permitted paths on `factory/issue-<N>`, and report the pending patch path.
+3. **Direct writer -> `{reviewer_slug}` handoff:** Message `{reviewer_slug}` directly (`scion message {reviewer_slug} "<your-slug> -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>)"`) without waking `{lead_slug}`.
+4. **Reviewer audit (`origin/{bbranch}...origin/factory/issue-<N>`):** `{reviewer_slug}` fetches `origin/{bbranch}` and `origin/factory/issue-<N>`, audits `git diff origin/{bbranch}...origin/factory/issue-<N>`, and runs `{stack['test_command']}` independently. On the first `FAIL`, `{reviewer_slug}` messages the writer directly (`{lead_slug}` is NOT woken); on `PASS` (or a second `FAIL`), `{reviewer_slug}` writes `/scion-volumes/scratchpad/reports/<N>-review.md` and wakes `{lead_slug}` once.
+5. **Trunk merge, cleanup, & auto-stop (`{lead_slug}`):** `{lead_slug}` starts **only** specialists required by active issues (never pre-starting unused roles, and never building virtual environments or running product test suites before delegating), merges verified `origin/factory/issue-<N>` onto `{bbranch}`, pushes `origin/{bbranch}`, deletes remote `factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), persists `/scion-volumes/scratchpad/STATE.json`, and stops idle specialists (`scion stop <agent>`).
+6. **Container-local tool environments (`/tmp/.venv`):** Keep any ephemeral Python `venv`, `pip` cache, or `node_modules` inside container-local `/tmp/` (for example `/tmp/.venv`), never on Filestore NFS `/scion-volumes/scratchpad`.
+"""
+        else:
+            k8s_clone_note = (
+                "\n- **Per-Pod Clones (`runtime: kubernetes`):** Each agent pod owns an isolated `/workspace` clone and shares "
+                "`/scion-volumes/scratchpad` plus `origin` (never uncommitted local files). Before requesting review on uncommitted "
+                "work, write `git diff HEAD > /scion-volumes/scratchpad/patches/issue-<N>.patch` (or push `factory/issue-<N>`) so "
+                "your reviewer pod can apply, test, and audit the exact diff before trunk merge."
+                if runtime_mode(spec) == "kubernetes"
+                else ""
+            )
+            trunks = (
+                f"`{vcs['build_branch']}` in `{proj['slug']}`, `{vcs['eval_branch']}` in `{proj['eval_slug']}`"
+                if has_eval
+                else f"`{vcs['build_branch']}` in `{proj['slug']}`"
+            )
+            integrate = f"""## 4. Pre-Commit Verification & Commit Slot (Lesson L18)
+Before committing or pushing to your team's trunk ({trunks}), ask your lead for the commit slot, then:{k8s_clone_note}
 1. Run build, test, and lint verification: `{stack['build_command']}`, `{stack['test_command']}`, and `{lint}`.
 2. Check whether your remote trunk moved (`git fetch origin <branch> && git rev-list --count HEAD..origin/<branch>`). When `0`, commit and push directly (`git push origin HEAD:<branch>`) without `git pull --rebase` or `git stash`. When `> 0`, stash **only** your own paths (`git stash push -m "pre-rebase" -- <files>`, never `git stash -u`), rebase onto `origin/<branch>`, pop, and re-verify (or ask your lead if shared files conflict).
 3. Stage **only** explicit paths (`git add -- <files>`) and verify `git diff --cached --name-only` contains only your assigned paths (or coupled paths your lead explicitly authorized for a co-commit). Never run `git add -A`, `git add .`, `git add -u`, or `git stash -u`, and never stage or stash `.scion/` or `.agents/`.
@@ -1054,19 +1133,30 @@ After the deploy, record the revision, the rollback revision, and the commit in 
 """
         turn_ref = "issue # and commit SHA"
     else:
-        if serves:
+        if has_eval:
+            if serves:
+                topology = (
+                    f"- **Build Project (`{proj['slug']}`):** Works in the shared `/workspace` (no version control yet) and "
+                    f"deploys `{infra['serving_service']}`.\n"
+                    f"- **Eval Project (`{proj['eval_slug']}`):** Works in its own Hub project workspace, isolated from the "
+                    f"build workspace, and deploys `{infra['eval_service']}` (Lesson L25)."
+                )
+            else:
+                topology = (
+                    f"- **Build Project (`{proj['slug']}`):** Works in the shared `/workspace` (no version control yet). "
+                    "Nothing to deploy (`infrastructure.deploy: none`): verified code in the workspace is the result.\n"
+                    f"- **Eval Project (`{proj['eval_slug']}`):** Works in its own Hub project workspace, isolated from the "
+                    "build workspace, and grades the build workspace's code (Lesson L25)."
+                )
+        elif serves:
             topology = (
-                f"- **Build Project (`{proj['slug']}`):** Works in the shared `/workspace` (no version control yet) and "
-                f"deploys `{infra['serving_service']}`.\n"
-                f"- **Eval Project (`{proj['eval_slug']}`):** Works in its own Hub project workspace, isolated from the "
-                f"build workspace, and deploys `{infra['eval_service']}` (Lesson L25)."
+                f"- **Build Project (`{proj['slug']}`):** Single-project factory working in `/workspace` (no version "
+                f"control yet) and deploying `{infra['serving_service']}`."
             )
         else:
             topology = (
-                f"- **Build Project (`{proj['slug']}`):** Works in the shared `/workspace` (no version control yet). "
-                "Nothing to deploy (`infrastructure.deploy: none`): verified code in the workspace is the result.\n"
-                f"- **Eval Project (`{proj['eval_slug']}`):** Works in its own Hub project workspace, isolated from the "
-                "build workspace, and grades the build workspace's code (Lesson L25)."
+                f"- **Build Project (`{proj['slug']}`):** Single-project factory working in `/workspace` (no version "
+                "control yet). Nothing to deploy (`infrastructure.deploy: none`): verified code in the workspace is the result."
             )
         backlog = """## 3. Backlog & Status (Lessons L1, L18)
 - The backlog is `/workspace/backlog/issues.json`. Each item has an `id`, `title`, `owner_role`, `requirements`, `acceptance_criteria`, and `status` (`ready` -> `in-progress` -> `in-review` -> `verified`, or `blocked`).
@@ -1113,16 +1203,48 @@ After the deploy, record the revision, the rollback revision, the snapshot path,
         # Nothing to deploy (spec §8): no deploy section, no deployer, and the pyramid grades the code.
         live_rule = ("The doc-writer keeps `knowledge-plane/state/LIVE.md` current (nothing is deployed: it records the "
                      "latest release and its source).")
-        deploy = """## 5. Nothing to Deploy
+        grader = "The evaluation team grades the code itself" if has_eval else "The `evaluator` specialist grades the code itself in-project"
+        pyramid_intro = (
+            "The evaluation team grades the code of the build's commits, not a live service:"
+            if has_eval
+            else "The `evaluator` specialist grades the code of the build's commits in-project, not a live service:"
+        )
+        deploy = f"""## 5. Nothing to Deploy
 This factory has `infrastructure.deploy: none` (a library, a CLI or a package): there is no service and no
-deployer, and no agent deploys anything. The evaluation team grades the code itself (section 7).
+deployer, and no agent deploys anything. {grader} (section 7).
 """
         pyramid = f"""## 7. L1–L5 Code Evaluation Pyramid
-The evaluation team grades the code of the build's commits, not a live service:
+{pyramid_intro}
 {render_code_pyramid(spec)}
 """
 
-    return f"""# Shared Factory Agent Protocol — {proj['name']} (`{proj['slug']}` & `{proj['eval_slug']}`)
+    header_slugs = f"`{proj['slug']}` & `{proj['eval_slug']}`" if has_eval else f"`{proj['slug']}`"
+    use_shared_kp = runtime_mode(spec) == "kubernetes" or is_delta
+    if use_shared_kp:
+        kp_reader_line = (
+            f"- Build agents check `{kp.EVAL_KP_MOUNT}/INDEX.md` first (with fallback `/workspace/knowledge-plane/INDEX.md`) before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`."
+            if has_eval
+            else f"- Every agent checks `{kp.EVAL_KP_MOUNT}/INDEX.md` first (with fallback `/workspace/knowledge-plane/INDEX.md`) before planning, implementing, reviewing, evaluating, or deploying."
+        )
+        kp_check_line = (
+            "- Run `python3 /workspace/knowledge-plane/kp-check.py` only when `/workspace/knowledge-plane/kp-check.py` is writable in Git (skip when reading the mounted `/scion-volumes/knowledge-plane` shared-dir), and fix every problem it reports."
+        )
+    else:
+        kp_reader_line = (
+            f"- Build agents read `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`."
+            if has_eval
+            else "- Every agent reads `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, evaluating, or deploying."
+        )
+        kp_check_line = "- After you change the knowledge plane, run `python3 /workspace/knowledge-plane/kp-check.py` and fix every problem it reports."
+    delta_comm_note = (
+        "\n- **Ignore bare `state-change` (`COMPLETED`) notifications:** If woken solely by a bare system `state-change` "
+        "(`COMPLETED`) event with no `DELTA:` payload or actionable peer message, run zero shell commands and immediately "
+        "call `sciontool status task_completed \"ignored bare state-change\"`."
+        if is_delta
+        else ""
+    )
+
+    return f"""# Shared Factory Agent Protocol — {proj['name']} ({header_slugs})
 
 Every agent in this Scion software factory MUST follow these operational rules (derived from Lessons L1–L27).
 
@@ -1133,18 +1255,18 @@ Every agent in this Scion software factory MUST follow these operational rules (
 {chr(10).join(f'  - {ng}' for ng in proj.get('non_goals', []))}
 
 ## 2. Knowledge Plane (Lesson L4)
-- Build agents read `/workspace/knowledge-plane/INDEX.md` before planning, implementing, reviewing, or deploying. Evaluation agents read the same knowledge plane read-only at `{kp.EVAL_KP_MOUNT}/INDEX.md`.
+{kp_reader_line}
 - Open files through the paths in the index. Never guess a file name.
 - Cite `REQ-` and `ADR-` IDs in work items, reviews, and evaluation results. Record new decisions with `knowledge-plane/adr/_template.md`.
 - {live_rule} Evaluation golden datasets never go into the build knowledge plane.
-- After you change the knowledge plane, run `python3 /workspace/knowledge-plane/kp-check.py` and fix every problem it reports.
+{kp_check_line}
 
 {backlog}
 {integrate}
 {deploy}
 ## 6. Communication & Turn Completion (Lessons L1, L2, L4)
 - **Verify message delivery (L1):** Always check the exit code of `scion message <recipient> "<msg>"` and confirm recipient names reside in the same Scion project.
-- **Signal turn completion (L2):** End every turn by running `sciontool status task_completed "<concise summary with {turn_ref}>"` (or `sciontool status ask_user "<blocker>"` when genuinely blocked).
+- **Signal turn completion (L2):** End every turn by running `sciontool status task_completed "<concise summary with {turn_ref}>"` (or `sciontool status ask_user "<blocker>"` when genuinely blocked).{delta_comm_note}
 {escalation}
 
 {pyramid}"""
@@ -1197,7 +1319,7 @@ BRIEFS_DIR = "/scion-volumes/scratchpad/briefs"
 REPORTS_DIR = "/scion-volumes/scratchpad/reports"
 DURABILITY_RULE = "A task is done only when its result is pushed or sent in a message."
 
-_FOCUS_COMMAND_KINDS = ("implementer", "test-engineer", "investigator")
+_FOCUS_COMMAND_KINDS = ("implementer", "test-engineer", "investigator", "evaluator")
 _FOCUS_DOC_KINDS = ("doc-writer", "researcher")
 _FOCUS_KEYS = ("paths", "commands", "docs")
 
@@ -1207,6 +1329,7 @@ _FOCUS_KEYS = ("paths", "commands", "docs")
 _READ_ONLY_KINDS = frozenset({
     "reviewer", "researcher", "investigator", "security-auditor", "performance-analyst", "contract-tester",
     "latency-prober", "ui-auditor", "safety-evaluator", "factory-analyst", "benchmark-runner", "api-compat-checker",
+    "evaluator",
 })
 # Reviewers whose verdicts the lead collects before it gives the commit slot (they never message each other).
 _PARALLEL_REVIEWER_KINDS = ("reviewer", "security-auditor", "performance-analyst")
@@ -1222,6 +1345,7 @@ _SIZING_LINES = (
     (("migration-specialist",), "schema/IaC → {migration-specialist}"),
     (("performance-analyst",), "perf-sensitive → {performance-analyst}"),
     (("release-manager",), "release → {release-manager}"),
+    (("evaluator",), "wave or L1–L5 gate → {evaluator}"),
 )
 
 
@@ -1245,6 +1369,14 @@ def _kind_agents(spec: dict[str, Any], team: list[dict[str, Any]]) -> dict[str, 
     for r in team:
         agents.setdefault(_role_kind(r), f"`{_agent(spec, r['role'])}`")
     return agents
+
+
+def _kind_agent_slug(spec: dict[str, Any], team: list[dict[str, Any]], kind: str, fallback: str) -> str:
+    """Plain agent slug (without backticks) for the first roster role matching `kind`, else `_agent(spec, fallback)`."""
+    for r in team:
+        if _role_kind(r) == kind:
+            return _agent(spec, r["role"])
+    return _agent(spec, fallback)
 
 
 def role_focus(spec: dict[str, Any], role_spec: dict[str, Any]) -> dict[str, list[str]]:
@@ -1272,11 +1404,25 @@ def role_focus(spec: dict[str, Any], role_spec: dict[str, Any]) -> dict[str, lis
 
 def _render_role_protocol(spec: dict[str, Any], role_spec: dict[str, Any]) -> str:
     lib_role = _library_role(role_spec)
-    protocol = role_library.role_protocol(lib_role, deploy_mode(spec)) if lib_role else None
+    wmode = wake_mode(spec)
+    protocol = role_library.role_protocol(lib_role, deploy_mode(spec), wake_mode=wmode) if lib_role else None
     if not protocol:
         return ""
+    if runtime_mode(spec) == "kubernetes" or wmode == "delta":
+        protocol = protocol.replace(
+            "Run `python3 <knowledge plane>/kp-check.py`",
+            "When `<knowledge plane>/kp-check.py` is writable in Git, run `python3 <knowledge plane>/kp-check.py`",
+        )
     protocol = protocol.replace("<knowledge plane>", f"{_ws(spec)}/knowledge-plane")
     protocol = protocol.replace("factory:<slug>", _factory_label(spec))
+    if "<build_branch>" in protocol or wmode == "delta":
+        vcs = spec.get("vcs") or {}
+        bbranch = (vcs.get("build_branch") or "main") if _vcs_enabled(spec) else "the build workspace"
+        build_roles = (spec.get("team") or {}).get("build_roles") or []
+        reviewer_slug = _kind_agent_slug(spec, build_roles, "reviewer", "reviewer")
+        protocol = protocol.replace("<build_branch>", bbranch)
+        protocol = protocol.replace("<reviewer>", reviewer_slug)
+        protocol = protocol.replace("<agent-slug>", _agent(spec, role_spec["role"]))
     return f"## Role protocol\n{protocol.strip()}\n\n"
 
 
@@ -1298,7 +1444,12 @@ def _render_sizing(spec: dict[str, Any], team: list[dict[str, Any]], is_eval: bo
     text = ("## Sizing an issue\nRead the issue and the knowledge plane, then decide who is needed.\n"
             f"{small} Add a teammate when its line applies:\n" + "\n".join(lines) + "\n")
     if reviewers:
-        text += f"\nReview verdicts from {', '.join(reviewers)} before giving the commit slot.\n"
+        if wake_mode(spec) == "delta" and _vcs_enabled(spec):
+            bbranch = (spec.get("vcs") or {}).get("build_branch") or "main"
+            text += (f"\nRequire PASS review verdicts from {', '.join(reviewers)} in "
+                     f"`{REPORTS_DIR}/<N>-review.md` before merging `origin/factory/issue-<N>` onto `{bbranch}`.\n")
+        else:
+            text += f"\nReview verdicts from {', '.join(reviewers)} before giving the commit slot.\n"
     return text + "\n"
 
 
@@ -1313,6 +1464,17 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
         implementer = agents.get("implementer", "the implementer")
         pre_work = ("- Pre-work comes first. Read\n  " + "\n  or ".join(reports) + "\n"
                     f"  before you brief {implementer}, and put the report's path in its brief.\n")
+    if wake_mode(spec) == "delta" and _vcs_enabled(spec):
+        reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
+        return f"""## Briefs
+- Write each brief to `{BRIEFS_DIR}/<issue>-<agent>.md` and update `/scion-volumes/scratchpad/STATE.json` **before** launching or messaging `<agent>`.
+- **Single-turn launch (never `scion start` + `scion message` back-to-back):** When `<agent>` does not exist yet, pass `{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>` directly as the `scion start` prompt and do **not** send a follow-up `scion message` (sending both queues a wasted duplicate second turn). Use `scion message <agent> "{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>"` **only** when `<agent>` is already `running` (or right after `scion resume <agent>` on a `stopped` pod). Start `{reviewer_slug}` on stand-by (`"{lead} -> {reviewer_slug}: read /scion-volumes/knowledge-plane/INDEX.md and stand by for writer handoffs"`) with no extra message before a writer pushes `origin/factory/issue-<N>`.
+- Never inline a brief body in the prompt or message: shell metacharacters and long prompts break.
+- For writers, name branch `factory/issue-<N>`, the deliverables (exact paths), the acceptance checks, and the direct
+  handoff termination line ("Push `origin/factory/issue-<N>` and message `{reviewer_slug}` directly without waking `{lead}`").
+  For reviewers and `evaluator`, name `{REPORTS_DIR}/<N>-review.md` (or `<N>-eval.md`) and report to `{lead}` on `PASS` or second `FAIL`.
+{pre_work}
+"""
     return f"""## Briefs
 - Write each brief to `{BRIEFS_DIR}/<issue>-<agent>.md`, then send
   `scion message <agent> "{lead} -> <agent>: {ref}: read {BRIEFS_DIR}/<file>"`.
@@ -1329,10 +1491,42 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
     Scion keeps each agent's creator (ancestry root -> parent -> child): the Hub's tree view shows the lead on top, and
     the Hub sends an agent's notifications to its creator, so the lead hears when a teammate stops or fails.
     """
-    team = spec["team"]["eval_roles"] if is_eval else spec["team"]["build_roles"]
+    team = (spec["team"].get("eval_roles") or []) if is_eval else spec["team"]["build_roles"]
     lead_role = _team_lead(team, "eval-lead" if is_eval else "lead")
     lead = _agent(spec, lead_role)
+    is_delta = wake_mode(spec) == "delta" and _vcs_enabled(spec)
+    vcs = spec.get("vcs", {}) or {}
     if role_spec["role"] != lead_role:
+        if is_delta:
+            my_slug = _agent(spec, role_spec["role"])
+            reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
+            bbranch = vcs.get("build_branch") or "main"
+            kind = _role_kind(role_spec)
+            if kind == "reviewer":
+                return f"""## Chain of command
+- `{lead}` started you on demand. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (and briefs from `{lead}` in `{BRIEFS_DIR}/<issue>-<agent>.md`).
+- Audit `git diff origin/{bbranch}...origin/factory/issue-<N>` and run tests independently without modifying product code.
+- **First `FAIL`:** Message the writer directly (`scion message <writer> "{my_slug} -> <writer>: FAIL issue #<N>: ..."`) so it can push fixes to `origin/factory/issue-<N>` — do **not** wake `{lead}` on the first `FAIL`.
+- **`PASS` (or second `FAIL`):** Write `{REPORTS_DIR}/<N>-review.md` and message `{lead}` once (`scion message {lead} "{my_slug} -> {lead}: <PASS|FAIL> issue #<N> (<sha>): see {REPORTS_DIR}/<N>-review.md"`).
+- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{lead}`'s job.
+- {DURABILITY_RULE}
+
+"""
+            if _role_writes(role_spec) and kind != "deployer":
+                return f"""## Chain of command
+- `{lead}` started you on demand for an active issue. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start.
+- Branch `factory/issue-<N>` from `origin/{bbranch}`, run local tests, commit explicit paths, and push `origin/factory/issue-<N>` directly (never write `.patch` files to `/scion-volumes/scratchpad/patches/`, and never wait on a commit slot).
+- **Direct peer handoff:** Once `origin/factory/issue-<N>` is pushed and green, message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>): brief {BRIEFS_DIR}/<file>"`) without waking `{lead}`. If `{reviewer_slug}` sends a first-attempt `FAIL`, fix it on `factory/issue-<N>`, push, and message `{reviewer_slug}` again; escalate blockers to `{lead}`.
+- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{lead}`'s job.
+- {DURABILITY_RULE}
+
+"""
+            return f"""## Chain of command
+- You report to `{lead}`, who started you on demand. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start, write your structured report under `{REPORTS_DIR}/`, prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment, and send your `PASS`/`FAIL` verdict or findings to `{lead}` with `scion message {lead} "{my_slug} -> {lead}: ..."`.
+- Never start, stop or delete agents: staffing is `{lead}`'s job.
+- {DURABILITY_RULE}
+
+"""
         return f"""## Chain of command
 - You report to `{lead}`, who started you. Take work from `{lead}` (or the PO), and send every result, blocker and
   verdict to `{lead}` with `scion message {lead} "<your name> -> {lead}: ..."`.
@@ -1345,9 +1539,8 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
   the repository.
 
 """
-    vcs = spec.get("vcs", {}) or {}
     team_branch = (
-        (vcs.get("eval_branch") if is_eval else vcs.get("build_branch"))
+        (vcs.get("eval_branch") if (is_eval and has_eval_project(spec)) else vcs.get("build_branch"))
         if runtime_mode(spec) == "kubernetes" and _vcs_enabled(spec)
         else ""
     )
@@ -1368,6 +1561,21 @@ def _render_chain_of_command(spec: dict[str, Any], role_spec: dict[str, Any], is
         "setup runbook step 6). Without one, ask the PO before you start that agent."
         if any(r.get("gcp_identity") for r in team if r["role"] != lead_role) else ""
     )
+    if is_delta:
+        bbranch = vcs.get("build_branch") or "main"
+        reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
+        return f"""## Chain of command
+You lead this team in ephemeral delta mode: the K8s delta controller (`scion-factory-delta`) wakes you only on actionable GitHub or child-pod state deltas, and every specialist you start is your Scion child.
+
+| Teammate | Start it with |
+|---|---|
+{table}
+
+- **On-demand staffing only (never pre-start unused roles):** Start **only** the specialists required by active issues (for example the assigned writer and `{reviewer_slug}`, or `evaluator` when running L1–L5 verification). Never pre-start unused roles when no active issue needs them; `scion resume <name>` a stopped specialist when assigning new work, and `scion resume --force <name>` one in `error`/`halted`.{sa_note}
+- **Merge verified branches & retire idle pods:** After `{reviewer_slug}` writes `{REPORTS_DIR}/<N>-review.md` with `PASS`, merge or fast-forward `origin/factory/issue-<N>` onto `{bbranch}`, push `origin/{bbranch}`, delete remote `factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), persist state in `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists immediately with `scion stop <agent>`.
+- **Ignore bare `state-change` (`COMPLETED`) events:** If woken solely by a bare system `state-change` (`COMPLETED`) notification with no `DELTA:` payload or actionable peer message, run **zero** shell commands and exit immediately via `sciontool status task_completed "ignored bare state-change"`.
+
+{_render_sizing(spec, team, is_eval)}{_render_briefs(spec, team, lead)}{_render_human_on_the_loop(spec, lead, is_eval)}"""
     return f"""## Chain of command
 You lead this team and you start it: the PO starts only you. Every agent you start is your child in Scion, so the
 Hub shows you on top of your team and sends you its notifications (stopped, failed, waiting for input).
@@ -1469,6 +1677,24 @@ Autonomy level: `{level}` (`team.autonomy` in factory.yaml; changing it means re
 """
     shipped = ("evaluation runs and the findings you filed" if is_eval
                else "what shipped (one line per issue at `status:verified`, waiting for the PO to close it)")
+    is_delta = wake_mode(spec) == "delta"
+    marker_po_note = (
+        f"\n- **Shared-PAT marker & ordering (`L14`):** Prepend `<!-- scion-agent: {lead} -->` on line 1 of every "
+        f"GitHub issue body or comment you write. Always post your `<!-- scion-agent: {lead} -->` comment **before** "
+        f"adding `status:po-decision` (`gh issue comment <N> -R {repo} --body-file <file> && gh issue edit <N> -R {repo} "
+        "--add-label status:po-decision`) so `scion-factory-delta` never misreads an older unmarked comment as a PO reply."
+        if is_delta
+        else ""
+    )
+    missing_digest_bullet = (
+        f'- If `$n` is empty, create the digest issue yourself rather than opening a `status:po-decision` blocker:\n'
+        f'  `gh issue create -R {repo} --title "{digest}" --label digest --label {flabel} --body "<!-- scion-agent: {lead} -->\\nDaily digest for {flabel}."`'
+        if is_delta
+        else (
+            "- If `$n` is empty, the digest issue is missing: open a PO inbox issue asking the PO to run\n"
+            "  `DRY_RUN=0 scripts/seed-github-waves.sh` from the kit, and skip the digest until it exists."
+        )
+    )
     text = rights + f"""
 ## PO inbox
 A decision in the "Waits for the PO" column becomes one GitHub issue, and the PO answers on it.
@@ -1477,13 +1703,12 @@ A decision in the "Waits for the PO" column becomes one GitHub issue, and the PO
 2. Send `scion message user:<PO_USER> "{lead}: PO decision needed: <issue URL>"`. Messages to the PO are only for
    `status:po-decision` issues, and each one links its issue: every message raises an ERROR alert.
 3. Keep working on other issues meanwhile. When the PO answers, act on the answer and remove `status:po-decision`.
-- `gh issue list -R {repo} --label status:po-decision` is the PO's whole inbox, across every factory on the repository.
+- `gh issue list -R {repo} --label status:po-decision` is the PO's whole inbox, across every factory on the repository.{marker_po_note}
 
 ## Daily digest
 Once a day (UTC), add one comment to the pinned issue "{digest}" (labels `digest` and `{flabel}`):
 - `n=$(gh issue list -R {repo} --label digest --label {flabel} --state open --search "\\"{digest}\\" in:title" --json number --jq '.[0].number // empty')`
-- If `$n` is empty, the digest issue is missing: open a PO inbox issue asking the PO to run
-  `DRY_RUN=0 scripts/seed-github-waves.sh` from the kit, and skip the digest until it exists.
+{missing_digest_bullet}
 - Start the comment with the line `[{lead} digest <YYYY-MM-DD>]` (UTC date; the brackets keep one lead's line from
   matching another's). Post only when today's line isn't there yet, so frequent wake-ups don't repeat it:
   `gh issue view "$n" -R {repo} --comments | grep -qF "[{lead} digest $(date -u +%F)]" || gh issue comment "$n" -R {repo} --body-file /scion-volumes/scratchpad/digest-$(date -u +%F).md`
@@ -1502,8 +1727,14 @@ The digest is never a Scion message: a daily message would page the PO every day
   comment the run on the issue; only the PO closes it.
 
 """
-    return text + """## Tell notices
-- At `status:verified`, comment the evidence on the issue (`gh issue comment`): commit, review verdicts, checks.
+    marker_tell_note = (
+        f"- Prepend `<!-- scion-agent: {lead} -->` on line 1 of every `gh issue comment` (including `status:verified` "
+        "evidence comments, digest comments, and PO escalations).\n"
+        if is_delta
+        else ""
+    )
+    return text + f"""## Tell notices
+{marker_tell_note}- At `status:verified`, comment the evidence on the issue (`gh issue comment`): commit, review verdicts, checks.
   The digest lists the issue; the PO accepts it by closing it.
 - An `eval-finding` issue (filed by the eval-lead at `status:ready`) is work like any other: work it directly and
   never file a duplicate issue for it.
@@ -1524,7 +1755,7 @@ def _render_role_system_prompt(spec: dict[str, Any], role_spec: dict[str, Any], 
     prefix, subdir = _monorepo(spec)
     if not subdir:
         return text
-    team = spec["team"]["eval_roles"] if is_eval else spec["team"]["build_roles"]
+    team = (spec["team"].get("eval_roles") or []) if is_eval else spec["team"]["build_roles"]
     mates = ", ".join(f"`{_agent(spec, r['role'])}`" for r in team if r["role"] != role_spec["role"])
     return text.replace("## Identity & Responsibility\n", f"""## Identity & Responsibility
 - **Your agent name is `{_agent(spec, role_spec['role'])}`.** Teammates: {mates}.
@@ -1539,14 +1770,17 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
     pyramid = spec["evaluation_pyramid"]
     l3 = pyramid["l3_domain_quality"]
     role = role_spec["role"]
-    project_slug = proj["eval_slug"] if is_eval else proj["slug"]
+    has_eval = has_eval_project(spec)
+    is_delta = wake_mode(spec) == "delta"
+    project_slug = proj["eval_slug"] if (is_eval and has_eval) else proj["slug"]
     if deploy_mode(spec) == "none":
         # Nothing to deploy (spec §8): no target service, and the pyramid grades the code.
-        target = f"- **Deploy Target:** {NOTHING_TO_DEPLOY}; the evaluation team grades the code"
+        grader_phrase = "the evaluation team grades the code" if has_eval else "the evaluator specialist grades the code in-project"
+        target = f"- **Deploy Target:** {NOTHING_TO_DEPLOY}; {grader_phrase}"
         oracle = f"## Evaluation Oracle (L1–L5 Code Pyramid)\n{render_code_pyramid(spec)}"
     else:
         l5 = pyramid["l5_latency_slo"]
-        service = infra["eval_service"] if is_eval else infra["serving_service"]
+        service = infra["eval_service"] if (is_eval and has_eval) else infra["serving_service"]
         target = f"- **Target Cloud Run Service:** `{service}`"
         oracle = f"""## Evaluation Oracle (L1–L5 Pyramid)
 1. **L1 Health:** `{pyramid['l1_health']['endpoint']}` -> {', '.join(pyramid['l1_health'].get('checks', []))}
@@ -1555,12 +1789,18 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
 4. **L4 Safety & Grounding:** {'; '.join(pyramid['l4_safety_grounding']['invariants'])}
 5. **L5 Latency SLO:** `p50 <= {l5.get('p50_ms', 100)}ms`, `p95 <= {l5['p95_ms']}ms`, `p99 <= {l5.get('p99_ms', 500)}ms`"""
     vcs = spec.get("vcs") or {}
-    kp_index = f"{kp.EVAL_KP_MOUNT}/INDEX.md" if is_eval else "/workspace/knowledge-plane/INDEX.md"
-    team = spec["team"]["eval_roles"] if is_eval else spec["team"]["build_roles"]
+    use_shared_kp = runtime_mode(spec) == "kubernetes" or is_delta
+    if is_eval:
+        kp_ref = f"`{kp.EVAL_KP_MOUNT}/INDEX.md`"
+    elif use_shared_kp:
+        kp_ref = f"`{kp.EVAL_KP_MOUNT}/INDEX.md` (fallback `/workspace/knowledge-plane/INDEX.md`)"
+    else:
+        kp_ref = "`/workspace/knowledge-plane/INDEX.md`"
+    team = (spec["team"].get("eval_roles") or []) if is_eval else spec["team"]["build_roles"]
     lead_role = _team_lead(team, "eval-lead" if is_eval else "lead")
     lead = _agent(spec, lead_role)
     if _vcs_enabled(spec):
-        branch = vcs["eval_branch"] if is_eval else vcs["build_branch"]
+        branch = vcs["eval_branch"] if (is_eval and has_eval) else vcs["build_branch"]
         location = f"Repository `{vcs['repo']}`, Branch `{branch}`"
         intake = f"inspect GitHub issues in `{vcs['repo']}` (`gh issue list -R {vcs['repo']} --label status:ready`)"
         slot = "commit slot"
@@ -1576,8 +1816,49 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
         write_step = (f"Verify your work with `{stack['test_command']}`,\n   and change files in `/workspace` only while "
                       f"`{lead}` gives you the edit slot.")
     # Leads keep backlog intake and orchestration and never implement; team members take work only from the brief
-    # named in their lead's message and report only to their lead; only writing kinds commit (spec §5.4, §6).
-    if role == lead_role:
+    # named in their lead's message and report only to their lead (or direct writer -> reviewer handoff in delta mode).
+    if is_delta and _vcs_enabled(spec):
+        repo = vcs["repo"]
+        my_slug = _agent(spec, role)
+        reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
+        kind = _role_kind(role_spec)
+        how = ("as your Role protocol says" if _render_role_protocol(spec, role_spec)
+               else "as your Primary Responsibility says")
+        if role == lead_role:
+            steps = [
+                "If woken solely by a bare system `state-change` (`COMPLETED`) notification or an initial stand-by prompt (`stand by`) with no `DELTA:` payload "
+                "and no actionable peer message, read `/scion-volumes/knowledge-plane/INDEX.md` once (on stand-by only) and exit immediately via `sciontool status task_completed \"standing by\"` without polling GitHub or starting specialists.",
+                f"Read `/scion-volumes/scratchpad/STATE.json`, {kp_ref}, and the incoming `DELTA:` or peer message "
+                f"(reconcile against {intake} or `--label status:po-decision --label {_factory_label(spec)}` when needed).",
+                "Size active issues, write briefs to `/scion-volumes/scratchpad/briefs/<N>-<agent>.md`, update "
+                "`/scion-volumes/scratchpad/STATE.json`, and start **only** the specialists required by active issues "
+                "(never pre-starting unused roles, and never implementing product code yourself).",
+                f"When `{reviewer_slug}` reports `PASS` (`{REPORTS_DIR}/<N>-review.md`), merge `origin/factory/issue-<N>` "
+                f"onto `{branch}`, verify `{stack['test_command']}`, push `origin/{branch}`, delete remote "
+                "`factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), update `/scion-volumes/scratchpad/STATE.json`, "
+                "and stop idle specialists with `scion stop <agent>`.",
+                f"Prepend `<!-- scion-agent: {lead} -->` to every GitHub comment (always commenting *before* adding "
+                "`status:po-decision`).",
+            ]
+            loop = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        elif kind == "reviewer":
+            loop = f"""1. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (or a brief in `{BRIEFS_DIR}/<N>-{my_slug}.md`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress review assignment on `origin/factory/issue-<N>` before going idle.
+2. Read {kp_ref}, fetch `origin/{branch}` and `origin/factory/issue-<N>`, inspect `git diff origin/{branch}...origin/factory/issue-<N>`, and run `{stack['test_command']}` independently (never change product code).
+3. On the first `FAIL`, message the writer directly with concrete `file:line` fixes (`{lead}` is NOT woken).
+4. On `PASS` (or second `FAIL`), write `{REPORTS_DIR}/<N>-review.md` and wake `{lead}` once with the verdict and commit SHA."""
+        elif _role_writes(role_spec) and kind != "deployer":
+            loop = f"""1. Take work from the brief file named in `{lead}`'s message (or a first-attempt `FAIL` fix request from `{reviewer_slug}`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
+3. Branch `factory/issue-<N>` from `origin/{branch}` (`git fetch origin {branch} && git checkout -B factory/issue-<N> origin/{branch}`) and implement your changes {how}, honoring `templates/_shared/agents.md`.
+4. Verify locally with `{stack['build_command']}` and `{stack['test_command']}`, stage explicit paths (`git add -- <files>`), commit, and push `origin/factory/issue-<N>` directly (no scratchpad `.patch` files, no commit-slot wait).
+5. Message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>)"`) without waking `{lead}`."""
+        else:
+            loop = f"""1. Take work from the brief file named in `{lead}`'s message; if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
+3. Do your role {how} on `{branch}`, honoring `templates/_shared/agents.md` (never change product code).
+4. Write structured verification output to `{REPORTS_DIR}/<N>-eval.md` (or the report path in your brief) and prepend `<!-- scion-agent: {my_slug} -->` to any GitHub evidence comment.
+5. Report `PASS` or `FAIL` with the report path to `{lead}`."""
+    elif role == lead_role:
         steps = [f"Read incoming `scion message` instructions and {intake}."]
         if _vcs_enabled(spec):
             repo = vcs["repo"]
@@ -1586,7 +1867,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
                 "   Act on each answered issue. For one without a PO answer for 24 hours, comment a reminder on it and\n"
                 "   re-send `scion message user:<PO_USER>` with the issue URL. Once a day, post the digest (see Daily digest).")
         steps += [
-            f"Read `{kp_index}` and the requirements and ADRs that the work item cites.",
+            f"Read {kp_ref} and the requirements and ADRs that the work item cites.",
             "Size the work item, brief your team by file and accept their results (see Chain of command) while honoring\n"
             "   `templates/_shared/agents.md`. Never implement it yourself.",
             f"Before you give the {slot} or mark the work verified, check the evidence: `{stack['test_command']}` passes and\n"
@@ -1599,7 +1880,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
         result = write_step if _role_writes(role_spec) else (
             "You never change product code: write your result (report, verdict or measurement) where the brief says.")
         loop = f"""1. Take work only from the brief file named in `{lead}`'s message; never pick work from the backlog yourself.
-2. Read `{kp_index}` and the requirements and ADRs that the brief cites.
+2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Do your role {how}, honoring `templates/_shared/agents.md`.
 4. {result}
 5. Report the result's path and a one-line result only to `{lead}`."""
@@ -1686,9 +1967,10 @@ service cloud.firestore {
 def _render_firestore_contract(spec: dict[str, Any]) -> str:
     proj = spec["project"]
     l3 = spec["evaluation_pyramid"]["l3_domain_quality"]
+    slugs = f"`{proj['slug']}` and `{proj['eval_slug']}`" if has_eval_project(spec) else f"`{proj['slug']}`"
     return f"""# Factory control plane on Firestore
 
-{proj['name']} (`{proj['slug']}` and `{proj['eval_slug']}`) stores agent status and evaluation runs in Firestore
+{proj['name']} ({slugs}) stores agent status and evaluation runs in Firestore
 (Native mode). Firestore is serverless: there is no instance to size, and idle cost is zero.
 
 - **Project:** `FIRESTORE_PROJECT` (default: the application project)
@@ -1764,20 +2046,22 @@ def _render_factory_env_example(spec: dict[str, Any]) -> str:
     proj = spec["project"]
     infra = spec["infrastructure"]
     team = spec["team"]
+    has_eval = has_eval_project(spec)
+    wmode = wake_mode(spec)
     build_names = " ".join(r["role"] for r in team["build_roles"])
-    eval_names = " ".join(r["role"] for r in team["eval_roles"])
+    eval_names = " ".join(r["role"] for r in (team.get("eval_roles") or []))
     iam_roles = " ".join(infra.get("deployer_iam_roles", []))
     vcs = spec.get("vcs") or {}
     if deploy_mode(spec) == "none":
         # Nothing to deploy (spec §8): no service, runtime or deployer variables.
         service_vars = "# Nothing to deploy (infrastructure.deploy: none): no service, runtime or deployer variables.\n"
     else:
+        dashboard_line = f"DASHBOARD_SERVICE={infra['eval_service']}\n" if has_eval and infra.get("eval_service") else ""
         service_vars = f"""DEPLOYER_SA_NAME=deployer-sa
 RUNTIME_SA_NAME={infra['serving_service']}
 DEPLOYER_IAM_ROLES="{iam_roles}"
 SERVING_SERVICE={infra['serving_service']}
-DASHBOARD_SERVICE={infra['eval_service']}
-"""
+{dashboard_line}"""
 
     prefix, subdir = _monorepo(spec)
     monorepo = (
@@ -1788,6 +2072,10 @@ FACTORY_SUBDIR={subdir}
 KNOWLEDGE_PLANE_SOURCES={proj['slug']}={subdir}/knowledge-plane
 """ if subdir else ""
     )
+    eval_slug = str(proj.get("eval_slug") or "") if has_eval else ""
+    eval_branch = vcs.get("eval_branch", "eval-dashboard") if has_eval else ""
+    factory_projects = f"{proj['slug']},{eval_slug}" if has_eval else proj["slug"]
+    hcron = team.get("heartbeat_cron", "" if wmode == "delta" else "*/15 * * * *")
     return f"""# Scion software factory configuration — {proj['name']}
 # Copy this file to config/factory.env in your scion-defaults checkout (git-ignored), replace the your-* values, and
 # deploy with docs/setup-runbook.md. The names match what scripts/run-on-hub.sh, render-templates.py and
@@ -1823,11 +2111,11 @@ HUB_SA=
 VCS_ENABLED={'true' if vcs.get('enabled') else 'false'}
 GITHUB_REPO={vcs.get('repo', '')}
 BUILD_PROJECT={proj['slug']}
-EVAL_PROJECT={proj['eval_slug']}
+EVAL_PROJECT={eval_slug}
 BUILD_BRANCH={vcs.get('build_branch', 'main')}
-EVAL_BRANCH={vcs.get('eval_branch', 'eval-dashboard')}
+EVAL_BRANCH={eval_branch}
 PO_EMAIL=po@example.com                      # Hub admin account that acts as the product owner
-FACTORY_PROJECTS={proj['slug']},{proj['eval_slug']}
+FACTORY_PROJECTS={factory_projects}
 KNOWLEDGE_PLANE_SOURCE_PROJECT={proj['slug']}
 MONTHLY_BUDGET_USD={infra.get('budget_usd', 200)}
 AUTONOMY={autonomy(spec)}   # team.autonomy: supervised | standard | autonomous (recompile and re-push to change)
@@ -1835,8 +2123,8 @@ AUTONOMY={autonomy(spec)}   # team.autonomy: supervised | standard | autonomous 
 # --- Roster (agent names = role names; start one agent per role) ---
 BUILD_AGENTS="{build_names}"
 EVAL_AGENTS="{eval_names}"
-HEARTBEAT_MODE={team.get('heartbeat_mode', 'direct-lead')}
-HEARTBEAT_CRON="{team.get('heartbeat_cron', '*/15 * * * *')}"
+HEARTBEAT_MODE={wmode}
+HEARTBEAT_CRON="{hcron}"
 WATCHDOG_CRON="{team.get('watchdog_cron', '*/5 * * * *')}"
 MAX_WIP={team.get('max_wip', 2)}
 {monorepo}"""
@@ -1846,6 +2134,33 @@ def _render_verify_prelude(spec: dict[str, Any], env_vars: str) -> str:
     """verify-factory.sh up to the generated-artifact checks; `env_vars` are the script's optional inputs."""
     proj = spec["project"]
     backlog_check = "" if _vcs_enabled(spec) else 'test -f "$ROOT_DIR/backlog/issues.json"'
+    if not has_eval_project(spec):
+        return f"""#!/usr/bin/env bash
+# End-to-End Infrastructure & L1-L5 Evaluation Oracle Verification Script
+# Generated by scion_factory.py for {proj['name']} ({proj['slug']})
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -f "$ROOT_DIR/config/factory.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/config/factory.env"
+fi
+
+BUILD_PROJECT_SLUG="${{BUILD_PROJECT:-{proj['slug']}}}"
+{env_vars}
+echo "[1/4] Verifying generated factory artifacts for $BUILD_PROJECT_SLUG..."
+test -f "$ROOT_DIR/factory.yaml"
+test -f "$ROOT_DIR/config/firestore/README.md"
+test -f "$ROOT_DIR/config/firestore/firestore.indexes.json"
+test -f "$ROOT_DIR/waves/issues.json"
+test -f "$ROOT_DIR/templates/_shared/agents.md"
+test -f "$ROOT_DIR/knowledge-plane/INDEX.md"
+test -f "$ROOT_DIR/knowledge-plane/kp-check.py"
+{backlog_check}
+echo "  Knowledge plane present. In the build workspace, run: python3 knowledge-plane/kp-check.py"
+"""
 
     return f"""#!/usr/bin/env bash
 # End-to-End Infrastructure & L1-L5 Evaluation Oracle Verification Script
@@ -2078,19 +2393,27 @@ def _render_root_agents_md(spec: dict[str, Any], roster_notes: list[str] | None 
     team = spec["team"]
     l3 = spec["evaluation_pyramid"]["l3_domain_quality"]
     serves = deploy_mode(spec) != "none"
+    has_eval = has_eval_project(spec)
+    wmode = wake_mode(spec)
     # Where each team's work lands: a Cloud Run service, or nothing to deploy (spec §8).
     build_target = f"Cloud Run `{infra['serving_service']}`" if serves else NOTHING_TO_DEPLOY
-    eval_target = (f"Cloud Run `{infra['eval_service']}`" if serves
-                   else "grades the build's code (the L1–L5 code pyramid)")
 
     build_rows = "\n".join(
         f"| `{r['role']}` | `{proj['slug']}` | `{r['harness']}` | `{r['model']}` | {r['responsibility']} |"
         for r in team["build_roles"]
     )
-    eval_rows = "\n".join(
-        f"| `{r['role']}` | `{proj['eval_slug']}` | `{r['harness']}` | `{r['model']}` | {r['responsibility']} |"
-        for r in team["eval_roles"]
-    )
+    eval_section = ""
+    if has_eval:
+        eval_rows = "\n".join(
+            f"| `{r['role']}` | `{proj['eval_slug']}` | `{r['harness']}` | `{r['model']}` | {r['responsibility']} |"
+            for r in (team.get("eval_roles") or [])
+        )
+        eval_section = f"""
+
+### Evaluation Team (`{proj['eval_slug']}`)
+| Role | Project | Harness | Model | Responsibility |
+|------|---------|---------|-------|----------------|
+{eval_rows}"""
     notes_section = ""
     if roster_notes:
         notes_section = "\n### Roster notes\n" + "\n".join(f"- {n}" for n in roster_notes) + (
@@ -2099,19 +2422,37 @@ def _render_root_agents_md(spec: dict[str, Any], roster_notes: list[str] | None 
         )
     vcs = spec.get("vcs") or {}
     if vcs.get("enabled"):
-        vcs_lines = (
-            f"- **Repository:** `{vcs['repo']}`\n"
-            f"- **Build Project (`{proj['slug']}`):** Branch `{vcs['build_branch']}` -> {build_target}\n"
-            f"- **Evaluation Project (`{proj['eval_slug']}`):** Disjoint orphan branch `{vcs['eval_branch']}` -> {eval_target}\n"
-            f"- **PO inbox:** `gh issue list -R {vcs['repo']} --label status:po-decision`; daily digest on the pinned "
-            f"issue \"{_digest_title(spec)}\"; issues labeled `{_factory_label(spec)}`"
-        )
-    else:
+        if has_eval:
+            eval_target = (f"Cloud Run `{infra['eval_service']}`" if serves
+                           else "grades the build's code (the L1–L5 code pyramid)")
+            vcs_lines = (
+                f"- **Repository:** `{vcs['repo']}`\n"
+                f"- **Build Project (`{proj['slug']}`):** Branch `{vcs['build_branch']}` -> {build_target}\n"
+                f"- **Evaluation Project (`{proj['eval_slug']}`):** Disjoint orphan branch `{vcs['eval_branch']}` -> {eval_target}\n"
+                f"- **PO inbox:** `gh issue list -R {vcs['repo']} --label status:po-decision`; daily digest on the pinned "
+                f"issue \"{_digest_title(spec)}\"; issues labeled `{_factory_label(spec)}`"
+            )
+        else:
+            vcs_lines = (
+                f"- **Repository:** `{vcs['repo']}`\n"
+                f"- **Build Project (`{proj['slug']}`):** Branch `{vcs['build_branch']}` -> {build_target} (single-project factory; on-demand evaluation runs in-project)\n"
+                f"- **PO inbox:** `gh issue list -R {vcs['repo']} --label status:po-decision`; daily digest on the pinned "
+                f"issue \"{_digest_title(spec)}\"; issues labeled `{_factory_label(spec)}`"
+            )
+    elif has_eval:
+        eval_target = (f"Cloud Run `{infra['eval_service']}`" if serves
+                       else "grades the build's code (the L1–L5 code pyramid)")
         vcs_lines = (
             "- **Version control:** Not configured yet. Backlog in `backlog/issues.json`; deploys from workspace snapshots. "
             "Run `scion-factory enable-git` and `scripts/enable-git.sh` to add Git later.\n"
             f"- **Build Project (`{proj['slug']}`):** Shared workspace -> {build_target}\n"
             f"- **Evaluation Project (`{proj['eval_slug']}`):** Separate workspace -> {eval_target}"
+        )
+    else:
+        vcs_lines = (
+            "- **Version control:** Not configured yet. Backlog in `backlog/issues.json`; deploys from workspace snapshots. "
+            "Run `scion-factory enable-git` and `scripts/enable-git.sh` to add Git later.\n"
+            f"- **Build Project (`{proj['slug']}`):** Shared workspace -> {build_target} (single-project factory)"
         )
 
     if serves:
@@ -2126,13 +2467,19 @@ def _render_root_agents_md(spec: dict[str, Any], roster_notes: list[str] | None 
     else:
         pyramid = f"## 4. L1–L5 Code Evaluation Pyramid\n{render_code_pyramid(spec)}\n"
 
+    heartbeat_desc = (
+        f"`delta` (zero-LLM K8s delta controller + auto-sleep) + Watchdog (`{team.get('watchdog_cron', '*/5 * * * *')}`)"
+        if wmode == "delta"
+        else f"`{team.get('heartbeat_mode', 'direct-lead')}` (`{team.get('heartbeat_cron', '*/15 * * * *')}`) + Watchdog (`{team.get('watchdog_cron', '*/5 * * * *')}`)"
+    )
+
     return f"""# {proj['name']} — Scion Autonomous Software Factory (`AGENTS.md`)
 
 ## 1. Mission & Architecture
 - **Mission:** {proj['mission']}
 {vcs_lines}
 - **Knowledge Plane:** [`knowledge-plane/INDEX.md`](knowledge-plane/INDEX.md) (copy `knowledge-plane/` to the root of the build workspace)
-- **Heartbeat Mode:** `{team.get('heartbeat_mode', 'direct-lead')}` (`{team.get('heartbeat_cron', '*/15 * * * *')}`) + Watchdog (`{team.get('watchdog_cron', '*/5 * * * *')}`)
+- **Heartbeat Mode:** {heartbeat_desc}
 - **Autonomy:** `{autonomy(spec)}` (what agents decide alone and what waits for the PO: the leads' Decision rights)
 
 ## 2. Build & Verification Commands
@@ -2145,12 +2492,7 @@ def _render_root_agents_md(spec: dict[str, Any], roster_notes: list[str] | None 
 ### Build Team (`{proj['slug']}`)
 | Role | Project | Harness | Model | Responsibility |
 |------|---------|---------|-------|----------------|
-{build_rows}
-
-### Evaluation Team (`{proj['eval_slug']}`)
-| Role | Project | Harness | Model | Responsibility |
-|------|---------|---------|-------|----------------|
-{eval_rows}
+{build_rows}{eval_section}
 {notes_section}
 {pyramid}"""
 
@@ -2289,8 +2631,12 @@ fi
 echo "[2/3] Import the build workspace into $REPO on branch $BUILD_BRANCH"
 import_workspace "$BUILD_WORKSPACE" "$BUILD_BRANCH" "chore: import factory build workspace into Git"
 
-echo "[3/3] Import the evaluation workspace as the orphan branch $EVAL_BRANCH (no shared history)"
-import_workspace "$EVAL_WORKSPACE" "$EVAL_BRANCH" "chore: import factory evaluation workspace into Git"
+if [[ -n "__EVAL_SLUG__" ]]; then
+  echo "[3/3] Import the evaluation workspace as the orphan branch $EVAL_BRANCH (no shared history)"
+  import_workspace "$EVAL_WORKSPACE" "$EVAL_BRANCH" "chore: import factory evaluation workspace into Git"
+else
+  echo "[3/3] Single-project factory: no separate evaluation workspace to import"
+fi
 
 echo "Done. Next: recompile the kit after 'scion-factory enable-git', push the templates, and restart the agents."
 '''
@@ -2298,8 +2644,9 @@ echo "Done. Next: recompile the kit after 'scion-factory enable-git', push the t
 
 def _render_enable_git_sh(spec: dict[str, Any]) -> str:
     proj = spec["project"]
+    eval_slug = str(proj.get("eval_slug") or "")
     return (ENABLE_GIT_SH.replace("__NAME__", proj["name"])
-            .replace("__SLUG__", proj["slug"]).replace("__EVAL_SLUG__", proj["eval_slug"]))
+            .replace("__SLUG__", proj["slug"]).replace("__EVAL_SLUG__", eval_slug))
 
 
 def compile_factory_boilerplate(
@@ -2315,6 +2662,7 @@ def compile_factory_boilerplate(
         raise ValueError(f"FactorySpec is not ready to compile: {readiness['missing_or_weak']}")
     # Older specs and presets get the missing default specialists; the kit's factory.yaml records the full roster.
     spec, roster_notes = normalize_team(spec)
+    has_eval = has_eval_project(spec)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -2349,9 +2697,10 @@ def compile_factory_boilerplate(
     _write("config/firestore/README.md", _render_firestore_contract(spec))
     _write("config/firestore/firestore.indexes.json", json.dumps(FIRESTORE_INDEXES, indent=2) + "\n")
     _write("config/firestore/firestore.rules", FIRESTORE_RULES)
-    # The eval team's Firestore client; refreshed on every compile (it's code, not knowledge).
-    _write("eval-workspace/tools/factory_store.py",
-           (Path(__file__).resolve().parent / "factory_store.py").read_text(), executable=True)
+    if has_eval:
+        # The eval team's Firestore client; refreshed on every compile (it's code, not knowledge).
+        _write("eval-workspace/tools/factory_store.py",
+               (Path(__file__).resolve().parent / "factory_store.py").read_text(), executable=True)
     _write(
         "config/heartbeat-message.txt",
         (
@@ -2365,8 +2714,11 @@ def compile_factory_boilerplate(
     shared_md = _render_shared_agents_md(spec)
     _write("templates/_shared/agents.md", shared_md)
 
-    # 4. Per-role templates for Build and Eval teams
-    for is_eval, role_list in ((False, spec["team"]["build_roles"]), (True, spec["team"]["eval_roles"])):
+    # 4. Per-role templates for Build and (when two-project) Eval teams
+    role_groups: list[tuple[bool, list[dict[str, Any]]]] = [(False, spec["team"]["build_roles"])]
+    if has_eval:
+        role_groups.append((True, spec["team"].get("eval_roles") or []))
+    for is_eval, role_list in role_groups:
         for role_spec in role_list:
             role = role_spec["role"]
             _write(f"templates/{role}/scion-agent.yaml", _render_scion_agent_yaml(role_spec, spec))
@@ -2386,10 +2738,11 @@ def compile_factory_boilerplate(
                     executable=True,
                 )
 
-    # 5. Knowledge plane (seeded once) and evaluation-only golden data notes
+    # 5. Knowledge plane (seeded once) and evaluation-only golden data notes (two-project kits only)
     for rel, content in kp.render_knowledge_plane(spec, git).items():
         _write(rel, content, executable=rel.endswith(".py"), seed_once=True)
-    _write("eval-workspace/golden/README.md", kp.render_eval_golden_readme(spec), seed_once=True)
+    if has_eval:
+        _write("eval-workspace/golden/README.md", kp.render_eval_golden_readme(spec), seed_once=True)
 
     # 6. Waves, backlog & operational scripts (mode-specific; stale scripts from the other mode are removed)
     _write("waves/issues.json", json.dumps(spec["waves"], indent=2) + "\n")
@@ -2538,16 +2891,19 @@ def enable_git(spec_path: str | Path, repo: str, build_branch: str = "main",
     """Switch a FactorySpec to Git mode in place. Recompile the kit afterwards."""
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
         raise ValueError("--repo must be OWNER/NAME")
-    if build_branch == eval_branch:
-        raise ValueError("--eval-branch must differ from --build-branch (orphan branch isolation, L25)")
     spec = load_spec(spec_path)
-    spec["vcs"] = {
+    has_eval = has_eval_project(spec)
+    if has_eval and build_branch == eval_branch:
+        raise ValueError("--eval-branch must differ from --build-branch (orphan branch isolation, L25)")
+    vcs_cfg: dict[str, Any] = {
         "enabled": True,
         "provider": "github",
         "repo": repo,
         "build_branch": build_branch,
-        "eval_branch": eval_branch,
     }
+    if has_eval:
+        vcs_cfg["eval_branch"] = eval_branch
+    spec["vcs"] = vcs_cfg
     save_spec(spec, spec_path)
     return spec
 
@@ -2600,6 +2956,32 @@ def main(argv: list[str] | None = None) -> int:
     p_prov.add_argument("--apply", action="store_true")
     p_prov.add_argument("--go", action="store_true")
     p_prov.add_argument("--json", action="store_true")
+
+    p_gke_up = sub.add_parser("gke-up", help="One-command cold-start GKE Hub setup, kit compile, and factory provisioning")
+    p_gke_up.add_argument("spec_path", type=str, help="Path to factory.yaml")
+    p_gke_up.add_argument("--env", type=str, required=True, help="Path to factory.env (updated in place on --apply)")
+    p_gke_up.add_argument("--kit", type=str, default=None, help="Output directory for compiled kit (default: build/kit-<slug>)")
+    p_gke_up.add_argument("--create-project", action="store_true", help="Create HUB_PROJECT, link billing, and bootstrap VPC/APIs")
+    p_gke_up.add_argument("--scion-repo", type=str, default=None, help="Optional local Scion source checkout")
+    p_gke_up.add_argument("--apply", action="store_true", help="Execute live provisioning (default: dry-run)")
+    p_gke_up.add_argument("--dry-run", action="store_true", help="Run in dry-run mode without mutating cloud state")
+    p_gke_up.add_argument("--go", action="store_true", help="Send initial GO message after provisioning")
+    p_gke_up.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_gke_down = sub.add_parser(
+        "gke-down",
+        help="Archive GKE pod logs/transcripts, write scorecard.json, clean GitHub test artifacts, and optionally delete project",
+    )
+    p_gke_down.add_argument("spec_path", type=str, help="Path to factory.yaml")
+    p_gke_down.add_argument("--env", type=str, required=True, help="Path to factory.env")
+    p_gke_down.add_argument("--backup-root", type=str, default=None, help="Root directory for <project>-<ts> archive")
+    p_gke_down.add_argument("--cleanup-issue-label", type=str, default="", help="Close open GitHub test issues carrying this label")
+    p_gke_down.add_argument("--cleanup-branch", type=str, default="", help="Delete this remote GitHub test branch")
+    p_gke_down.add_argument("--delete-project", action="store_true", help="Delete HUB_PROJECT via gcloud projects delete --quiet")
+    p_gke_down.add_argument("--confirm-project", type=str, default="", help="Confirm deletion of a non-ephemeral HUB_PROJECT")
+    p_gke_down.add_argument("--apply", action="store_true", help="Execute archive, cleanup, and optional project deletion")
+    p_gke_down.add_argument("--dry-run", action="store_true", help="Preview teardown actions without mutating state")
+    p_gke_down.add_argument("--json", action="store_true", help="Output JSON")
 
     p_role = sub.add_parser("add-role", help="Add a library specialist (for example one discovery proposed) to a FactorySpec")
     p_role.add_argument("spec_path", help="Path to factory.yaml")
@@ -2690,6 +3072,57 @@ def main(argv: list[str] | None = None) -> int:
             for p in report["phases"]:
                 print(f"Phase {p['phase']}: {'OK' if p.get('ok') else 'SKIP'}")
         return 0 if report["ok"] else 1
+
+    if args.cmd == "gke-up":
+        import gke_lifecycle
+        eff_apply = bool(args.apply) and not bool(args.dry_run)
+        report = gke_lifecycle.gke_up(
+            args.spec_path,
+            env_file=args.env,
+            kit_dir=args.kit,
+            create_project=args.create_project,
+            scion_repo=args.scion_repo,
+            apply=eff_apply,
+            send_go=args.go,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(
+                f"gke-up ({'apply' if report.get('apply') else 'dry-run'}): ok={report.get('ok')} "
+                f"total={report.get('total_sec')}s (setup={report.get('setup_gke_sec')}s, "
+                f"compile={report.get('compile_sec')}s, provision={report.get('provision_sec')}s)"
+            )
+        return 0 if report.get("ok") else 1
+
+    if args.cmd == "gke-down":
+        import gke_lifecycle
+        eff_apply = bool(args.apply) and not bool(args.dry_run)
+        try:
+            report = gke_lifecycle.gke_down(
+                args.spec_path,
+                env_file=args.env,
+                backup_root=args.backup_root,
+                cleanup_issue_label=args.cleanup_issue_label,
+                cleanup_branch=args.cleanup_branch,
+                delete_project=args.delete_project,
+                confirm_project=args.confirm_project,
+                apply=eff_apply,
+            )
+        except ValueError as err:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(err)}, indent=2))
+            else:
+                print(f"error: {err}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(
+                f"gke-down ({'apply' if report.get('apply') else 'dry-run'}): ok={report.get('ok')} "
+                f"backup_dir={report.get('backup_dir')}"
+            )
+        return 0 if report.get("ok") else 1
 
     if args.cmd == "add-role":
         before = load_spec(args.spec_path)

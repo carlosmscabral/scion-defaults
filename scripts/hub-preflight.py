@@ -40,10 +40,10 @@ def parse_env(text):
 
 
 def merge_projects(current, new):
-    """The projects already covered, then the new ones, without duplicates."""
+    """The projects already covered, then the new ones, without duplicates or built-in 'global'."""
     merged = []
     for slug in list(current) + list(new):
-        if slug and slug not in merged:
+        if slug and slug != "global" and slug not in merged:
             merged.append(slug)
     return merged
 
@@ -141,7 +141,11 @@ def build_api_report(client, po_email, new_projects, images, watchdog_projects, 
         errors.append(f"{po_email} is not a Hub user yet: sign in to the Hub web UI once with that account")
         
     try:
-        existing = [p["slug"] for p in client.list_projects()]
+        existing = [
+            p["slug"]
+            for p in client.list_projects()
+            if isinstance(p, dict) and p.get("slug") and p.get("slug") != "global"
+        ]
     except Exception:
         existing = []
         

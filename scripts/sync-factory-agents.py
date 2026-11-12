@@ -161,11 +161,20 @@ def now():
 
 
 def collect_agent_docs_from_api(client, projects: list[str], api_calls_by_agent: dict[str, int], tool_calls_by_agent: dict[str, int]) -> list[dict]:
+    import hub_client
+
     docs = []
     id_by_slug = {proj["slug"]: proj["id"] for proj in client.list_projects() if proj.get("slug") and proj.get("id")}
     for p in projects:
+        if p == "global":
+            continue
         pid = id_by_slug.get(p, p)
-        agents = client.list_agents(pid)
+        try:
+            agents = client.list_agents(pid)
+        except hub_client.HubAPIError as exc:
+            if exc.status == 403 and len(projects) > 1:
+                continue
+            raise
         names_by_id = {a.get("id"): (a.get("slug") or a.get("name")) for a in agents if a.get("id")}
         for a in agents:
             aid = a.get("id")
@@ -201,7 +210,7 @@ def main():
 
     projects = os.environ.get("FACTORY_PROJECTS") or ",".join(
         p for p in (os.environ.get("BUILD_PROJECT"), os.environ.get("EVAL_PROJECT")) if p)
-    projects = [p.strip() for p in projects.split(",") if p.strip()]
+    projects = [p.strip() for p in projects.split(",") if p.strip() and p.strip() != "global"]
     if not projects:
         sys.exit("set FACTORY_PROJECTS (or BUILD_PROJECT/EVAL_PROJECT)")
     try:

@@ -87,16 +87,22 @@ run() {
 }
 exists() { "$@" >/dev/null 2>&1; }   # read-only describe calls; they also run in DRY_RUN mode
 step() { printf '\n== %s\n' "$*"; }
-# A service account created a moment ago can be missing from IAM for up to a minute ("does not exist"), so IAM
-# bindings retry instead of failing the run (L28).
+# A service account created a moment ago can be missing from IAM for up to a minute ("does not exist", L28), and
+# rapid-fire gcloud IAM reads/writes can hit shared Cloud Resource Manager 1/min rate limits (429 RATE_LIMIT_EXCEEDED)
+# or concurrent policy ETag conflicts (409 ABORTED). Retry across a >60s window instead of failing cold start.
 iam() {
   if [[ "$DRY_RUN" == "1" ]]; then run "$@"; return; fi
-  local attempt err
-  for attempt in 1 2 3 4 5 6; do
+  local attempt err wait_s
+  for attempt in 1 2 3 4 5 6 7 8; do
     if err="$("$@" 2>&1 >/dev/null)"; then return 0; fi
-    grep -q 'does not exist' <<< "$err" && [[ "$attempt" -lt 6 ]] || { echo "$err" >&2; return 1; }
-    echo "  IAM has not seen a new service account yet; retrying in 10s ($attempt/5)" >&2
-    sleep 10
+    if [[ "$attempt" -lt 8 ]] && grep -Eq 'does not exist|RATE_LIMIT_EXCEEDED|RESOURCE_EXHAUSTED|Quota exceeded|status.: 429|concurrent policy changes|ABORTED|UNAVAILABLE|status.: 503' <<< "$err"; then
+      wait_s=$(( attempt * 10 ))
+      echo "  Transient IAM/quota response; retrying in ${wait_s}s ($attempt/7)" >&2
+      sleep "$wait_s"
+      continue
+    fi
+    echo "$err" >&2
+    return 1
   done
 }
 bind_project() { iam gcloud projects add-iam-policy-binding "$P" --member="$1" --role="$2" --condition=None --quiet; }
@@ -146,7 +152,8 @@ echo "sandbox=$P region=$R deployer=$DEPLOYER_SA runtime=$RUNTIME_SA hub_vm_sa=$
 step "1. APIs"
 apis=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com aiplatform.googleapis.com
       iam.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com firestore.googleapis.com
-      storage.googleapis.com logging.googleapis.com serviceusage.googleapis.com)
+      storage.googleapis.com logging.googleapis.com cloudtrace.googleapis.com monitoring.googleapis.com
+      serviceusage.googleapis.com)
 [[ "$with_spanner" == 1 ]] && apis+=(spanner.googleapis.com)
 [[ "$with_bigquery" == 1 ]] && apis+=(bigquery.googleapis.com)
 run gcloud services enable "${apis[@]}" --project="$P"
@@ -317,9 +324,19 @@ if [[ "$IS_GKE_MODE" == 1 ]]; then
     run gcloud iam service-accounts create "$WORKER_SA_NAME" --project="$P" \
       --description="Identity for Scion agents running in GKE" --display-name="Agent Worker"
   fi
-  for role in roles/aiplatform.user roles/datastore.user roles/serviceusage.serviceUsageConsumer; do
+  for role in roles/aiplatform.user roles/datastore.user roles/serviceusage.serviceUsageConsumer roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
     bind_project "serviceAccount:$WORKER_SA" "$role"
   done
+  if [[ -n "${HUB_K8S_NAMESPACE:-}" && -n "${HUB_PROJECT:-}" ]]; then
+    # sciontool PID 1 initializes GCPExporter before the metadata server starts, authenticating via the
+    # pod KSA's Workload Identity GSA (<hub_name>-agent@<hub_project>) rather than WORKER_SA.
+    _hub_agent_sa="${HUB_K8S_NAMESPACE}-agent@${HUB_PROJECT}.iam.gserviceaccount.com"
+    if [[ "$_hub_agent_sa" != "$WORKER_SA" ]] && exists gcloud iam service-accounts describe "$_hub_agent_sa" --project="$HUB_PROJECT"; then
+      for role in roles/logging.logWriter roles/cloudtrace.agent roles/monitoring.metricWriter; do
+        bind_project "serviceAccount:$_hub_agent_sa" "$role"
+      done
+    fi
+  fi
   if [[ -n "${DATA_BUCKET:-}" ]]; then
     iam gcloud storage buckets add-iam-policy-binding "gs://$DATA_BUCKET" --member="serviceAccount:$WORKER_SA" \
       --role=roles/storage.objectAdmin --quiet

@@ -240,3 +240,78 @@ def test_readme_follows_google_dev_style_and_ste100_without_content_loss():
                     f"Broken cross-doc anchor {target!r} in README.md (available in {rel_path}: {sorted(doc_headings)})"
                 )
 
+
+def test_docs_cover_gke_hillclimb_delta_orchestration_and_l34():
+    report_path = ROOT / "docs/gke-hillclimb-report.md"
+    assert report_path.exists(), "docs/gke-hillclimb-report.md must exist"
+    report = report_path.read_text()
+    for needle in (
+        "gke-up",
+        "gke-down",
+        "factory_delta.py",
+        "scion-gke-hc1-",
+        "scion-gke-hc2-",
+        "scion-gke-hc3-",
+        "status:po-decision",
+        "kubectl delete pod",
+    ):
+        assert needle in report, f"missing {needle!r} in docs/gke-hillclimb-report.md"
+
+    lessons = (ROOT / "docs/lessons-learned.md").read_text()
+    assert "## L34." in lessons
+    for needle in ("factory_delta.py", "gke-up", "telemetry.cloud", "10-direct-iap-token"):
+        assert needle in lessons, f"missing {needle!r} in docs/lessons-learned.md"
+
+    gke_runbook = (ROOT / "docs/gke-setup-runbook.md").read_text()
+    for needle in ("gke-up", "gke-down", "factory_delta.py", "SCION_REF", "gke-hillclimb-report.md"):
+        assert needle in gke_runbook, f"missing {needle!r} in docs/gke-setup-runbook.md"
+
+    readme = (ROOT / "README.md").read_text()
+    for needle in (
+        "gke-up",
+        "gke-down",
+        "factory_delta.py",
+        "bananacast-gke.factory.yaml",
+        "docs/gke-hillclimb-report.md",
+        "L34",
+    ):
+        assert needle in readme, f"missing {needle!r} in README.md"
+
+    agents_md = (ROOT / "AGENTS.md").read_text()
+    for needle in ("gke-hillclimb-report.md", "bananacast-gke.factory.yaml", "factory_delta.py", "34 lessons learned"):
+        assert needle in agents_md, f"missing {needle!r} in AGENTS.md"
+
+    leak_re = re.compile(
+        r"scion-gke-hc[123]-(?!a1b2c3|fail00)[0-9a-f]{6}\b|altostrat\.com|\.a\.run\.app",
+        flags=re.IGNORECASE,
+    )
+    for rel in (
+        "docs/gke-hillclimb-report.md",
+        "docs/lessons-learned.md",
+        "docs/gke-setup-runbook.md",
+        "README.md",
+        "AGENTS.md",
+    ):
+        text = (ROOT / rel).read_text()
+        leaks = leak_re.findall(text)
+        assert not leaks, f"found unredacted real identifier in {rel}: {leaks}"
+
+
+def test_public_repo_skills_cover_gcp_gke_reproducibility_without_corp_leaks():
+    corp_re = re.compile(r"\b(cloudtop|jetski|agcis|google3|citc|piper|moma|buganizer|altostrat)\b", flags=re.IGNORECASE)
+    for rel in (
+        "skills/scion-factory-bootstrap/SKILL.md",
+        "skills/clean-room-reproducibility/SKILL.md",
+        "skills/gke-hillclimb-verification/SKILL.md",
+    ):
+        path = ROOT / rel
+        assert path.is_file(), f"missing public repo skill {rel}"
+        text = path.read_text()
+        assert text.startswith("---\nname: "), f"{rel} missing YAML frontmatter"
+        assert "\ndescription:" in text, f"{rel} missing description in frontmatter"
+        corp_hits = corp_re.findall(text)
+        assert not corp_hits, f"public skill {rel} contains Google-corp internal terms: {corp_hits}"
+        assert "\u2014" not in text, f"em-dash found in {rel}"
+
+
+

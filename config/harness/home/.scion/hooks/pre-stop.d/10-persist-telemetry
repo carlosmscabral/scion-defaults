@@ -1,0 +1,53 @@
+#!/bin/sh
+# 10-persist-telemetry — mirror container-local ~/.scion/agent.log and
+# ~/.gemini/**/transcript_full.jsonl onto the durable scratchpad shared-dir
+# before KubernetesRuntime.Stop deletes the agent Pod.
+
+SCRATCHPAD_DIR="${SCION_SCRATCHPAD_DIR:-/scion-volumes/scratchpad}"
+if [ ! -d "$SCRATCHPAD_DIR" ] || [ -z "${HOME:-}" ]; then
+  exit 0
+fi
+
+AGENT_SLUG="${SCION_AGENT_SLUG:-${SCION_AGENT_NAME:-unknown}}"
+POD_NAME="${HOSTNAME:-$(hostname 2>/dev/null || echo pod)}"
+[ -n "$POD_NAME" ] || POD_NAME="pod"
+DEST_ROOT="${SCRATCHPAD_DIR}/.telemetry/${AGENT_SLUG}/${POD_NAME}"
+
+_copy_atomic() {
+  _src="$1"
+  _dst="$2"
+  [ -f "$_src" ] || return 0
+  _dst_dir="$(dirname "$_dst")"
+  mkdir -p "$_dst_dir" 2>/dev/null || return 0
+  if [ -f "$_dst" ]; then
+    _src_sz="$(wc -c < "$_src" 2>/dev/null | tr -d '[:space:]')"
+    _dst_sz="$(wc -c < "$_dst" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$_src_sz" ] && [ -n "$_dst_sz" ] && [ "$_src_sz" -lt "$_dst_sz" ] 2>/dev/null; then
+      return 0
+    fi
+  fi
+  _tmp="${_dst}.$$.tmp"
+  if cp "$_src" "$_tmp" 2>/dev/null; then
+    chmod 600 "$_tmp" 2>/dev/null || true
+    mv -f "$_tmp" "$_dst" 2>/dev/null || rm -f "$_tmp" 2>/dev/null || true
+  else
+    rm -f "$_tmp" 2>/dev/null || true
+  fi
+}
+
+# Current Scion writes ~/agent.log; older builds wrote ~/.scion/agent.log.
+if [ -f "${HOME}/agent.log" ]; then
+  _copy_atomic "${HOME}/agent.log" "${DEST_ROOT}/agent.log"
+else
+  _copy_atomic "${HOME}/.scion/agent.log" "${DEST_ROOT}/agent.log"
+fi
+
+if [ -d "${HOME}/.gemini" ]; then
+  find "${HOME}/.gemini" -type f -name "transcript_full.jsonl" 2>/dev/null | while IFS= read -r _tp; do
+    [ -n "$_tp" ] || continue
+    _rel="${_tp#"${HOME}"/}"
+    _copy_atomic "$_tp" "${DEST_ROOT}/${_rel}"
+  done
+fi
+
+exit 0

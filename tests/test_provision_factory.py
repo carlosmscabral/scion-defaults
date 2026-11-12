@@ -150,7 +150,7 @@ def test_scion_factory_provision_dry_run_and_apply_against_gke_fake_hub(fake_hub
         members = getattr(fake_hub, "project_members", {}).get(pid, [])
         assert any(
             m.get("principalId") == "factory-control@my-sandbox.iam.gserviceaccount.com"
-            and m.get("roleDefinitionId") == "rd-proj-admin"
+            and m.get("roleDefinitionId") == "rd-proj-owner"
             for m in members
         ), members
 
@@ -296,3 +296,273 @@ def test_provision_go_waits_for_tmux_session_before_sending_go_message(fake_hub,
     assert last_exec_idx < msg_idx
 
 
+def _single_project_delta_gke_spec() -> dict:
+    return {
+        "project": {
+            "name": "BananaCast Studio",
+            "slug": "bananacast-hc1",
+            "mission": "Deliver verified multi-app audio/video studio slices with zero idle LLM or pod spend.",
+            "non_goals": [
+                "Never deploy public Cloud Run services during hillclimb code verification runs.",
+                "Never mutate main or factory/main branches.",
+            ],
+        },
+        "vcs": {
+            "enabled": True,
+            "provider": "github",
+            "repo": "example-org/bananacast",
+            "build_branch": "factory/gke-hc1",
+        },
+        "knowledge_plane": {
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "title": "Health & config validation",
+                    "description": "Validate studio configuration and proxy routes deterministically.",
+                    "acceptance": ["Unit and integration suites pass under pytest."],
+                }
+            ],
+            "invariants": [
+                "All API error payloads return structured JSON with an explicit error code.",
+            ],
+            "decisions": [
+                {
+                    "id": "ADR-001",
+                    "title": "In-process ASGI/WSGI verification",
+                    "decision": "Verify Flask and FastAPI endpoints with in-process test clients.",
+                }
+            ],
+        },
+        "stack": {
+            "primary_language": "python",
+            "framework": "flask-fastapi-react",
+            "build_command": "python3 -m compileall -q src",
+            "test_command": "pytest -q",
+            "lint_command": "ruff check src",
+            "port": 8080,
+        },
+        "infrastructure": {
+            "deploy": "none",
+            "runtime": "kubernetes",
+            "runtime_profile": "remote",
+            "cloud_stores": [],
+            "budget_usd": 50,
+        },
+        "team": {
+            "heartbeat_mode": "delta",
+            "max_wip": 2,
+            "autonomy": "standard",
+            "dropped_defaults": [
+                {"role": "researcher", "reason": "Scoped hillclimb tasks require no external research pod."},
+                {"role": "doc-writer", "reason": "Documentation is maintained alongside code slices."},
+                {"role": "investigator", "reason": "Implementer reproduces defects directly in-process."},
+            ],
+            "build_roles": [
+                {
+                    "role": "lead",
+                    "harness": "antigravity",
+                    "model": "Gemini 4 Argon",
+                    "responsibility": "Plans active issues on demand, merges verified issue branches, and stops idle pods.",
+                },
+                {
+                    "role": "backend",
+                    "harness": "antigravity",
+                    "model": "Gemini 4 Argon",
+                    "responsibility": "Implements Python Flask/FastAPI backend features on factory/issue-<N> branches.",
+                },
+                {
+                    "role": "reviewer",
+                    "harness": "antigravity",
+                    "model": "Gemini 4 Argon",
+                    "responsibility": "Audits origin/<build_branch>...origin/factory/issue-<N> diffs and runs tests.",
+                },
+            ],
+        },
+        "evaluation_pyramid": {
+            "l2_contract": {
+                "endpoints": ["/api/health"],
+                "invariants": ["JSON responses include status field"],
+            },
+            "l3_domain_quality": {
+                "primary_metric": "pytest_pass_rate",
+                "target_threshold": 1.0,
+                "probe_description": "Full backend and proxy test suite pass rate.",
+            },
+            "l4_safety_grounding": {
+                "invariants": ["Zero hardcoded credentials"],
+            },
+        },
+        "waves": [
+            {
+                "wave": 1,
+                "title": "Wave 1 — Core Studio Validation",
+                "issues": [
+                    {
+                        "title": "Add structured config validation endpoint",
+                        "owner_role": "backend",
+                        "requirements": ["REQ-001"],
+                        "acceptance_criteria": ["Returns 200 on valid config and 400 JSON error on invalid payload."],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_provision_single_project_delta_creates_one_project_no_schedule_and_enables_delta_cronjob(fake_hub, tmp_path):
+    # Simulate Hub built-in `global` project materialized by `PUT /api/v1/env/*` (scope=hub) during setup-gke-hub.sh:
+    # preflight and provision MUST exclude `global` from FACTORY_PROJECTS so CronJobs never 403 on `/projects/global/agents`.
+    fake_hub.projects_by_slug["global"] = {"id": "uuid-global", "slug": "global", "name": "global"}
+    spec = _single_project_delta_gke_spec()
+    spec_path = tmp_path / "factory.yaml"
+    kit_dir = tmp_path / "kit"
+    scion_factory.save_spec(spec, spec_path)
+    scion_factory.compile_factory_boilerplate(spec, kit_dir)
+    env_file = write_gke_factory_env(tmp_path, fake_hub.url)
+
+    r_apply = subprocess.run(
+        [
+            sys.executable,
+            "scripts/scion_factory.py",
+            "provision",
+            str(spec_path),
+            "--kit",
+            str(kit_dir),
+            "--env",
+            str(env_file),
+            "--apply",
+            "--json",
+        ],
+        cwd=ROOT,
+        env=fake_cli_env(tmp_path, fake_hub.url),
+        capture_output=True,
+        text=True,
+    )
+    assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
+    out = json.loads(r_apply.stdout)
+    assert out["ok"] is True, out
+
+    # 1. Single project ONLY across phases 4-9 (no -eval project, no eval-lead started; built-in `global` untouched)
+    assert set(fake_hub.projects_by_slug) - {"global"} == {"bananacast-hc1"}
+    build_pid = fake_hub.projects_by_slug["bananacast-hc1"]["id"]
+    assert out["factory_projects"] == [build_pid]
+    assert fake_hub.agents_by_project[build_pid] == ["lead"]
+    assert all("eval-lead" not in agents for agents in fake_hub.agents_by_project.values())
+    lead_posts = [
+        json.loads(r["body"].decode("utf-8"))
+        for r in fake_hub.requests
+        if r["method"] == "POST" and r["path"] == f"/api/v1/projects/{build_pid}/agents"
+    ]
+    assert "/scion-volumes/knowledge-plane/INDEX.md" in lead_posts[0]["task"]
+
+    # 2. Cloud telemetry on GKE apply goes into each template's `telemetry:` block (HUB_PROJECT fallback
+    #    to SANDBOX_PROJECT). The Hub env API rejects SCION_* names as reserved (hillclimb Run 1), so
+    #    provisioning must never PUT them.
+    env_put_keys = {
+        req["path"].rsplit("/", 1)[-1]
+        for req in fake_hub.requests
+        if req["method"] == "PUT" and ("/env/" in req["path"])
+    }
+    assert not any(k.startswith("SCION_") for k in env_put_keys), env_put_keys
+    import provision_factory
+    import yaml
+
+    agent_yamls = sorted((kit_dir / "templates").glob("*/scion-agent.yaml"))
+    assert agent_yamls
+    for agent_yaml in agent_yamls:
+        cfg = yaml.safe_load(agent_yaml.read_text())
+        assert cfg["telemetry"] == {
+            "enabled": True,
+            "cloud": {"enabled": True, "provider": "gcp", "gcp_project_id": "my-hub"},
+        }, agent_yaml
+        assert cfg["env"]["GOOGLE_CLOUD_LOCATION"] == "global"
+    # Idempotent: a second pass leaves the files unchanged
+    assert provision_factory._inject_cloud_telemetry(kit_dir / "templates", "my-hub") == []
+    assert fake_hub.server_config["telemetry"] == {
+        "enabled": True,
+        "cloud": {"enabled": True, "provider": "gcp", "gcp_project_id": "my-hub"},
+    }
+
+    # 2b. Vertex AI env the Hub requires before it starts a vertex-ai agent is written at project scope
+    #     by provisioning itself and read back (hillclimb Run 1, fourth attempt: 422 missing_env_vars).
+    project_env = fake_hub.env_vars[("project", build_pid)]
+    assert project_env == {
+        "GOOGLE_CLOUD_PROJECT": "my-hub",
+        "GOOGLE_CLOUD_LOCATION": "global",
+        "GOOGLE_CLOUD_REGION": "global",
+    }
+    env_reads = [r for r in fake_hub.requests if r["method"] == "GET" and r["path"].startswith("/api/v1/env?")]
+    assert any(f"scopeId={build_pid}" in r["path"] for r in env_reads)
+    first_agent_post = next(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "POST" and r["path"] == f"/api/v1/projects/{build_pid}/agents"
+    )
+    last_env_put = max(
+        i for i, r in enumerate(fake_hub.requests)
+        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/GOOGLE_CLOUD_")
+    )
+    assert last_env_put < first_agent_post
+
+    # 3. Delta mode skips Scion LLM schedule creation completely, and starts lead + tmux BEFORE installing K8s CronJobs
+    assert fake_hub.schedules.get(build_pid, []) == []
+    assert not any(r["method"] == "POST" and r["path"].endswith("/schedules") for r in fake_hub.requests)
+    assert fake_hub.exec_commands.get((build_pid, "lead")) == [["tmux", "has-session", "-t", "scion"]]
+
+    # 4. Control plane enables scion-factory-delta CronJob + GitHub auth Secret with exact flags
+    klog_text = (tmp_path / "kubectl.log").read_text()
+    assert '"scion-factory-delta"' in klog_text
+    assert '"scion-factory-github-auth"' in klog_text
+    assert '"name": "GITHUB_REPO", "value": "example-org/bananacast"' in klog_text
+    assert '"name": "ISSUE_LABEL", "value": "factory:bananacast-hc1"' in klog_text
+    assert '"name": "LEAD_SLUG", "value": "lead"' in klog_text
+    assert '"name": "BUILD_BRANCH", "value": "factory/gke-hc1"' in klog_text
+    assert '"name": "RUNTIME_PROFILE", "value": "remote"' in klog_text
+    assert '"name": "FACTORY_PROJECTS", "value": "proj-1,bananacast-hc1"' in klog_text
+    assert '"global,' not in klog_text
+    assert "bananacast-hc1-eval" not in klog_text
+
+
+
+
+
+def test_ensure_vertex_env_fails_fast_when_hub_drops_project_env_and_warns_on_hub_scope_denial(fake_hub):
+    import provision_factory
+    from hub_client import HubClient
+
+    client = HubClient(base_url=fake_hub.url, token="tok-admin")
+
+    # Hub scope refused (caller is not an unscoped admin): project scope still lands, with a warning
+    fake_hub.deny_hub_scope_env = True
+    warnings = provision_factory._ensure_vertex_env(client, ["proj-a"], "my-hub", "global")
+    assert len(warnings) == 3 and all("hub-scope" in w and "403" in w for w in warnings)
+    assert fake_hub.env_vars[("project", "proj-a")]["GOOGLE_CLOUD_LOCATION"] == "global"
+    assert ("hub", "") not in fake_hub.env_vars
+
+    # Hub accepts the write but does not keep it: fail before any agent is started
+    fake_hub.drop_env_writes = True
+    with pytest.raises(RuntimeError, match="missing Vertex AI env.*GOOGLE_CLOUD_PROJECT"):
+        provision_factory._ensure_vertex_env(client, ["proj-b"], "my-hub", "global")
+
+    with pytest.raises(RuntimeError, match="both empty"):
+        provision_factory._ensure_vertex_env(client, ["proj-c"], "", "global")
+
+    fake_hub.deny_admin_server_config = True
+    tel_warns = provision_factory._ensure_hub_cloud_telemetry(client, "my-hub")
+    assert len(tel_warns) == 1 and "403" in tel_warns[0]
+
+
+def test_control_plane_identity_prefers_project_owner_and_falls_back_with_a_named_role():
+    # The control plane execs into agents and deletes them; current Scion reserves both for
+    # project-owner. With project-admin the factory could neither wake lead nor go to sleep
+    # (hillclimb Run 1).
+    import provision_factory
+
+    owner = {"id": "rd-owner", "name": "project-owner"}
+    admin = {"id": "rd-admin", "name": "project-admin"}
+    member = {"id": "rd-member", "name": "project-member"}
+    assert provision_factory._pick_control_plane_role([member, admin, owner]) == ("rd-owner", "project-owner")
+    # Older Hub without an assignable owner role: admin, and the caller records a warning for it
+    assert provision_factory._pick_control_plane_role([member, admin]) == ("rd-admin", "project-admin")
+    assert provision_factory._pick_control_plane_role([member]) == ("rd-member", "project-member")
+    assert provision_factory._pick_control_plane_role([]) == ("", "")
+    assert provision_factory._pick_control_plane_role(["junk", {"name": "no-id"}]) == ("", "")
