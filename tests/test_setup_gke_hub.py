@@ -1447,7 +1447,18 @@ def test_setup_gke_hub_seeds_cloud_telemetry_into_hub_settings_template_idempote
     scion_repo = make_fake_scion_upstream(tmp_path)
     tftpl = scion_repo / "deploy" / "terraform" / "modules" / "hub-cloudrun" / "templates" / "settings.yaml.tftpl"
     tftpl.parent.mkdir(parents=True, exist_ok=True)
-    tftpl.write_text('schema_version: "1"\nimage_registry: ${image_registry}\nactive_profile: remote\n')
+    tftpl.write_text(
+        'schema_version: "1"\n'
+        'image_registry: ${image_registry}\n'
+        'active_profile: remote\n'
+        'server:\n'
+        '  auth:\n'
+        '    transport:\n'
+        '      mode: iap\n'
+        '%{ if iap_oauth_client_id != null ~}\n'
+        '      oidc_audience: ${iap_oauth_client_id}\n'
+        '%{ endif ~}\n'
+    )
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1512,6 +1523,8 @@ def test_setup_gke_hub_seeds_cloud_telemetry_into_hub_settings_template_idempote
     assert rendered.count("\ntelemetry:\n") == 1
     assert "provider: gcp" in rendered
     assert "gcp_project_id: ${project_id}" in rendered
+    assert "oidc_audience: ${coalesce(iap_oauth_client_id, public_url)}" in rendered
+    assert "%{ if iap_oauth_client_id != null ~}" not in rendered
 
 
 def test_setup_gke_hub_patches_iam_sleep_suppresses_scion_base_warning_and_retries_iap_403(fake_hub, tmp_path):

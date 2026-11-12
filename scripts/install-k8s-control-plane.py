@@ -153,7 +153,7 @@ def render_manifests(
     if enable_delta:
         delta_cj = make_cronjob(
             "scion-factory-delta",
-            "*/2 * * * *",
+            "*/1 * * * *",
             ["python3", "/opt/scion-factory/factory_delta.py", "--apply"],
             extra_env=[
                 {"name": "GITHUB_REPO", "value": github_repo},

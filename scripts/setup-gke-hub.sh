@@ -626,12 +626,24 @@ if new not in src and old in src:
 PY
   fi
   if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl" ]]; then
-    # Current Scion ignores template telemetry blocks on Hub dispatch (ptone/scion#4524); only the Hub
-    # settings `telemetry` section reaches runtime brokers and injects SCION_GCP_PROJECT_ID into pods.
+    # 1. Current Scion ignores template telemetry blocks on Hub dispatch (ptone/scion#4524); only the Hub
+    #    settings `telemetry` section reaches runtime brokers and injects SCION_GCP_PROJECT_ID into pods.
+    # 2. On Pass 1 of a fresh GCP project (`iap_oauth_client_id == null`), upstream omits `oidc_audience`,
+    #    which causes `scion server` to exit(1) with `hosted HA deployment requires server.auth.transport.oidc_audience`
+    #    and fails Cloud Run revision 00001 startup probes (Error code 9). Defaulting Pass 1 to `public_url`
+    #    lets revision 00001 pass startup cleanly before Pass 2 binds the discovered Google-managed IAP client ID.
     python3 - "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl" <<'PY'
 import pathlib, re, sys
 p = pathlib.Path(sys.argv[1])
 src = p.read_text()
+old_oidc = (
+    "%{ if iap_oauth_client_id != null ~}\n"
+    "      oidc_audience: ${iap_oauth_client_id}\n"
+    "%{ endif ~}"
+)
+new_oidc = "      oidc_audience: ${coalesce(iap_oauth_client_id, public_url)}"
+if old_oidc in src:
+    src = src.replace(old_oidc, new_oidc, 1)
 if not re.search(r"(?m)^telemetry:\s*$", src):
     block = (
         "\ntelemetry:\n"
@@ -641,7 +653,8 @@ if not re.search(r"(?m)^telemetry:\s*$", src):
         "    provider: gcp\n"
         "    gcp_project_id: ${project_id}\n"
     )
-    p.write_text(src.rstrip("\n") + "\n" + block)
+    src = src.rstrip("\n") + "\n" + block
+p.write_text(src)
 PY
   fi
   if [[ "$DRY_RUN" == "0" && "$APPROVE_APPLY" == 1 && -f "${SCION_REPO}/deploy/terraform/modules/hub-cloudrun/main.tf" ]]; then

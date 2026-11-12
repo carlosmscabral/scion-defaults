@@ -409,7 +409,7 @@ def test_install_k8s_control_plane_enable_delta_renders_cronjob_and_github_secre
     assert "factory_delta.py" in default_cm["data"]
     assert not any(m["kind"] == "CronJob" and m["metadata"]["name"] == "scion-factory-delta" for m in default_manifests)
 
-    # enable_delta=True renders scion-factory-delta CronJob (*/2 * * * *) with expected env + secret ref
+    # enable_delta=True renders scion-factory-delta CronJob (*/1 * * * *) with expected env + secret ref
     manifests = install_k8s.render_manifests(
         namespace="scion-hub-prod",
         hub_url="https://hub.example.com",
@@ -424,7 +424,7 @@ def test_install_k8s_control_plane_enable_delta_renders_cronjob_and_github_secre
         runtime_profile="remote",
     )
     delta_cj = next(m for m in manifests if m["kind"] == "CronJob" and m["metadata"]["name"] == "scion-factory-delta")
-    assert delta_cj["spec"]["schedule"] == "*/2 * * * *"
+    assert delta_cj["spec"]["schedule"] == "*/1 * * * *"
     container = delta_cj["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
     assert container["command"] == ["python3", "/opt/scion-factory/factory_delta.py", "--apply"]
     env_by_name = {e["name"]: e for e in container["env"]}
