@@ -531,13 +531,23 @@ EOF
     CB_SA_PATH="$(gcloud builds get-default-service-account --project="$HUB_PROJECT" --format='value(serviceAccountEmail)' 2>/dev/null || true)"
     CB_SA="${CB_SA_PATH##*/}"
     if [[ -n "$CB_SA" ]]; then
-      gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
-        --member="serviceAccount:${CB_SA}" --role="roles/cloudbuild.builds.builder" --condition=None >/dev/null 2>&1 || \
-      gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
-        --member="serviceAccount:${CB_SA}" --role="roles/cloudbuild.builds.builder" >/dev/null
-      gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
-        --project="$HUB_PROJECT" --location="$REPO_LOC" \
-        --member="serviceAccount:${CB_SA}" --role="roles/artifactregistry.writer" >/dev/null
+      for _cb_try in 1 2 3 4 5 6; do
+        if gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
+          --member="serviceAccount:${CB_SA}" --role="roles/cloudbuild.builds.builder" --condition=None >/dev/null 2>&1 \
+          || gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
+          --member="serviceAccount:${CB_SA}" --role="roles/cloudbuild.builds.builder" >/dev/null 2>&1; then
+          break
+        fi
+        [[ $_cb_try -lt 6 ]] && sleep "${BUILD_POLL_SEC}"
+      done
+      for _ar_try in 1 2 3 4 5 6; do
+        if gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+          --project="$HUB_PROJECT" --location="$REPO_LOC" \
+          --member="serviceAccount:${CB_SA}" --role="roles/artifactregistry.writer" >/dev/null 2>&1; then
+          break
+        fi
+        [[ $_ar_try -lt 6 ]] && sleep "${BUILD_POLL_SEC}"
+      done
     fi
   fi
 else

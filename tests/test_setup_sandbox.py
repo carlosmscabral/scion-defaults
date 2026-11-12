@@ -217,3 +217,36 @@ def test_setup_sandbox_gke_mode_grants_cloud_telemetry_writer_roles(tmp_path):
     calls_ag = (st_ag / "calls").read_text()
     for role in ("roles/logging.logWriter", "roles/cloudtrace.agent", "roles/monitoring.metricWriter"):
         assert f"--member=serviceAccount:scion-prod-agent@hub-proj.iam.gserviceaccount.com --role={role}" in calls_ag
+
+
+def test_setup_sandbox_retries_cloudresourcemanager_429_rate_limit_and_409_aborted(tmp_path):
+    bindir = tmp_path / "bin-429"
+    bindir.mkdir()
+    gcloud_429 = FAKE_GCLOUD.replace(
+        'echo "ERROR: (gcloud.projects.add-iam-policy-binding) INVALID_ARGUMENT: Service account x does not exist." >&2',
+        'echo "ERROR: (gcloud.projects.add-iam-policy-binding) HttpError status: 429 RATE_LIMIT_EXCEEDED RESOURCE_EXHAUSTED Quota exceeded" >&2',
+    )
+    (bindir / "gcloud").write_text(gcloud_429)
+    (bindir / "gcloud").chmod(0o755)
+    (bindir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "sleep").chmod(0o755)
+    (bindir / "kubectl").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "kubectl").chmod(0o755)
+
+    state = tmp_path / "state-429"
+    state.mkdir()
+    env_file = tmp_path / "factory-429.env"
+    env_file.write_text(
+        "AGENT_RUNTIME=kubernetes\nSANDBOX_PROJECT=sandbox\nSANDBOX_REGION=us-east1\n"
+        "HUB_PROJECT=sandbox\nHUB_REGION=us-east1\nHUB_K8S_NAMESPACE=tfha-prod\nDATA_BUCKET=sandbox-data\n"
+    )
+    res = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FACTORY_ENV": str(env_file), "FAKE_STATE": str(state), "DRY_RUN": "0"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "retrying in 10s" in res.stderr
+    assert "done" in res.stdout
+

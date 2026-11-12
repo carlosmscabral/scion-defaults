@@ -87,16 +87,22 @@ run() {
 }
 exists() { "$@" >/dev/null 2>&1; }   # read-only describe calls; they also run in DRY_RUN mode
 step() { printf '\n== %s\n' "$*"; }
-# A service account created a moment ago can be missing from IAM for up to a minute ("does not exist"), so IAM
-# bindings retry instead of failing the run (L28).
+# A service account created a moment ago can be missing from IAM for up to a minute ("does not exist", L28), and
+# rapid-fire gcloud IAM reads/writes can hit shared Cloud Resource Manager 1/min rate limits (429 RATE_LIMIT_EXCEEDED)
+# or concurrent policy ETag conflicts (409 ABORTED). Retry across a >60s window instead of failing cold start.
 iam() {
   if [[ "$DRY_RUN" == "1" ]]; then run "$@"; return; fi
-  local attempt err
-  for attempt in 1 2 3 4 5 6; do
+  local attempt err wait_s
+  for attempt in 1 2 3 4 5 6 7 8; do
     if err="$("$@" 2>&1 >/dev/null)"; then return 0; fi
-    grep -q 'does not exist' <<< "$err" && [[ "$attempt" -lt 6 ]] || { echo "$err" >&2; return 1; }
-    echo "  IAM has not seen a new service account yet; retrying in 10s ($attempt/5)" >&2
-    sleep 10
+    if [[ "$attempt" -lt 8 ]] && grep -Eq 'does not exist|RATE_LIMIT_EXCEEDED|RESOURCE_EXHAUSTED|Quota exceeded|status.: 429|concurrent policy changes|ABORTED|UNAVAILABLE|status.: 503' <<< "$err"; then
+      wait_s=$(( attempt * 10 ))
+      echo "  Transient IAM/quota response; retrying in ${wait_s}s ($attempt/7)" >&2
+      sleep "$wait_s"
+      continue
+    fi
+    echo "$err" >&2
+    return 1
   done
 }
 bind_project() { iam gcloud projects add-iam-policy-binding "$P" --member="$1" --role="$2" --condition=None --quiet; }
