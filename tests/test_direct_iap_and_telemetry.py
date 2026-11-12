@@ -178,7 +178,7 @@ def test_pre_stop_persist_telemetry_hook_and_factory_cd_mirror_logs_and_transcri
                 "h = pathlib.Path(os.environ['HOME']); "
                 "(h / '.scion').mkdir(parents=True, exist_ok=True); "
                 "(h / '.scion' / 'agent.log').write_text('logged before pod deletion\\n'); "
-                "tp = h / '.gemini' / 'jetski' / 'brain' / 'conv-xyz' / '.system_generated' / 'logs' / 'transcript_full.jsonl'; "
+                "tp = h / '.gemini' / 'antigravity-cli' / 'brain' / 'conv-xyz' / '.system_generated' / 'logs' / 'transcript_full.jsonl'; "
                 "tp.parent.mkdir(parents=True, exist_ok=True); "
                 "tp.write_text('{\"type\":\"PLANNER_RESPONSE\",\"output_tokens\":42}\\n')"
             ),
