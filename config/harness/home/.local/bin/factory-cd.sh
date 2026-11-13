@@ -15,21 +15,26 @@
 #
 # Exit codes: 64 FACTORY_SUBDIR is absolute or leaves the repository; 66 the folder does not exist.
 
+# Ensure Vertex AI / Google Cloud SDK quota billing stays pinned to the agent's target project
+# rather than inheriting a shared GKE Autopilot host cluster project.
+if [ -n "${GOOGLE_CLOUD_PROJECT:-}" ] && [ -z "${GOOGLE_CLOUD_QUOTA_PROJECT:-}" ]; then
+  export GOOGLE_CLOUD_QUOTA_PROJECT="${GOOGLE_CLOUD_PROJECT}"
+fi
+
 # Google-managed Cloud Run Direct IAP (369001918367-*) rejects OIDC ID tokens unless a custom OAuth client is
-# manually bound via Console, and instead accepts Service Account OAuth2 access tokens in Proxy-Authorization.
-# gke-metadata-server caches Workload Identity access tokens until 5 minutes before their 60-minute expiry
-# ([T+55m, T+60m)), so poll every 180s (not 25m, which lands at T+25m, T+50m, T+75m and misses [T+55m, T+60m))
-# and rewrite the token files only when the token bytes actually rotate.
+# manually bound via Console, and instead accepts Service Account OAuth2 access tokens (or opt-in IAM signJwt RS256
+# tokens) in Proxy-Authorization. gke-metadata-server caches Workload Identity access tokens until 5 minutes before
+# their 60-minute expiry ([T+55m, T+60m)), so poll every 180s and rewrite the token files only when bytes rotate.
 if [ "${SCION_TRANSPORT_MODE:-}" = "iap" ]; then
   case "${SCION_TRANSPORT_AUDIENCE:-}" in
-    369001918367-*)
+    369001918367-*|direct|sign-jwt|https://*)
       _refresh_direct_iap_token() {
         if [ -x "${HOME}/.scion/hooks/pre-start.d/10-direct-iap-token" ]; then
           "${HOME}/.scion/hooks/pre-start.d/10-direct-iap-token" >/dev/null 2>&1
         else
           command -v python3 >/dev/null 2>&1 || return 1
           python3 - <<'PY' >/dev/null 2>&1
-import json, os, stat, time, urllib.request
+import json, os, stat, time, urllib.parse, urllib.request
 def _write_if_changed(path, content):
     try:
         st = os.lstat(path)
@@ -58,6 +63,23 @@ else:
 bases = [b for b in bases if b]
 scopes = "https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,openid"
 sleep_sec = float(os.environ.get("SCION_IAP_RETRY_SLEEP_SEC", "1.0"))
+hub_url = (os.environ.get("SCION_HUB_ENDPOINT") or os.environ.get("HUB_URL") or "").strip()
+aud_env = (os.environ.get("SCION_TRANSPORT_AUDIENCE") or "").strip()
+want_sign_jwt = (
+    os.environ.get("HUB_DIRECT_IAP_SIGN_JWT", "").strip() == "1"
+    or os.environ.get("SCION_TRANSPORT_TOKEN_TYPE", "").strip() == "sign_jwt"
+    or aud_env.lower() in ("direct", "sign-jwt")
+    or aud_env.startswith("https://")
+    or bool(os.environ.get("SCION_IAMCREDENTIALS_URL", "").strip())
+)
+jwt_aud = ""
+if want_sign_jwt:
+    if aud_env.startswith("https://"):
+        jwt_aud = aud_env if aud_env.endswith("/*") else aud_env.rstrip("/") + "/*"
+    elif hub_url.startswith("https://"):
+        p = urllib.parse.urlparse(hub_url)
+        if p.netloc:
+            jwt_aud = f"https://{p.netloc}/*"
 for base in bases:
     for attempt in range(3):
         try:
@@ -66,11 +88,40 @@ for base in bases:
                 headers={"Metadata-Flavor": "Google"},
             )
             with urllib.request.urlopen(req, timeout=10.0) as resp:
-                tok = (json.loads(resp.read().decode("utf-8", errors="replace")).get("access_token") or "").strip()
-            if tok:
-                _write_if_changed(out1, tok)
-                _write_if_changed(out2, tok)
-                raise SystemExit(0)
+                access_tok = (json.loads(resp.read().decode("utf-8", errors="replace")).get("access_token") or "").strip()
+            if not access_tok:
+                continue
+            if jwt_aud:
+                try:
+                    er = urllib.request.Request(
+                        f"{base}/computeMetadata/v1/instance/service-accounts/default/email",
+                        headers={"Metadata-Flavor": "Google"},
+                    )
+                    with urllib.request.urlopen(er, timeout=5.0) as eresp:
+                        sa_email = eresp.read().decode("utf-8", errors="replace").strip()
+                    if "@" in sa_email:
+                        now = int(time.time())
+                        payload = json.dumps({"iss": sa_email, "sub": sa_email, "aud": jwt_aud, "iat": now, "exp": now + 3600})
+                        iam_base = (os.environ.get("SCION_IAMCREDENTIALS_URL") or "https://iamcredentials.googleapis.com").rstrip("/")
+                        sreq = urllib.request.Request(
+                            f"{iam_base}/v1/projects/-/serviceAccounts/{urllib.parse.quote(sa_email, safe='@.')}:signJwt",
+                            data=json.dumps({"payload": payload}).encode("utf-8"),
+                            headers={"Authorization": f"Bearer {access_tok}", "Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(sreq, timeout=10.0) as sresp:
+                            signed = (json.loads(sresp.read().decode("utf-8", errors="replace")).get("signedJwt") or "").strip()
+                        if signed:
+                            _write_if_changed(out1, signed)
+                            _write_if_changed(out2, signed)
+                            raise SystemExit(0)
+                except SystemExit:
+                    raise
+                except Exception:
+                    pass
+            _write_if_changed(out1, access_tok)
+            _write_if_changed(out2, access_tok)
+            raise SystemExit(0)
         except SystemExit:
             raise
         except Exception:
