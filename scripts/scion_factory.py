@@ -39,6 +39,8 @@ import discovery  # noqa: E402
 import kaizen_policy  # noqa: E402
 import knowledge_plane as kp  # noqa: E402
 import role_library  # noqa: E402
+import sub_coordinator_prompts  # noqa: E402
+import sub_coordinators  # noqa: E402
 import verification_policy  # noqa: E402
 
 
@@ -155,11 +157,14 @@ GRILL_QUESTIONS: list[dict[str, Any]] = [
         "field_path": "team.build_roles / team.eval_roles",
         "question": (
             "Confirm the default roster (lead, backend, reviewer, plus the three default specialists: "
-            "`researcher`, `doc-writer`, `investigator` on build; `eval-lead`, `domain-evaluator` on eval). "
+            "`researcher`, `doc-writer`, `investigator` on build, and `eval-lead`, `domain-evaluator` on eval). "
             "Review each proposed specialist from discovery with its evidence, add confirmed specialists "
             "with `./scripts/scion-factory add-role`, record drops under `team.dropped_defaults` with a reason, "
-            "and confirm cross-family harness/model pairs (`team.verification_policy: cross-family`) plus "
-            "`team.reviewer_replicas` when concurrent WIP is 4 or higher."
+            "confirm cross-family harness/model pairs (`team.verification_policy: cross-family`) plus "
+            "`team.reviewer_replicas` when concurrent WIP is 4 or higher, and decide whether the repository stays "
+            "flat (`lead -> specialists`, default for `< 8` non-lead roles or Single-VM `runtime: docker`) or groups "
+            "`3+` disjoint domains (`8+` active build roles) under optional `sub-coordinator` roles "
+            "(`--role sub-coordinator --as <domain>-sub-coordinator` and `--reports-to`)."
         ),
         "why_we_ask": (
             "Each harness has distinct runtime requirements: OpenCode Gemini 4 Argon "
@@ -688,12 +693,8 @@ def _dropped_defaults(spec: dict[str, Any]) -> set[str]:
 
 
 def _role_kind(role_spec: dict[str, Any]) -> str:
-    """A role's `default_kind`: explicit, else the library's for a library role, else the role name."""
-    role = str(role_spec.get("role", ""))
-    if role_spec.get("default_kind"):
-        return str(role_spec["default_kind"])
-    lib = role_library.ROLES.get(role)
-    return lib["default_kind"] if lib else role
+    """A role's `default_kind`: explicit, else the library's for a library role, else sub-coordinator suffix or role name."""
+    return role_library.resolve_role_kind(role_spec)
 
 
 def normalize_team(spec: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -721,7 +722,10 @@ def normalize_team(spec: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             roster = []
             team[key] = roster
         names = {str(r.get("role")) for r in roster if isinstance(r, dict)}
-        kinds = {_role_kind(r) for r in roster if isinstance(r, dict)}
+        kinds = {
+            _role_kind(r) for r in roster
+            if isinstance(r, dict) and not str(r.get("reports_to") or "").strip()
+        }
         for role in always:
             if role in dropped or role in names or role_library.ROLES[role]["default_kind"] in kinds:
                 continue
@@ -749,16 +753,27 @@ def normalize_team(spec: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return out, notes
 
 
-def add_role(spec_path: str | Path, role: str, team: str | None = None, evidence: list[str] | tuple[str, ...] = ()
-             ) -> dict[str, Any]:
-    """Add a library role (with the evidence discovery found) to a FactorySpec in place. Recompile the kit afterwards.
+def add_role(
+    spec_path: str | Path,
+    role: str,
+    team: str | None = None,
+    evidence: list[str] | tuple[str, ...] = (),
+    *,
+    as_role: str | None = None,
+    reports_to: str | None = None,
+    paths: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Add a library role (optionally aliased via `as_role` or bound via `reports_to`) to a FactorySpec in place.
 
-    Idempotent: a role already in either roster is left as is. Raises ValueError for an unknown role, a bad team, or
-    a role that needs a deployed service when the spec says `infrastructure.deploy: none`.
+    Idempotent: a role slug already in either roster is left as is. Raises ValueError for an unknown library role,
+    an invalid role slug, a bad team, or a role that needs a deployed service when `infrastructure.deploy: none`.
     """
     lib = role_library.ROLES.get(role)
     if lib is None:
         raise ValueError(f"unknown role {role!r}; library roles: {', '.join(sorted(role_library.ROLES))}")
+    target_role = (as_role or role).strip()
+    if not _SLUG_RE.match(target_role):
+        raise ValueError(f"role name {target_role!r} must be a lowercase slug (e.g. backend-sub-coordinator)")
     team_name = team or lib["team"]
     if team_name not in ("build", "eval"):
         raise ValueError(f"--team must be build or eval, not {team_name!r}")
@@ -766,22 +781,60 @@ def add_role(spec_path: str | Path, role: str, team: str | None = None, evidence
     if lib["needs_service"] and deploy_mode(spec) == "none":
         raise ValueError(f"{role} needs a deployed service, but this factory has infrastructure.deploy: none")
     roster_team = spec.setdefault("team", {})
-    existing = [r.get("role") for key in ("build_roles", "eval_roles") for r in (roster_team.get(key) or [])
-                if isinstance(r, dict)]
-    if role in existing:
+    existing_by_name = {
+        str(r.get("role")): r
+        for key in ("build_roles", "eval_roles")
+        for r in (roster_team.get(key) or [])
+        if isinstance(r, dict) and r.get("role")
+    }
+    if target_role in existing_by_name:
+        prev = existing_by_name[target_role]
+        want_parent = (reports_to or "").strip()
+        prev_parent = str(prev.get("reports_to") or "").strip()
+        if _role_kind(prev) != lib["default_kind"]:
+            raise ValueError(
+                f"role {target_role!r} already exists with kind {_role_kind(prev)!r} (cannot alias {role!r})"
+            )
+        if want_parent and want_parent != prev_parent:
+            raise ValueError(
+                f"role {target_role!r} already exists with reports_to={prev_parent!r} (got {want_parent!r})"
+            )
         return spec
-    entry = dict(role_library.library_role_entry(role), default=lib["kind"] == "always")
+    entry = dict(role_library.library_role_entry(role), default=(lib["kind"] == "always" and target_role == role))
+    entry["role"] = target_role
+    if target_role != role or role == "sub-coordinator":
+        entry["default_kind"] = lib["default_kind"]
     if verification_policy.verification_policy_mode(spec) == "cross-family" and lib["default_kind"] in verification_policy.VERIFIER_KINDS:
         opp_h, opp_m = verification_policy.opposing_verifier_pair(spec)
         entry["harness"] = opp_h
         entry["model"] = opp_m
+    if reports_to and reports_to.strip():
+        parent = reports_to.strip()
+        target_list = [r for r in (roster_team.get(f"{team_name}_roles") or []) if isinstance(r, dict)]
+        parent_entry = next((r for r in target_list if str(r.get("role") or "") == parent), None)
+        if parent_entry is None or not sub_coordinators.is_sub_coordinator(parent_entry):
+            raise ValueError(
+                f"--reports-to {parent!r} must reference an existing sub-coordinator role in {team_name}_roles"
+            )
+        if lib["default_kind"] in sub_coordinators.ROOT_ONLY_KINDS or lib["default_kind"] == "sub-coordinator":
+            raise ValueError(f"role {target_role!r} ({lib['default_kind']}) cannot report to a sub-coordinator")
+        entry["reports_to"] = parent
+    if paths:
+        clean_paths = [str(p).strip() for p in paths if str(p).strip()]
+        if clean_paths:
+            default_focus = role_focus(spec, entry)
+            merged_focus: dict[str, list[str]] = {"paths": clean_paths}
+            for fkey in ("commands", "docs"):
+                if default_focus.get(fkey):
+                    merged_focus[fkey] = default_focus[fkey]
+            entry["focus"] = merged_focus
     if evidence:
         entry["evidence"] = [str(e) for e in evidence]
     roster_team.setdefault(f"{team_name}_roles", []).append(entry)
     # Adding a dropped default back undoes the drop.
     if roster_team.get("dropped_defaults"):
         roster_team["dropped_defaults"] = [d for d in roster_team["dropped_defaults"]
-                                           if not (isinstance(d, dict) and d.get("role") == role)]
+                                           if not (isinstance(d, dict) and d.get("role") in (role, target_role))]
     save_spec(spec, spec_path)
     return spec
 
@@ -837,6 +890,8 @@ def _team_readiness(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     div_errors, div_warnings = verification_policy.audit_verification_diversity(spec)
     errors.extend(div_errors)
     warnings.extend(div_warnings)
+    hier_errors, _hier_warnings = sub_coordinators.validate_hierarchy(spec, _team_lead)
+    errors.extend(hier_errors)
     return errors, warnings
 
 
@@ -1450,6 +1505,9 @@ def _render_scion_agent_yaml(role_spec: dict[str, Any], spec: dict[str, Any] | N
         "system_prompt: system-prompt.md",
     ]
     env = [f"  FACTORY_ROLE: \"{role}\""]
+    parent_role = str(role_spec.get("reports_to") or "").strip()
+    if parent_role:
+        env.append(f"  FACTORY_PARENT_ROLE: \"{parent_role}\"")
     if (harness == "opencode" and "vertex" in model.lower()) or (
         harness in ("antigravity", "gemini", "gemini-cli") and "gemini" in model.lower()
     ):
@@ -1495,7 +1553,7 @@ _FOCUS_KEYS = ("paths", "commands", "docs")
 # Every other kind writes (implementer, doc-writer, test-engineer, frontend, migration-specialist, release-manager,
 # deployers, domain-evaluator, and roles outside the library).
 _READ_ONLY_KINDS = frozenset({
-    "reviewer", "researcher", "investigator", "security-auditor", "performance-analyst", "kaizen-analyst",
+    "sub-coordinator", "reviewer", "researcher", "investigator", "security-auditor", "performance-analyst", "kaizen-analyst",
     "contract-tester", "latency-prober", "ui-auditor", "safety-evaluator", "factory-analyst",
     "benchmark-runner", "api-compat-checker", "evaluator",
 })
@@ -1540,7 +1598,10 @@ def _kind_agents(spec: dict[str, Any], team: list[dict[str, Any]]) -> dict[str, 
 
 
 def _kind_agent_slug(spec: dict[str, Any], team: list[dict[str, Any]], kind: str, fallback: str) -> str:
-    """Plain agent slug (without backticks) for the first roster role matching `kind`, else `_agent(spec, fallback)`."""
+    """Plain agent slug (without backticks) for the first root-level role matching `kind`, else any matching role or fallback."""
+    for r in team:
+        if not str(r.get("reports_to") or "").strip() and _role_kind(r) == kind:
+            return _agent(spec, r["role"])
     for r in team:
         if _role_kind(r) == kind:
             return _agent(spec, r["role"])
@@ -1589,9 +1650,12 @@ def _render_role_protocol(spec: dict[str, Any], role_spec: dict[str, Any]) -> st
         vcs = spec.get("vcs") or {}
         bbranch = (vcs.get("build_branch") or "main") if _vcs_enabled(spec) else "the build workspace"
         build_roles = (spec.get("team") or {}).get("build_roles") or []
-        reviewer_slug = _kind_agent_slug(spec, build_roles, "reviewer", "reviewer")
+        lead_role = _team_lead(build_roles, "lead")
+        parent_slug = _agent(spec, sub_coordinators.resolve_parent_role(build_roles, role_spec, lead_role))
+        reviewer_slug = sub_coordinators.subtree_reviewer_slug(spec, build_roles, role_spec, lead_role, _agent)
         protocol = protocol.replace("<build_branch>", bbranch)
         protocol = protocol.replace("<reviewer>", reviewer_slug)
+        protocol = protocol.replace("<parent>", parent_slug)
         protocol = protocol.replace("<agent-slug>", _agent(spec, role_spec["role"]))
     return f"## Role protocol\n{protocol.strip()}\n\n"
 
@@ -1604,15 +1668,18 @@ def _render_focus(spec: dict[str, Any], role_spec: dict[str, Any]) -> str:
 
 
 def _render_sizing(spec: dict[str, Any], team: list[dict[str, Any]], is_eval: bool) -> str:
-    agents = _kind_agents(spec, team)
+    root_role = _team_lead(team, "eval-lead" if is_eval else "lead")
+    root_children = sub_coordinators.direct_children(team, root_role, is_root_lead=True)
+    root_agents = _kind_agents(spec, root_children)
+    agents = sub_coordinators.root_sizing_agents(spec, team, root_role, _agent)
     lines = [f"- {line.format_map(agents)}" for kinds, line in _SIZING_LINES if all(k in agents for k in kinds)]
-    reviewer_pool = [f"`{_agent(spec, r['role'])}`" for r in team if _role_kind(r) == "reviewer"]
+    reviewer_pool = [f"`{_agent(spec, r['role'])}`" for r in root_children if _role_kind(r) == "reviewer"]
     if len(reviewer_pool) >= 2:
         lines.append(
             f"- reviewer pool (M/G/k) → check `scion list` and dispatch one idle reviewer ({', '.join(reviewer_pool)}). "
             "Do not review one diff twice. Require two reviewers only on `P0`, auth, or security slices"
         )
-    reviewers = [agents[k] for k in _PARALLEL_REVIEWER_KINDS if k in agents]
+    reviewers = [root_agents[k] for k in _PARALLEL_REVIEWER_KINDS if k in root_agents]
     if len(reviewer_pool) >= 2 and reviewers:
         reviewers[0] = f"one idle reviewer ({', '.join(reviewer_pool)})"
     if is_eval and not lines and not reviewers:
@@ -1621,13 +1688,18 @@ def _render_sizing(spec: dict[str, Any], team: list[dict[str, Any]], is_eval: bo
             f"{agents.get('reviewer', 'the reviewer')}."
     text = ("## Sizing an issue\nRead the issue and the knowledge plane, then decide who is needed.\n"
             f"{small} Add a teammate when its line applies:\n" + "\n".join(lines) + "\n")
+    subtrees_note = sub_coordinator_prompts.render_root_lead_subtrees_note(
+        spec, team, root_role, _agent, vcs_enabled=_vcs_enabled(spec)
+    )
+    text += subtrees_note
+    relay_clause = " (or a domain sub-coordinator's relayed verdict)" if subtrees_note else ""
     if reviewers:
         if wake_mode(spec) == "delta" and _vcs_enabled(spec):
             bbranch = (spec.get("vcs") or {}).get("build_branch") or "main"
-            text += (f"\nRequire PASS review verdicts from {', '.join(reviewers)} in "
+            text += (f"\nRequire PASS review verdicts from {', '.join(reviewers)}{relay_clause} in "
                      f"`{REPORTS_DIR}/<N>-review.md` before merging `origin/factory/issue-<N>` onto `{bbranch}`.\n")
         else:
-            text += f"\nReview verdicts from {', '.join(reviewers)} before giving the commit slot.\n"
+            text += f"\nReview verdicts from {', '.join(reviewers)}{relay_clause} before giving the commit slot.\n"
         if not is_eval and _vcs_enabled(spec) and reviewer_pool:
             build_branch = (spec.get("vcs") or {}).get("build_branch") or "main"
             text += (
@@ -1717,49 +1789,6 @@ def _render_chain_of_command(
     lead = _agent(spec, lead_role)
     is_delta = wake_mode(spec) == "delta" and _vcs_enabled(spec)
     vcs = spec.get("vcs", {}) or {}
-    if role_spec["role"] != lead_role:
-        if is_delta:
-            my_slug = _agent(spec, role_spec["role"])
-            reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
-            bbranch = vcs.get("build_branch") or "main"
-            kind = _role_kind(role_spec)
-            if kind == "reviewer":
-                return f"""## Chain of command
-- `{lead}` started you on demand. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (and briefs from `{lead}` in `{BRIEFS_DIR}/<issue>-<agent>.md`).
-- Audit `git diff origin/{bbranch}...origin/factory/issue-<N>` and run tests independently without modifying product code.
-- **First `FAIL`:** Message the writer directly (`scion message <writer> "{my_slug} -> <writer>: FAIL issue #<N>: ..."`) so it can push fixes to `origin/factory/issue-<N>` — do **not** wake `{lead}` on the first `FAIL`.
-- **`PASS` (or second `FAIL`):** Write `{REPORTS_DIR}/<N>-review.md` and message `{lead}` once (`scion message {lead} "{my_slug} -> {lead}: <PASS|FAIL> issue #<N> (<sha>): see {REPORTS_DIR}/<N>-review.md"`).
-- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{lead}`'s job.
-- {DURABILITY_RULE}
-
-"""
-            if _role_writes(role_spec) and kind != "deployer":
-                return f"""## Chain of command
-- `{lead}` started you on demand for an active issue. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start.
-- Branch `factory/issue-<N>` from `origin/{bbranch}`, run local tests, commit explicit paths, and push `origin/factory/issue-<N>` directly (never write `.patch` files to `/scion-volumes/scratchpad/patches/`, and never wait on a commit slot).
-- **Direct peer handoff:** Once `origin/factory/issue-<N>` is pushed and green, message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>): brief {BRIEFS_DIR}/<file>"`) without waking `{lead}`. If `{reviewer_slug}` sends a first-attempt `FAIL`, fix it on `factory/issue-<N>`, push, and message `{reviewer_slug}` again; escalate blockers to `{lead}`.
-- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{lead}`'s job.
-- {DURABILITY_RULE}
-
-"""
-            return f"""## Chain of command
-- You report to `{lead}`, who started you on demand. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start, write your structured report under `{REPORTS_DIR}/`, prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment, and send your `PASS`/`FAIL` verdict or findings to `{lead}` with `scion message {lead} "{my_slug} -> {lead}: ..."`.
-- Never start, stop or delete agents: staffing is `{lead}`'s job.
-- {DURABILITY_RULE}
-
-"""
-        return f"""## Chain of command
-- You report to `{lead}`, who started you. Take work from `{lead}` (or the PO), and send every result, blocker and
-  verdict to `{lead}` with `scion message {lead} "<your name> -> {lead}: ..."`.
-- Read the brief file named in the message (`{BRIEFS_DIR}/<issue>-<agent>.md`) before you start:
-  it has the key locations, the deliverables, the acceptance checks and when you are done.
-- When a brief tells you to hand work straight to a teammate, do it and copy `{lead}`.
-- Never start, stop or delete agents: staffing is `{lead}`'s job.
-- {DURABILITY_RULE}
-  The scratchpad lasts as long as the Hub project, but anything the next issue needs goes to the knowledge plane or
-  the repository.
-
-"""
     rt = runtime_mode(spec)
     team_branch = (
         (vcs.get("eval_branch") if (is_eval and has_eval_project(spec)) else vcs.get("build_branch"))
@@ -1768,10 +1797,69 @@ def _render_chain_of_command(
     )
     id_mode = effective_gcp_identity_mode(spec, compile_env)
     omit_vertex_harness_auth = rt == "docker" and id_mode == "assign"
+    if role_spec["role"] != lead_role:
+        if sub_coordinators.is_sub_coordinator(role_spec):
+            return sub_coordinator_prompts.render_sub_coordinator_chain(
+                spec=spec,
+                role_spec=role_spec,
+                team=team,
+                root_lead_slug=lead,
+                agent_fn=_agent,
+                team_branch=team_branch,
+                omit_vertex_harness_auth=omit_vertex_harness_auth,
+                is_delta=is_delta,
+                is_eval=is_eval,
+                vcs_enabled=_vcs_enabled(spec),
+                briefs_dir=BRIEFS_DIR,
+                reports_dir=REPORTS_DIR,
+                durability_rule=DURABILITY_RULE,
+            )
+        parent_role = sub_coordinators.resolve_parent_role(team, role_spec, lead_role)
+        parent_slug = _agent(spec, parent_role)
+        if is_delta:
+            my_slug = _agent(spec, role_spec["role"])
+            reviewer_slug = sub_coordinators.subtree_reviewer_slug(spec, team, role_spec, lead_role, _agent)
+            bbranch = vcs.get("build_branch") or "main"
+            kind = _role_kind(role_spec)
+            if kind == "reviewer":
+                return f"""## Chain of command
+- `{parent_slug}` started you on demand. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (and briefs from `{parent_slug}` in `{BRIEFS_DIR}/<issue>-<agent>.md`).
+- Audit `git diff origin/{bbranch}...origin/factory/issue-<N>` and run tests independently without modifying product code.
+- **First `FAIL`:** Message the writer directly (`scion message <writer> "{my_slug} -> <writer>: FAIL issue #<N>: ..."`) so it can push fixes to `origin/factory/issue-<N>` — do **not** wake `{parent_slug}` on the first `FAIL`.
+- **`PASS` (or second `FAIL`):** Write `{REPORTS_DIR}/<N>-review.md` and message `{parent_slug}` once (`scion message {parent_slug} "{my_slug} -> {parent_slug}: <PASS|FAIL> issue #<N> (<sha>): see {REPORTS_DIR}/<N>-review.md"`).
+- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{parent_slug}`'s job.
+- {DURABILITY_RULE}
+
+"""
+            if _role_writes(role_spec) and kind != "deployer":
+                return f"""## Chain of command
+- `{parent_slug}` started you on demand for an active issue. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start.
+- Branch `factory/issue-<N>` from `origin/{bbranch}`, run local tests, commit explicit paths, and push `origin/factory/issue-<N>` directly (never write `.patch` files to `/scion-volumes/scratchpad/patches/`, and never wait on a commit slot).
+- **Direct peer handoff:** Once `origin/factory/issue-<N>` is pushed and green, message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>): brief {BRIEFS_DIR}/<file>"`) without waking `{parent_slug}`. If `{reviewer_slug}` sends a first-attempt `FAIL`, fix it on `factory/issue-<N>`, push, and message `{reviewer_slug}` again. Escalate blockers to `{parent_slug}`.
+- Prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment. Never start, stop or delete agents: staffing is `{parent_slug}`'s job.
+- {DURABILITY_RULE}
+
+"""
+            return f"""## Chain of command
+- You report to `{parent_slug}`, who started you on demand. Read `{BRIEFS_DIR}/<issue>-<agent>.md` before you start, write your structured report under `{REPORTS_DIR}/`, prepend `<!-- scion-agent: {my_slug} -->` to any GitHub comment, and send your `PASS`/`FAIL` verdict or findings to `{parent_slug}` with `scion message {parent_slug} "{my_slug} -> {parent_slug}: ..."`.
+- Never start, stop or delete agents: staffing is `{parent_slug}`'s job.
+- {DURABILITY_RULE}
+
+"""
+        return f"""## Chain of command
+- You report to `{parent_slug}`, who started you. Take work from `{parent_slug}` (or the PO), and send every result, blocker and
+  verdict to `{parent_slug}` with `scion message {parent_slug} "<your name> -> {parent_slug}: ..."`.
+- Read the brief file named in the message (`{BRIEFS_DIR}/<issue>-<agent>.md`) before you start:
+  it has the key locations, the deliverables, the acceptance checks and when you are done.
+- When a brief tells you to hand work straight to a teammate, do it and copy `{parent_slug}`.
+- Never start, stop or delete agents: staffing is `{parent_slug}`'s job.
+- {DURABILITY_RULE}
+  The scratchpad lasts as long as the Hub project, but anything the next issue needs goes to the knowledge plane or
+  the repository.
+
+"""
     rows = []
-    for r in team:
-        if r["role"] == lead_role:
-            continue
+    for r in sub_coordinators.direct_children(team, lead_role, is_root_lead=True):
         cmd = f'scion start {_agent(spec, r["role"])} -t {r["role"]}'
         if team_branch:
             cmd += f" -b {team_branch}"
@@ -1800,7 +1888,7 @@ You lead this team in ephemeral delta mode: the K8s delta controller (`scion-fac
 {table}
 
 - **On-demand staffing only (never pre-start unused roles):** Start **only** the specialists required by active issues (for example the assigned writer and `{reviewer_slug}`, or `evaluator` when running L1–L5 verification). Never pre-start unused roles when no active issue needs them; `scion resume <name>` a stopped specialist when assigning new work, and `scion resume --force <name>` one in `error`/`halted`.{sa_note}
-- **Merge verified branches & retire idle pods:** After `{reviewer_slug}` writes `{REPORTS_DIR}/<N>-review.md` with `PASS`, merge or fast-forward `origin/factory/issue-<N>` onto `{bbranch}`, push `origin/{bbranch}`, delete remote `factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), persist state in `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists immediately with `scion stop <agent>`.
+- **Merge verified branches & retire idle pods:** After `{reviewer_slug}` (or a domain sub-coordinator relaying `{REPORTS_DIR}/<N>-review.md`) reports `PASS`, merge or fast-forward `origin/factory/issue-<N>` onto `{bbranch}`, push `origin/{bbranch}`, delete remote `factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), persist state in `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists immediately with `scion stop <agent>` (never stop a sub-coordinator while any of its subtree children is still running).
 - **Ignore bare `state-change` (`COMPLETED`) events:** If woken solely by a bare system `state-change` (`COMPLETED`) notification with no `DELTA:` payload or actionable peer message, run **zero** shell commands and exit immediately via `sciontool status task_completed "ignored bare state-change"`.
 
 {_render_sizing(spec, team, is_eval)}{_render_briefs(spec, team, lead)}{_render_human_on_the_loop(spec, lead, is_eval)}"""
@@ -2039,6 +2127,9 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
     team = (spec["team"].get("eval_roles") or []) if is_eval else spec["team"]["build_roles"]
     lead_role = _team_lead(team, "eval-lead" if is_eval else "lead")
     lead = _agent(spec, lead_role)
+    parent_role = sub_coordinators.resolve_parent_role(team, role_spec, lead_role)
+    parent_slug = _agent(spec, parent_role)
+    slot_via = f" (requested on your behalf by `{parent_slug}`)" if parent_role != lead_role else ""
     has_firestore = "firestore" in [str(db).lower() for db in spec.get("infrastructure", {}).get("databases", [])]
 
     if _vcs_enabled(spec):
@@ -2053,7 +2144,7 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
             intake = f"inspect GitHub issues in `{vcs['repo']}` (`gh issue list -R {vcs['repo']} --label status:ready`)"
         slot = "commit slot"
         write_step = (f"Verify your work with `{stack['test_command']}`,\n   then commit and push on branch `{branch}` "
-                      f"only when `{lead}` gives you the commit slot.")
+                      f"only when `{lead}` gives you the commit slot{slot_via}.")
     else:
         location = "Shared Hub project workspace `/workspace`, no version control"
         if is_eval:
@@ -2065,13 +2156,13 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
             intake = "read `/workspace/backlog/issues.json` (only the lead edits it)"
         slot = "edit slot"
         write_step = (f"Verify your work with `{stack['test_command']}`,\n   and change files in `/workspace` only while "
-                      f"`{lead}` gives you the edit slot.")
+                      f"`{lead}` gives you the edit slot{slot_via}.")
     # Leads keep backlog intake and orchestration and never implement; team members take work only from the brief
     # named in their lead's message and report only to their lead (or direct writer -> reviewer handoff in delta mode).
     if is_delta and _vcs_enabled(spec):
         repo = vcs["repo"]
         my_slug = _agent(spec, role)
-        reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
+        reviewer_slug = sub_coordinators.subtree_reviewer_slug(spec, team, role_spec, lead_role, _agent)
         kind = _role_kind(role_spec)
         how = ("as your Role protocol says" if _render_role_protocol(spec, role_spec)
                else "as your Primary Responsibility says")
@@ -2084,31 +2175,42 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
                 "Size active issues, write briefs to `/scion-volumes/scratchpad/briefs/<N>-<agent>.md`, update "
                 "`/scion-volumes/scratchpad/STATE.json`, and start **only** the specialists required by active issues "
                 "(never pre-starting unused roles, and never implementing product code yourself).",
-                f"When `{reviewer_slug}` reports `PASS` (`{REPORTS_DIR}/<N>-review.md`), merge `origin/factory/issue-<N>` "
+                f"When `{reviewer_slug}` (or a domain sub-coordinator relaying `{REPORTS_DIR}/<N>-review.md`) reports `PASS`, merge `origin/factory/issue-<N>` "
                 f"onto `{branch}`, verify `{stack['test_command']}`, push `origin/{branch}`, delete remote "
                 "`factory/issue-<N>` (`git push origin --delete factory/issue-<N>`), update `/scion-volumes/scratchpad/STATE.json`, "
-                "and stop idle specialists with `scion stop <agent>`.",
+                "and stop idle specialists with `scion stop <agent>` (never stop a sub-coordinator while any of its subtree children is running).",
                 f"Prepend `<!-- scion-agent: {lead} -->` to every GitHub comment (always commenting *before* adding "
                 "`status:po-decision`).",
             ]
             loop = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        elif sub_coordinators.is_sub_coordinator(role_spec):
+            loop = sub_coordinator_prompts.render_sub_coordinator_loop(
+                root_lead_slug=lead,
+                my_slug=my_slug,
+                kp_ref=kp_ref,
+                test_command=stack["test_command"],
+                briefs_dir=BRIEFS_DIR,
+                reports_dir=REPORTS_DIR,
+                is_delta=True,
+                vcs_enabled=True,
+            )
         elif kind == "reviewer":
             loop = f"""1. Accept review handoffs directly from a writer on `origin/factory/issue-<N>` (or a brief in `{BRIEFS_DIR}/<N>-{my_slug}.md`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress review assignment on `origin/factory/issue-<N>` before going idle.
 2. Read {kp_ref}, fetch `origin/{branch}` and `origin/factory/issue-<N>`, inspect `git diff origin/{branch}...origin/factory/issue-<N>`, and run `{stack['test_command']}` independently (never change product code).
-3. On the first `FAIL`, message the writer directly with concrete `file:line` fixes (`{lead}` is NOT woken).
-4. On `PASS` (or second `FAIL`), write `{REPORTS_DIR}/<N>-review.md` and wake `{lead}` once with the verdict and commit SHA."""
+3. On the first `FAIL`, message the writer directly with concrete `file:line` fixes (`{parent_slug}` is NOT woken).
+4. On `PASS` (or second `FAIL`), write `{REPORTS_DIR}/<N>-review.md` and wake `{parent_slug}` once with the verdict and commit SHA."""
         elif _role_writes(role_spec) and kind != "deployer":
-            loop = f"""1. Take work from the brief file named in `{lead}`'s message (or a first-attempt `FAIL` fix request from `{reviewer_slug}`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+            loop = f"""1. Take work from the brief file named in `{parent_slug}`'s message (or a first-attempt `FAIL` fix request from `{reviewer_slug}`); if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
 2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Branch `factory/issue-<N>` from `origin/{branch}` (`git fetch origin {branch} && git checkout -B factory/issue-<N> origin/{branch}`) and implement your changes {how}, honoring `agents.md`.
 4. Verify locally with `{stack['build_command']}` and `{stack['test_command']}`, stage explicit paths (`git add -- <files>`), commit, and push `origin/factory/issue-<N>` directly (no scratchpad `.patch` files, no commit-slot wait).
-5. Message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>)"`) without waking `{lead}`."""
+5. Message `{reviewer_slug}` directly (`scion message {reviewer_slug} "{my_slug} -> {reviewer_slug}: issue #<N> ready on origin/factory/issue-<N> (<sha>)"`) without waking `{parent_slug}`."""
         else:
-            loop = f"""1. Take work from the brief file named in `{lead}`'s message; if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
+            loop = f"""1. Take work from the brief file named in `{parent_slug}`'s message; if woken on a fresh pod with no inline message, check `/scion-volumes/scratchpad/STATE.json` and `/scion-volumes/scratchpad/briefs/*` for an active in-progress assignment on `origin/factory/issue-<N>` before going idle (never pick unassigned work from the backlog yourself).
 2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Do your role {how} on `{branch}`, honoring `agents.md` (never change product code).
 4. Write structured verification output to `{REPORTS_DIR}/<N>-eval.md` (or the report path in your brief) and prepend `<!-- scion-agent: {my_slug} -->` to any GitHub evidence comment.
-5. Report `PASS` or `FAIL` with the report path to `{lead}`."""
+5. Report `PASS` or `FAIL` with the report path to `{parent_slug}`."""
     elif role == lead_role:
         steps = [f"Read incoming `scion message` instructions and {intake}."]
         if _vcs_enabled(spec):
@@ -2130,16 +2232,27 @@ def _render_role_system_prompt_base(spec: dict[str, Any], role_spec: dict[str, A
                 f"and `{_ws(spec)}/knowledge-plane/INDEX.md` at wave close."
             )
         loop = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    elif sub_coordinators.is_sub_coordinator(role_spec):
+        loop = sub_coordinator_prompts.render_sub_coordinator_loop(
+            root_lead_slug=lead,
+            my_slug=_agent(spec, role),
+            kp_ref=kp_ref,
+            test_command=stack["test_command"],
+            briefs_dir=BRIEFS_DIR,
+            reports_dir=REPORTS_DIR,
+            is_delta=False,
+            vcs_enabled=_vcs_enabled(spec),
+        )
     else:
         how = ("as your Role protocol says" if _render_role_protocol(spec, role_spec)
                else "as your Primary Responsibility says")
         result = write_step if _role_writes(role_spec) else (
             "You never change product code: write your result (report, verdict or measurement) where the brief says.")
-        loop = f"""1. Take work only from the brief file named in `{lead}`'s message; never pick work from the backlog yourself.
+        loop = f"""1. Take work only from the brief file named in `{parent_slug}`'s message; never pick work from the backlog yourself.
 2. Read {kp_ref} and the requirements and ADRs that the brief cites.
 3. Do your role {how}, honoring `agents.md`.
 4. {result}
-5. Report the result's path and a one-line result only to `{lead}`."""
+5. Report the result's path and a one-line result only to `{parent_slug}`."""
     last_step = len(re.findall(r"^\d+\. ", loop, re.MULTILINE)) + 1
     factory_data = ""
     if is_eval:
@@ -3285,7 +3398,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_role = sub.add_parser("add-role", help="Add a library specialist (for example one discovery proposed) to a FactorySpec")
     p_role.add_argument("spec_path", help="Path to factory.yaml")
-    p_role.add_argument("--role", required=True, help="Library role, e.g. security-auditor")
+    p_role.add_argument("--role", required=True, help="Library role, e.g. security-auditor or sub-coordinator")
+    p_role.add_argument("--as", dest="as_role", default=None,
+                        help="Optional custom role slug, e.g. backend-sub-coordinator or api-builder")
+    p_role.add_argument("--reports-to", default=None,
+                        help="Optional parent sub-coordinator role slug in the same team")
+    p_role.add_argument("--paths", action="append", default=[],
+                        help="Optional repo-relative focus path for this role (repeatable)")
     p_role.add_argument("--team", choices=("build", "eval"), default=None,
                         help="Roster to add it to (default: the role's team in the library)")
     p_role.add_argument("--evidence", action="append", default=[],
@@ -3492,19 +3611,28 @@ def main(argv: list[str] | None = None) -> int:
         before = load_spec(args.spec_path)
         present = {r.get("role") for key in ("build_roles", "eval_roles")
                    for r in ((before.get("team") or {}).get(key) or []) if isinstance(r, dict)}
+        target_slug = (args.as_role or args.role).strip()
         try:
-            spec = add_role(args.spec_path, args.role, team=args.team, evidence=args.evidence)
+            spec = add_role(
+                args.spec_path,
+                args.role,
+                team=args.team,
+                evidence=args.evidence,
+                as_role=args.as_role,
+                reports_to=args.reports_to,
+                paths=args.paths,
+            )
         except ValueError as err:
             print(f"error: {err}", file=sys.stderr)
             return 2
         team_name = next(t for t in ("build", "eval")
-                         if any(r.get("role") == args.role for r in spec["team"].get(f"{t}_roles") or []))
+                         if any(r.get("role") == target_slug for r in spec["team"].get(f"{t}_roles") or []))
         report = evaluate_spec_readiness(spec)
         print(json.dumps({
             "spec_path": str(args.spec_path),
-            "role": args.role,
+            "role": target_slug,
             "team": team_name,
-            "added": args.role not in present,
+            "added": target_slug not in present,
             "ready": report["ready"],
             "next": "recompile the kit and push the new template",
         }, indent=2))

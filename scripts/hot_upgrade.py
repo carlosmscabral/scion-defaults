@@ -182,6 +182,7 @@ def run_hot_upgrade(
     pending_spawns = [(tpl, ag) for tpl, ag in spawns if ag not in all_agent_slugs]
     skipped_spawns = [ag for _tpl, ag in spawns if ag in all_agent_slugs]
     spawn_commands: list[str] = []
+    commands_by_parent: dict[str, list[str]] = {}
     for tpl, ag in pending_spawns:
         parts = ["scion", "start", ag, "-t", tpl]
         if branch.strip():
@@ -191,21 +192,35 @@ def run_hot_upgrade(
         if harness_auth:
             cmd_str += f" --harness-auth {shlex.quote(harness_auth)}"
         tpl_yaml = templates_dir / tpl / "scion-agent.yaml"
-        if tpl_yaml.exists() and "gcp_identity" in tpl_yaml.read_text(encoding="utf-8"):
+        tpl_text = tpl_yaml.read_text(encoding="utf-8") if tpl_yaml.exists() else ""
+        if "gcp_identity" in tpl_text:
             cmd_str += ' ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}'
+        m_parent = re.search(r'^\s*FACTORY_PARENT_ROLE:\s*"?([a-z0-9-]+)"?', tpl_text, flags=re.MULTILINE)
+        parent_role = m_parent.group(1) if m_parent else ""
+        if parent_role:
+            parent_slug = next(
+                (s for s, rec in running_by_slug.items()
+                 if s == parent_role or str(rec.get("template") or "") == parent_role or s.endswith(f"-{parent_role}")),
+                parent_role,
+            )
+        else:
+            parent_slug = resolved_lead
+        commands_by_parent.setdefault(parent_slug, []).append(cmd_str)
         spawn_commands.append(cmd_str)
 
     lead_notified = False
     if spawn_commands:
-        if resolved_lead not in running_by_slug:
-            raise RuntimeError(f"lead agent {resolved_lead!r} is not running in project {project!r}")
-        if apply:
-            directive = (
-                f"PO -> {resolved_lead}: [HOT-UPGRADE STAFFING] Start new child specialist(s):\n"
-                + "\n".join(f"- `{cmd}`" for cmd in spawn_commands)
-            )
-            client.request("POST", f"/api/v1/projects/{pid}/agents/{resolved_lead}/message", body={"message": directive})
-            lead_notified = True
+        for parent_slug, p_cmds in commands_by_parent.items():
+            if parent_slug not in running_by_slug:
+                label = "lead agent" if parent_slug == resolved_lead else "parent agent"
+                raise RuntimeError(f"{label} {parent_slug!r} is not running in project {project!r}")
+            if apply:
+                directive = (
+                    f"PO -> {parent_slug}: [HOT-UPGRADE STAFFING] Start new child specialist(s):\n"
+                    + "\n".join(f"- `{cmd}`" for cmd in p_cmds)
+                )
+                client.request("POST", f"/api/v1/projects/{pid}/agents/{parent_slug}/message", body={"message": directive})
+                lead_notified = True
 
     return {
         "ok": True, "apply": apply, "project": project, "project_id": pid,

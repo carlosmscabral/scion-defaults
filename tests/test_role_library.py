@@ -76,7 +76,7 @@ def test_library_role_entry_contents():
 def test_role_def_structure_and_counts():
     assert len(role_library.ALWAYS_BUILD) == 6
     assert len(role_library.ALWAYS_EVAL) == 2
-    assert len(role_library.ROLES) == 26
+    assert len(role_library.ROLES) == 27
     for r, d in role_library.ROLES.items():
         assert "team" in d
         assert "kind" in d

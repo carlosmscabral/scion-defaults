@@ -231,7 +231,7 @@ def apply_strict_delegation(spec: dict[str, Any], out_dir: str | Path) -> list[s
         harness = str(role_spec.get("harness") or "")
         if harness != "claude":
             continue
-        if kind not in ("lead", "eval-lead") and role not in ("lead", "eval-lead"):
+        if kind not in ("lead", "eval-lead", "sub-coordinator") and role not in ("lead", "eval-lead") and not role.endswith("-sub-coordinator"):
             continue
 
         rel = f"templates/{role}/home/.claude/settings.json"

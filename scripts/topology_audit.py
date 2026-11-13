@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import scion_factory
+import sub_coordinators
 
 BOTTLENECK_SHARE_THRESHOLD = 0.60
 DOCKER_ROLE_CAP = 10
@@ -81,6 +82,10 @@ def audit(spec: dict[str, Any]) -> dict[str, Any]:
             "into 'domain-evaluator' to prevent host memory exhaustion."
         )
 
+    hier_errors, hier_warnings = sub_coordinators.validate_hierarchy(norm_spec, scion_factory._team_lead)
+    warnings.extend(hier_errors)
+    warnings.extend(hier_warnings)
+
     for role_spec in build_roles + eval_roles:
         if not isinstance(role_spec, dict):
             continue
@@ -125,4 +130,4 @@ def audit(spec: dict[str, Any]) -> dict[str, Any]:
     if cli_tools:
         checklist.append(f"Verify required CLI binaries exist in container PATH: {', '.join(cli_tools)}.")
 
-    return {"ok": True, "errors": [], "warnings": warnings, "checklist": checklist}
+    return {"ok": len(hier_errors) == 0, "errors": hier_errors, "warnings": warnings, "checklist": checklist}

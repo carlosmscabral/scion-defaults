@@ -103,7 +103,14 @@ Work through the team configuration with the human:
    ```
 4. **Autonomy level:** Ask for `team.autonomy`: `standard` (default; agents decide implementation and tell the PO about verified work, while scope, cost, IAM, ADRs, and acceptance wait for the PO), `supervised` (the PO approves the plan on GitHub before implementation starts), or `autonomous` (only cost, IAM, and acceptance wait for the PO).
 5. **Cross-family verification and reviewer capacity:** New drafts set `team.verification_policy: cross-family` so builders and verifiers use distinct model families. Run `./scripts/scion-factory diversify-team factory.yaml` if role edits reintroduce monoculture. If `team.max_wip >= 4`, set `team.reviewer_replicas: 2` to avoid review bottlenecks. Use `team.verification_policy: single-harness` with `team.single_harness_reason` only when the Hub exposes one harness.
-6. **Never invent intent:** Always present candidates and evidence to the human; confirm every specialist addition, default drop, autonomy level, and deploy choice before updating `factory.yaml`.
+6. **Optional domain sub-coordinators (3-tier hierarchy for complex repositories):** Default to the flat 2-tier team (`lead -> specialists`) for small or medium repositories (`< 8` non-lead build roles or Single-VM `runtime: docker`). When the repository spans **3+ disjoint subsystems** (for example `backend`, `data-api`, and `frontend`) and **8+ non-lead build roles** on Kubernetes, offer optional domain `sub-coordinator` roles so Scion's native ancestry tree routes child notifications per domain while `lead` retains sole trunk-merge, deployment, and PO-inbox authority:
+   ```bash
+   ./scripts/scion-factory add-role factory.yaml --role sub-coordinator --as data-api-sub-coordinator --paths services/data-api
+   ./scripts/scion-factory add-role factory.yaml --role backend --as api-builder --reports-to data-api-sub-coordinator --paths services/data-api/api
+   ./scripts/scion-factory add-role factory.yaml --role security-auditor --as iap-security --reports-to data-api-sub-coordinator --paths services/data-api/auth
+   ```
+   Never nest sub-coordinators deeper than 3 tiers (`lead -> sub-coordinator -> specialist`), assign disjoint repo-relative `focus.paths` per sub-coordinator (include `<monorepo.subdir>/...` in monorepos), and keep `deployer`, `evaluator`, and `kaizen-analyst` directly under `lead`.
+7. **Never invent intent:** Present candidates and evidence to the human first. Confirm every specialist addition, sub-coordinator subtree, default drop, autonomy level, and deploy choice before updating `factory.yaml`.
 
 ### Git is optional
 

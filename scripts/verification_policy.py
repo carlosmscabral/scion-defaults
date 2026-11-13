@@ -46,11 +46,7 @@ _STOCK_PAIRS: tuple[tuple[str, str, str], ...] = (
 
 def role_kind(role_spec: dict[str, Any]) -> str:
     """Return the canonical `default_kind` for a roster entry."""
-    if role_spec.get("default_kind"):
-        return str(role_spec["default_kind"])
-    role = str(role_spec.get("role", ""))
-    lib = role_library.ROLES.get(role)
-    return lib["default_kind"] if lib else role
+    return role_library.resolve_role_kind(role_spec)
 
 
 def verification_policy_mode(spec: dict[str, Any]) -> str:
@@ -171,7 +167,10 @@ def expand_reviewer_replicas(spec: dict[str, Any]) -> list[str]:
     if not isinstance(build_roles, list):
         return []
 
-    reviewers = [r for r in build_roles if isinstance(r, dict) and role_kind(r) == "reviewer"]
+    reviewers = [
+        r for r in build_roles
+        if isinstance(r, dict) and role_kind(r) == "reviewer" and not str(r.get("reports_to") or "").strip()
+    ]
     if not reviewers or len(reviewers) >= replicas:
         return []
 
@@ -184,7 +183,10 @@ def expand_reviewer_replicas(spec: dict[str, Any]) -> list[str]:
     ref_families = {infer_model_family(str(b.get("harness", "")), str(b.get("model", ""))) for b in ref}
     base_family = infer_model_family(str(base.get("harness", "")), str(base.get("model", "")))
 
-    insert_at = max(i for i, r in enumerate(build_roles) if isinstance(r, dict) and role_kind(r) == "reviewer") + 1
+    insert_at = max(
+        i for i, r in enumerate(build_roles)
+        if isinstance(r, dict) and role_kind(r) == "reviewer" and not str(r.get("reports_to") or "").strip()
+    ) + 1
     notes: list[str] = []
     idx = 2
     while len(reviewers) < replicas:
@@ -233,7 +235,10 @@ def audit_verification_diversity(spec: dict[str, Any]) -> tuple[list[str], list[
 
     max_wip = team.get("max_wip", 2)
     build_roles = [r for r in (team.get("build_roles") or []) if isinstance(r, dict)]
-    standing_reviewers = [r for r in build_roles if role_kind(r) == "reviewer"]
+    standing_reviewers = [
+        r for r in build_roles
+        if role_kind(r) == "reviewer" and not str(r.get("reports_to") or "").strip()
+    ]
     effective_reviewers = max(len(standing_reviewers), raw_replicas if isinstance(raw_replicas, int) and not isinstance(raw_replicas, bool) else 0)
     if isinstance(max_wip, int) and max_wip >= 4 and effective_reviewers < 2:
         warnings.append(

@@ -207,6 +207,21 @@ Never modify product code or test environments outside the evaluation scope.""",
     # -------------------------------------------------------------------------
     # Build Catalog Roles
     # -------------------------------------------------------------------------
+    "sub-coordinator": {
+        "team": "build",
+        "kind": "catalog",
+        "default_kind": "sub-coordinator",
+        "harness": "antigravity",
+        "model": _DEFAULT_ANTIGRAVITY_MODEL,
+        "responsibility": "Coordinates a domain specialist subtree, decomposes subsystem slices, staffs child builders and auditors, and reports verified domain branches to the root lead.",
+        "needs_service": False,
+        "protocol": """You lead a domain specialist subtree under the root build lead.
+Read the domain brief from your root lead and decompose subsystem work across your assigned domain specialists (`reports_to` children).
+Write file-based briefs under `/scion-volumes/scratchpad/briefs/<issue>-<specialist>.md` and coordinate child specialists within your assigned `Paths in scope`.
+Verify that every child deliverable passes local build, lint, and unit gates and satisfies cited `REQ-` and `ADR-` invariants before reporting upward.
+Escalate cross-domain contract questions, blockers, and verified domain branches to your root lead.
+Never write product code yourself, never merge or grant trunk commit slots, never run deployments, never close issues, and never message the human product owner directly.""",
+    },
     "security-auditor": {
         "team": "build",
         "kind": "catalog",
@@ -505,9 +520,9 @@ _DELTA_PROTOCOLS: dict[str, dict[str, str]] = {
 If woken solely by a bare system `state-change` (`COMPLETED`) notification with no `DELTA:` payload and no actionable peer message, run zero shell commands and conclude your turn immediately.
 Never create Python virtual environments, install language packages, or run product test suites yourself before delegating: write briefs and start required specialists immediately so pods boot in parallel, and let each specialist manage its own container-local `/tmp/.venv`.
 Persist active issue and wave state in `/scion-volumes/scratchpad/STATE.json`, write briefs to `/scion-volumes/scratchpad/briefs/<issue>-<agent>.md`, and start **only** the specialists required by active issues (never pre-starting unused roles).
-When a `DELTA:` wake reports `ABNORMAL_CHILDREN` or `STALLED_WIP`, inspect `scion list`, restart any `stopped`/`error`/`halted` specialist still needed by open `in-progress` issues (`scion start <agent>`), and re-send its brief message.
+When a `DELTA:` wake reports `ABNORMAL_CHILDREN` or `STALLED_WIP`, inspect `scion list`, restart any `stopped`/`error`/`halted` root specialist still needed by open `in-progress` issues (`scion start <agent>`), and re-send its brief message (if the specialist reports to a domain sub-coordinator, message its owning sub-coordinator to restart it rather than running `scion start` yourself).
 When a `DELTA:` wake reports `PO_REPLIES`, read the latest human comment (`gh issue view <N> --comments`), apply the PO decision (recording evidence, removing `status:po-decision` / `status:blocked`, and adding `status:verified` directly when zero code changes are needed, or briefing a specialist otherwise).
-When `<reviewer>` reports `PASS` for `origin/factory/issue-<N>`, merge or fast-forward `origin/factory/issue-<N>` onto `<build_branch>`, push `origin/<build_branch>`, delete remote `factory/issue-<N>`, update `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists with `scion stop <agent>`.
+When `<reviewer>` (or a domain sub-coordinator relaying `/scion-volumes/scratchpad/reports/<N>-review.md`) reports `PASS` for `origin/factory/issue-<N>`, merge or fast-forward `origin/factory/issue-<N>` onto `<build_branch>`, push `origin/<build_branch>`, delete remote `factory/issue-<N>`, update `/scion-volumes/scratchpad/STATE.json`, and stop idle specialists with `scion stop <agent>` (never stop a sub-coordinator while any of its subtree children is still running).
 Prepend `<!-- scion-agent: <agent-slug> -->` to every GitHub comment, and post your escalation comment *before* adding `status:po-decision` through your Decision rights channel.
 If a push is rejected by repository or token scope limits (for example `.github/workflows/*` without `workflow` scope), keep restricted paths in `/scion-volumes/scratchpad/pending-<issue>/`, land permitted paths, and escalate through your Decision rights channel.
 Never write product code yourself.""",
@@ -519,7 +534,7 @@ Follow repository architecture invariants, existing conventions, and test-driven
 In multi-app repositories, guard cross-app or optional-dependency imports in tests (for example `pytest.importorskip(...)`) so primary test collection never fails in minimal per-app environments.
 If a Python test runner or package is missing from `PATH`, create any ephemeral virtual environment in container-local `/tmp/.venv` (`python3 -m venv /tmp/.venv && /tmp/.venv/bin/pip install -q ...`) rather than on NFS `/scion-volumes/scratchpad`.
 Run local verification commands, commit clean explicit paths, and push `origin/factory/issue-<N>` directly (never write scratchpad `.patch` files and never wait for a commit slot).
-Never review your own changes; hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `lead` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
+Never review your own changes. Hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `<parent>` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
         "none": """You implement features, refactorings, and bugfixes for the library or tool on ephemeral branch `factory/issue-<N>` branched from `origin/<build_branch>`.
 Read the brief and relevant investigation or research reports before writing code.
 Follow repository architecture invariants, existing conventions, and test-driven development practices.
@@ -527,22 +542,22 @@ Keep the public API compatible unless the brief calls for a breaking change, and
 In multi-app repositories, guard cross-app or optional-dependency imports in tests (for example `pytest.importorskip(...)`) so primary test collection never fails in minimal per-app environments.
 If a Python test runner or package is missing from `PATH`, create any ephemeral virtual environment in container-local `/tmp/.venv` (`python3 -m venv /tmp/.venv && /tmp/.venv/bin/pip install -q ...`) rather than on NFS `/scion-volumes/scratchpad`.
 Run local verification commands, commit clean explicit paths, and push `origin/factory/issue-<N>` directly (never write scratchpad `.patch` files and never wait for a commit slot).
-Never review your own changes; hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `lead` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
+Never review your own changes. Hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `<parent>` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
     },
     "frontend": {
         "default": """You implement and refine client-side interfaces, web components, frontend layouts, and UI proxy integrations on ephemeral branch `factory/issue-<N>` branched from `origin/<build_branch>`.
 Read the design brief, inspect component hierarchies, and follow design system tokens.
 Build responsive, accessible user interfaces compliant with WCAG accessibility guidelines, and verify client-side interactions and tests locally (placing any ephemeral virtual environment or package cache under `/tmp/.venv`, never on NFS `/scion-volumes/scratchpad`).
 Commit clean explicit paths and push `origin/factory/issue-<N>` directly (never write scratchpad `.patch` files and never wait for a commit slot).
-Hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `lead` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
+Hand off `origin/factory/issue-<N>` directly to `<reviewer>` via `scion message` without waking `<parent>` (and fix any first-attempt `FAIL` directly on `factory/issue-<N>`).""",
     },
     "reviewer": {
         "default": """You review code changes independently against repository invariants, design specifications, and ADRs by auditing `origin/<build_branch>...origin/factory/issue-<N>`.
 Examine the diff thoroughly for ACID transaction safety, edge-case coverage, and regressions, and run local verification commands independently (placing any ephemeral virtual environment under container-local `/tmp/.venv`, never on NFS `/scion-volumes/scratchpad`).
 Verify that tests importing optional or secondary-app packages guard those imports (for example `pytest.importorskip(...)`) so test collection stays green in minimal per-app environments.
-Never fix code yourself; provide actionable `file:line` review feedback only.
-On a first-attempt `FAIL`, message the writer directly so it can fix and re-push `origin/factory/issue-<N>` without waking `lead`.
-On `PASS` (or second `FAIL`), write `/scion-volumes/scratchpad/reports/<N>-review.md` and message `lead` once with the verdict and commit SHA.
+Never fix code yourself. Provide actionable `file:line` review feedback only.
+On a first-attempt `FAIL`, message the writer directly so it can fix and re-push `origin/factory/issue-<N>` without waking `<parent>`.
+On `PASS` (or second `FAIL`), write `/scion-volumes/scratchpad/reports/<N>-review.md` and message `<parent>` once with the verdict and commit SHA.
 When waiting for writer handoffs, finish your turn with `sciontool status task_completed "Awaiting writer handoffs"` (never `sciontool status blocked`).""",
     },
 }
@@ -581,4 +596,20 @@ def library_role_entry(role: str) -> dict[str, Any]:
     }
     if "gcp_identity" in d:
         entry["gcp_identity"] = d["gcp_identity"]
+    if role == "sub-coordinator":
+        entry["default_kind"] = d["default_kind"]
     return entry
+
+
+def resolve_role_kind(role_spec: dict[str, Any]) -> str:
+    """Return the canonical `default_kind` for a team roster entry."""
+    explicit = str(role_spec.get("default_kind") or "").strip()
+    if explicit:
+        return explicit
+    role = str(role_spec.get("role") or "").strip()
+    lib = ROLES.get(role)
+    if lib:
+        return str(lib["default_kind"])
+    if role.endswith("-sub-coordinator"):
+        return "sub-coordinator"
+    return role

@@ -30,6 +30,7 @@ _FALLBACK_KINDS = {
     "deployer": "deployer",
     "release-manager": "release-manager",
     "kaizen-analyst": "kaizen-analyst",
+    "sub-coordinator": "sub-coordinator",
     "eval-lead": "eval-lead",
 }
 
@@ -52,12 +53,15 @@ MAX_ACTIVE_PLAYBOOK_RULES = 15
 
 def _role_kind(role_spec: dict[str, Any]) -> str:
     """Resolve the canonical capability kind for a build or eval role entry."""
+    if role_library is not None and hasattr(role_library, "resolve_role_kind"):
+        return role_library.resolve_role_kind(role_spec)
     explicit = str(role_spec.get("default_kind") or "").strip()
     if explicit:
         return explicit
     role_name = str(role_spec.get("role") or "").strip()
-    lib_def = (role_library.ROLES.get(role_name) or {}) if role_library is not None else {}
-    return str(lib_def.get("default_kind") or _FALLBACK_KINDS.get(role_name) or role_name)
+    if role_name.endswith("-sub-coordinator"):
+        return "sub-coordinator"
+    return str(_FALLBACK_KINDS.get(role_name) or role_name)
 
 
 def _agent_name(spec: dict[str, Any], role: str) -> str:
@@ -82,6 +86,7 @@ def build_kaizen_manifest(spec: dict[str, Any]) -> dict[str, Any]:
     eval_roles = list(team.get("eval_roles") or [])
 
     coordinator = "lead"
+    sub_coords: list[str] = []
     producers: list[str] = []
     automators: list[str] = []
     verifiers: list[str] = []
@@ -92,6 +97,8 @@ def build_kaizen_manifest(spec: dict[str, Any]) -> dict[str, Any]:
         kind = _role_kind(r)
         if idx == 0 or kind in ("lead", "coordinator"):
             coordinator = name
+        elif kind == "sub-coordinator":
+            sub_coords.append(name)
         elif kind in AUTOMATION_KINDS:
             automators.append(name)
         elif kind in VERIFIER_KINDS or "reviewer" in name or "auditor" in name:
@@ -99,8 +106,8 @@ def build_kaizen_manifest(spec: dict[str, Any]) -> dict[str, Any]:
         elif kind in RELEASER_KINDS:
             if deploy != "none":
                 releasers.append(name)
-        elif kind in PRODUCER_KINDS or bool(r.get("writes", kind not in ("researcher", "investigator", "kaizen-analyst"))):
-            if kind not in ("kaizen-analyst", "researcher", "investigator"):
+        elif kind in PRODUCER_KINDS or bool(r.get("writes", kind not in ("researcher", "investigator", "kaizen-analyst", "sub-coordinator"))):
+            if kind not in ("kaizen-analyst", "researcher", "investigator", "sub-coordinator"):
                 producers.append(name)
 
     if not automators:
@@ -134,6 +141,7 @@ def build_kaizen_manifest(spec: dict[str, Any]) -> dict[str, Any]:
         "repo": str(vcs.get("repo") or "") if git_enabled else "",
         "build_branch": str(vcs.get("build_branch") or "main") if git_enabled else "",
         "coordinator_role": coordinator,
+        "sub_coordinator_roles": sub_coords,
         "producer_roles": producers,
         "automation_roles": automators,
         "verifier_roles": verifiers,
