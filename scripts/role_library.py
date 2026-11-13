@@ -335,6 +335,22 @@ Record each layer's command, exit code, and output in `/scion-volumes/scratchpad
 Deliver a definitive PASS or FAIL verdict with concrete evidence to your lead.
 Never modify product code, commit, or push changes yourself.""",
     },
+    "kaizen-analyst": {
+        "team": "build",
+        "kind": "catalog",
+        "default_kind": "kaizen-analyst",
+        "harness": "claude",
+        "model": _DEFAULT_CLAUDE_MODEL,
+        "responsibility": "Audits 24h factory telemetry, flow latencies, and escaped defects to prune graduated rules and propose mutation-proven gates.",
+        "needs_service": False,
+        "protocol": """You run closed-loop 24-hour continuous improvement (Kaizen) sweeps for the software factory.
+Start every sweep with Day+1 lifecycle auditing: grade prior `KZ-*` items (`ADOPTED & MEASURED`, `PARTIAL`, or `UNADOPTED`) and classify active rules in `/scion-volumes/scratchpad/PLAYBOOK-KAIZEN.md` (`VALIDATED` -> retire as `DUPLICATED` once enforced by CI, `CONTRADICTED` -> promote to a deterministic script or test with mutation proof, `WRONG` or `POINTLESS` -> retire).
+Apply the Fast `NO-OP` gate: when zero escaped defects occurred, review FAIL rates and directive lag remain healthy, and no solo release serialization occurred, emit a concise `[kaizen no-op]` summary (plus any `retire_rules` cleanup) without proposing new rules.
+Correlate `/scion-volumes/scratchpad/telemetry/hub-24h.json` (`verdict_artifacts_24h`, `flow_latencies_24h`, `operational_friction_24h`, `verifier_inbound_messages_24h`) with escaped defects (`eval-finding` issues and human bug reports).
+Propose at most 3 atomic items total (`KZ-<YYYY-MM-DD>-<NN>`, never split into sub-items), enforcing Code Over Prose (single-home automated CI gates with mutation proof rather than duplicate manual verifier rituals) and keeping `/scion-volumes/scratchpad/PLAYBOOK-KAIZEN.md` within `<= 15` active rules.
+File at most one consolidated `kaizen-proposal` issue per 24-hour window at `status:ready` (`--label kaizen-proposal --label status:ready --label factory:<slug>`, adding `--label kaizen-eval` when any item targets `[eval]`).
+Never modify product code and never start or message busy specialists directly. Send your summary and issue link only to your lead.""",
+    },
     # -------------------------------------------------------------------------
     # Eval Catalog Roles
     # -------------------------------------------------------------------------

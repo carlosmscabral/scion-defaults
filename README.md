@@ -687,6 +687,7 @@ flowchart TB
 - **Stacked Cloud Trace waterfalls:** [`patches/sciontool-stacked-traces/`](patches/sciontool-stacked-traces/README.md) links each agent turn into a three-level trace waterfall across sessions.
 - **Telegram DM mirror:** [`patches/telegram-dm-mirror/`](patches/telegram-dm-mirror/README.md) shows one DM conversation in web chat and Telegram. It also lets the Telegram plugin work behind IAP.
 - **Five-layer evaluation control tower:** [`scripts/sync-factory-agents.py`](scripts/sync-factory-agents.py) exports agent state and token/tool counters to Firestore every minute, while [`docs/verification-and-eval.md`](docs/verification-and-eval.md) defines the L1–L5 verification pyramid.
+- **Closed-loop 24h Kaizen engine:** [`scripts/hub_telemetry_exporter.py`](scripts/hub_telemetry_exporter.py) and [`scripts/kaizen_watcher.py`](scripts/kaizen_watcher.py) export sanitized telemetry with zero idle LLM calls. They wake `kaizen-analyst` daily and route `status:ready` proposals to both Build and Evaluation leads.
 - **Production safety guardrails:** Orphan-branch evaluation isolation, GKE Workload Identity least-privilege KSAs (`scion-worker` and `scion-deployer`), clean `git archive` Cloud Run rollouts, backups, alerts, and budgets.
 
 ### Reference presets
