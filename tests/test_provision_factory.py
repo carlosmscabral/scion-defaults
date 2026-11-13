@@ -251,8 +251,6 @@ def test_build_project_payload_defaults_per_agent_for_git_and_shared_for_non_git
     assert k8s_payload["workspaceMode"] == "per-agent"
     assert override_payload["workspaceMode"] == "shared"
     assert docker_non_git_payload.get("workspaceMode") is None or docker_non_git_payload.get("workspaceMode") == "shared"
-
-
 def test_single_vm_docker_provision_registers_assign_service_account(fake_hub, tmp_path):
     spec = _starter()
     spec["project"]["slug"] = "vm-app"

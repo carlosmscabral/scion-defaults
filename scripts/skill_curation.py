@@ -14,7 +14,10 @@ import re
 import shutil
 from typing import Any
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 MAX_SKILL_MD_LINES = 300
 MAX_SINGLE_FILE_LINES = 1000
@@ -117,7 +120,15 @@ def audit_bank(bank_dir: str | Path, spec: dict[str, Any] | None = None) -> dict
             report["errors"].append(f"Skill '{skill_name}' is missing YAML frontmatter.")
         else:
             try:
-                fm = yaml.safe_load(fm_match.group(1)) or {}
+                if yaml:
+                    fm = yaml.safe_load(fm_match.group(1)) or {}
+                else:
+                    fm = {}
+                    for fline in fm_match.group(1).splitlines():
+                        if ":" in fline:
+                            k, v = fline.split(":", 1)
+                            fm[k.strip()] = v.strip().strip("'").strip('"').strip('|>')
+                
                 if not isinstance(fm, dict):
                     report["errors"].append(f"Skill '{skill_name}' frontmatter must be a YAML mapping.")
                 else:
@@ -127,7 +138,7 @@ def audit_bank(bank_dir: str | Path, spec: dict[str, Any] | None = None) -> dict
                         )
                     if not str(fm.get("description") or "").strip():
                         report["errors"].append(f"Skill '{skill_name}' frontmatter is missing a description.")
-            except yaml.YAMLError:
+            except Exception:
                 report["errors"].append(f"Skill '{skill_name}' contains invalid YAML frontmatter.")
 
         total_lines = 0

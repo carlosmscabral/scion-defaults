@@ -226,8 +226,10 @@ def _build_project_payload(
         if not git_url.endswith(".git"):
             git_url += ".git"
         branch = _resolve_branch(spec, branch_key, eff_env)
-        default_ws = "per-agent" if runtime == "kubernetes" or vcs_enabled else "shared"
-        ws_mode = eff_env.get("WORKSPACE_MODE", default_ws)
+        # L35: Default to per-agent workspaces whenever Git VCS is enabled to avoid .git/index.lock conflicts
+        # across concurrent Docker containers. Only fallback to shared for local non-Git Docker workflows.
+        default_ws = "per-agent" if (runtime == "kubernetes" or vcs_enabled) else "shared"
+        ws_mode = eff_env.get("WORKSPACE_MODE", "").lower().strip() or default_ws
         body["gitRemote"] = git_url
         body["workspaceMode"] = ws_mode
         body["labels"] = {

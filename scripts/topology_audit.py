@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import scion_factory
+
 BOTTLENECK_SHARE_THRESHOLD = 0.60
 DOCKER_ROLE_CAP = 10
 ROLE_SKILL_CAP = 6
@@ -52,7 +54,8 @@ def audit(spec: dict[str, Any]) -> dict[str, Any]:
     warnings: list[str] = []
     checklist: list[str] = []
 
-    team = spec.get("team") or {}
+    norm_spec = scion_factory.normalize_team(spec)[0] if spec.get("team") else spec
+    team = norm_spec.get("team") or {}
     max_wip = int(team.get("max_wip") or 1)
     waves = _collect_waves(spec)
 
