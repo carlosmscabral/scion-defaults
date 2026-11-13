@@ -13,6 +13,7 @@ Why this module exists:
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 try:
@@ -205,8 +206,58 @@ Propose at most **3 atomic items total** (never split an item into `01a/01b/01c`
 Never modify product code, never self-approve, and never message busy specialists directly. Send your summary only to `{lead}`."""
 
 
+def render_verification_brief_template(spec: dict[str, Any]) -> str:
+    """Render a canonical topology-bound verification brief template.
+
+    If a coordinator session runs across many waves, older briefs in scratchpad or context
+    can reintroduce retired rituals through few-shot imitation. Instantiating verification
+    briefs from this single template keeps review scope fast and deterministic.
+    """
+    m = build_kaizen_manifest(spec)
+    lead = m["coordinator_role"]
+    verifiers = " | ".join(m["verifier_roles"]) or "reviewer"
+    timeout_sec = max(30, int((spec.get("stack") or {}).get("gate_timeout_sec") or 300))
+    gates_cmd = " && ".join(f"timeout {timeout_sec}s sh -c {shlex.quote(g)}" for g in m["executable_gates"])
+    if m["workflow_mode"] == "git_commit_slot":
+        ref_line = (
+            f"Head: origin/<review-branch> @ <SHA>. Base: origin/{m['build_branch']} <BASE_SHA>.\n"
+            f"Issue: `gh issue view <ISSUE> -R {m['repo']}`\n"
+        )
+        scope_check = (
+            f"1. **Ancestor & Path Scope:** Verify `git merge-base --is-ancestor origin/{m['build_branch']} <SHA>` "
+            "and confirm only authorized paths changed (`<= 300` lines per file, ASD-STE100 comments, zero `;` in prose)."
+        )
+        base_falsify = f"`origin/{m['build_branch']}`"
+    else:
+        ref_line = "Item: `<ITEM_ID>` in `/workspace/backlog/issues.json`.\n"
+        scope_check = (
+            "1. **Path Scope & Modularity:** Confirm only authorized paths changed "
+            "(`<= 300` lines per file, ASD-STE100 comments, zero `;` in prose)."
+        )
+        base_falsify = "the pre-change baseline"
+
+    return f"""# Canonical Verification Brief Template (Single-Home Fast Review)
+
+Instantiate every verification brief from this template (`~/review-brief-template.md`). Never copy older `<issue>-review.md` files.
+
+```markdown
+# #<ISSUE> review: <{verifiers}> (from {lead})
+{ref_line}Requirements & ADRs: <REQ-xxx, ADR-xxx>
+
+## Checks
+{scope_check}
+2. **Contract & Sibling Call-Site Audit:** Inspect the diff against cited `REQ-` and `ADR-` invariants and search sibling call sites across the workspace.
+3. **Single-Pass Executable Gate (`1x` only):** Run `{gates_cmd}` once plus `1x` execution of the directly touched test or spec wrapped in `timeout {timeout_sec}s sh -c '<cmd>'`. Never repeat `Nx` flake-hunting loops in review.
+4. **Targeted Falsification Only When Tests Change (`<= 1` check):** If the producer modified a test helper or fixture that grades its own fix, run at most one check against {base_falsify} source to confirm the test fails RED on unfixed code. Never run combinatorial `M1..Mn` mutation matrices.
+5. **Subprocess Hygiene:** Run gates in the foreground with `timeout {timeout_sec}s sh -c '<cmd>'`. Never wait on background jobs with `until` or `while` loops calling `pgrep -f`.
+
+Write `VERDICT: PASS` or `VERDICT: FAIL` with `file:line` evidence and message `{lead}`.
+```
+"""
+
+
 def render_coordinator_kaizen_rubric(spec: dict[str, Any]) -> str:
-    """Render the 3-Axis Kaizen Triage Rubric for the build coordinator."""
+    """Render the 3-Axis Kaizen Triage Rubric and Brief Anchoring rule for the coordinator."""
     m = build_kaizen_manifest(spec)
     verifiers_str = ", ".join(f"`{v}`" for v in m["verifier_roles"]) or "verifier roles"
     batch_clause = (
@@ -219,4 +270,5 @@ Evaluate each `kaizen-proposal` item across three axes before updating `/scion-v
 1. **Premise:** Verify cited counts against `/scion-volumes/scratchpad/reviews/` and trunk history. Reject telemetry artifacts or isolated `N = 1` nits.
 2. **Single-Home (`Code Over Prose`):** Reject any manual ritual on {verifiers_str} that duplicates an executable gate (`{m['executable_gates'][0]}` / test suite), and retire prose rules from `PLAYBOOK-KAIZEN.md` as soon as their automated gate lands on trunk.
 3. **Cycle-Time Cost vs. Milestone Phase:** Reject ceremony that adds disproportionate minutes per slice during polish or pre-milestone windows{batch_clause}.
+4. **Brief Template Anchoring (Anti-Contagion):** Instantiate every verification brief from `~/review-brief-template.md`, never by copying prior `<issue>-review.md` files from scratchpad or earlier conversation turns. When a ritual is retired from `PLAYBOOK-KAIZEN.md`, omit it from all subsequent briefs immediately.
 """

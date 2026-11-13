@@ -806,3 +806,14 @@ fix now lives. Dates are UTC. "Encoded in" points to the script, template rule o
   - [`scripts/hub_telemetry_exporter.py`](../scripts/hub_telemetry_exporter.py) and [`scripts/telemetry_flow_metrics.py`](../scripts/telemetry_flow_metrics.py) export `schema_version: 2` `/scion-volumes/scratchpad/telemetry/hub-24h.json` (reconciling `verdict_artifacts_24h` against `reviews/*.md`, computing `p50`/`p95` `verifier_turnaround_min` and `slot_hold_min`, `landings_per_release` / `solo_release_serialization`, and open `max_unanswered_directive_lag_min` + `phase_drift_agents`).
   - Compiled `kaizen-analyst` and `lead` protocols enforce Day+1 pruning (`VALIDATED -> DUPLICATED` retirement, `CONTRADICTED ->` script/test promotion), a Fast `NO-OP` gate on clean windows, 4 Admission Gates (`<= 3` atomic items, Single-Home `Code Over Prose`, `<= 15` active rule cap in `/scion-volumes/scratchpad/PLAYBOOK-KAIZEN.md`), and a 3-Axis Coordinator Triage Rubric (`Premise`, `Single-Home`, `Cycle-Time Cost vs. Milestone Phase`).
   - [`scripts/kaizen_watcher.py`](../scripts/kaizen_watcher.py) routes `[eval]` items blind-safely to `eval-lead`.
+
+## L40. Blocked-WIP delta stalls, `pgrep -f` polling deadlocks, and brief-template anchoring
+
+- **Observed failure modes:**
+  1. **Running `blocked` specialists missed by delta recovery:** A hung background shell left a running verifier in `blocked` while `factory_delta.py` checked only `stopped_children`.
+  2. **Background `pgrep -f` self-deadlock:** Polling loops running `until ! pgrep -f <script>` inside `sh -c` matched their own parent shell command string forever.
+  3. **In-context few-shot brief contagion:** Long-lived `--continue` coordinators copied `Run 3 times` loops and `M1..Mn` mutation matrices from prior briefs after `PLAYBOOK-KAIZEN.md` retired them.
+- **Guardrails codified:**
+  - [`scripts/factory_delta.py`](../scripts/factory_delta.py) adds per-child `blocked_wip_sec` (`BLOCKED_WIP_TIMEOUT_SEC`, default `900s`, capped at 2 wakes per fingerprint) alongside `stopped_children` recovery.
+  - [`scripts/scion_factory.py`](../scripts/scion_factory.py) wraps verification gates in `timeout <N>s sh -c '<cmd>'`, forbids `pgrep -f` wait loops, and includes Kaizen rubrics on non-Git build leads.
+  - [`scripts/kaizen_policy.py`](../scripts/kaizen_policy.py) emits `templates/<lead>/home/review-brief-template.md` (`~/review-brief-template.md`), and [`scripts/hot_upgrade.py`](../scripts/hot_upgrade.py) adds `--flush-stale-examples`.

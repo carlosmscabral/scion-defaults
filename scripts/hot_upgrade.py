@@ -107,6 +107,7 @@ def run_hot_upgrade(
     roles: list[str] | None = None,
     overwrite_templates: bool = False,
     rule_delta: str = "",
+    flush_stale_examples: bool = False,
     notify_agents: list[str] | None = None,
     spawn_specs: list[tuple[str, str]] | None = None,
     lead_slug: str = "",
@@ -161,20 +162,35 @@ def run_hot_upgrade(
 
     delta_text = rule_delta.strip()
     targets: list[str] = []
-    if delta_text:
+    if delta_text or flush_stale_examples:
         if notify_list:
             missing_running = [a for a in notify_list if a not in running_by_slug]
             if missing_running:
                 raise ValueError(f"requested --notify-agents not running in project {project!r}: {missing_running}")
             targets = list(notify_list)
-        else:
+        elif role_list:
             role_set = set(role_list)
             targets = sorted(
                 slug for slug, rec in running_by_slug.items()
                 if slug in role_set or str(rec.get("template") or "") in role_set
             )
-        if apply:
-            body = {"message": f"[HOT-UPGRADE RULE DELTA] Apply immediately in active and future turns:\n{delta_text}"}
+        else:
+            lead_cand = _resolve_lead_slug(agents, lead_slug)
+            targets = [lead_cand] if lead_cand in running_by_slug else []
+        if apply and targets:
+            parts = []
+            if delta_text:
+                parts.append(f"[HOT-UPGRADE RULE DELTA] Apply immediately in active and future turns:\n{delta_text}")
+            if flush_stale_examples:
+                parts.append(
+                    "[ANTI-CONTAGION BRIEF ANCHOR] Instantiate future verification briefs strictly from "
+                    "~/review-brief-template.md (if present) and /scion-volumes/scratchpad/PLAYBOOK-KAIZEN.md: "
+                    "run touched gates 1x via `timeout 300s sh -c '<cmd>'` (never Nx flake loops), run zero "
+                    "combinatorial M1..Mn mutation matrices, run at most 1 base-branch check only when test helpers "
+                    "changed, and never poll background jobs with `pgrep -f`. Disregard superseded brief formats in "
+                    "earlier conversation turns or older scratchpad briefs."
+                )
+            body = {"message": "\n\n".join(parts)}
             for slug in targets:
                 client.request("POST", f"/api/v1/projects/{pid}/agents/{slug}/message", body=body)
 
@@ -211,6 +227,7 @@ def run_hot_upgrade(
         "ok": True, "apply": apply, "project": project, "project_id": pid,
         "overwrite_templates": overwrite_templates, "templates_pushed": roles_to_push,
         "skipped_existing_templates": skipped_existing, "notified_agents": targets,
+        "flush_stale_examples": bool(flush_stale_examples),
         "lead_agent": resolved_lead if spawn_commands else None, "lead_notified": lead_notified,
         "spawn_commands": spawn_commands, "skipped_existing_agents": skipped_spawns,
     }
@@ -227,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overwrite-templates", action="store_true", help="Overwrite existing Hub templates in --roles")
     parser.add_argument("--rule-delta", default="", help="Live prompt rule delta sent via Hub message")
     parser.add_argument("--rule-delta-file", default="", help="File containing a live prompt rule delta")
+    parser.add_argument("--flush-stale-examples", action="store_true", help="Append anti-contagion brief-template anchor to --rule-delta")
     parser.add_argument("--notify-agents", default="", help="Explicit comma-separated running agents to message")
     parser.add_argument("--spawn", action="append", default=[], help="Specialist to start via lead: template[:agent_name]")
     parser.add_argument("--lead", default="", help="Explicit lead agent slug")
@@ -242,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             env_file=Path(args.env) if args.env else None,
             roles=[r for r in args.roles.split(",") if r.strip()],
             overwrite_templates=bool(args.overwrite_templates and not args.create_only),
-            rule_delta=delta,
+            rule_delta=delta, flush_stale_examples=args.flush_stale_examples,
             notify_agents=[a for a in args.notify_agents.split(",") if a.strip()],
             spawn_specs=parse_spawn_specs(args.spawn), lead_slug=args.lead,
             branch=args.branch, apply=args.apply,

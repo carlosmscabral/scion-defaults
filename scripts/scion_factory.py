@@ -1316,6 +1316,7 @@ Every agent in this Scion software factory MUST follow these operational rules (
 {deploy}
 ## 6. Communication & Turn Completion (Lessons L1, L2, L4, L5)
 - **Verify message delivery (L1, L4):** Always check the exit code and `Message delivered` confirmation of `scion message <recipient> "<msg>"` (printed text in your own output reaches nobody), confirm recipient names reside in the same Scion project, and use `scion message <recipient> --body-file <file>` for long or multi-line messages to avoid shell quoting bugs.
+- **Bounded foreground commands (no `pgrep -f` polling deadlocks):** Wrap build, test, and browser verification commands in an explicit foreground timeout subshell (for example `timeout 300s sh -c '<cmd>'`). Never wait on background jobs with `until` or `while` loops calling `pgrep -f <pattern>`, because `pgrep -f` matches the parent shell command line itself and deadlocks indefinitely.
 - **Signal turn completion (L2, L5):** End every turn by running `sciontool status task_completed "<concise summary with {turn_ref}>"`, `sciontool status blocked "waiting: <what, from whom>"` when waiting on a teammate, or `sciontool status ask_user "<blocker>"` when genuinely blocked on a human.{delta_comm_note}
 {escalation}
 
@@ -1648,6 +1649,11 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
         implementer = agents.get("implementer", "the implementer")
         pre_work = ("- Pre-work comes first. Read\n  " + "\n  or ".join(reports) + "\n"
                     f"  before you brief {implementer}, and put the report's path in its brief.\n")
+    review_tpl_note = (
+        "- Instantiate verification briefs from `~/review-brief-template.md` (`1x` touched gate run via `timeout 300s sh -c '<cmd>'`, zero `M1..Mn` mutation matrices), never by copying older `<issue>-review.md` files.\n"
+        if any(_role_kind(r) in kaizen_policy.VERIFIER_KINDS or "reviewer" in str(r.get("role") or "") for r in team)
+        else ""
+    )
     if wake_mode(spec) == "delta" and _vcs_enabled(spec):
         reviewer_slug = _kind_agent_slug(spec, team, "reviewer", "reviewer")
         return f"""## Briefs
@@ -1657,7 +1663,7 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
 - For writers, name branch `factory/issue-<N>`, the deliverables (exact paths), the acceptance checks, and the direct
   handoff termination line ("Push `origin/factory/issue-<N>` and message `{reviewer_slug}` directly without waking `{lead}`").
   For reviewers and `evaluator`, name `{REPORTS_DIR}/<N>-review.md` (or `<N>-eval.md`) and report to `{lead}` on `PASS` or second `FAIL`.
-{pre_work}
+{review_tpl_note}{pre_work}
 """
     return f"""## Briefs
 - Write each brief to `{BRIEFS_DIR}/<issue>-<agent>.md`, then send
@@ -1665,7 +1671,7 @@ def _render_briefs(spec: dict[str, Any], team: list[dict[str, Any]], lead: str) 
 - Never inline a brief in the message: shell metacharacters and long prompts break.
 - A brief has the key locations, the deliverables (exact paths), the acceptance checks, and a termination line
   ("You MUST … then report to `{lead}`").
-{pre_work}
+{review_tpl_note}{pre_work}
 """
 
 
@@ -1891,7 +1897,13 @@ Autonomy level: `{level}` (`team.autonomy` in factory.yaml; changing it means re
   `scion message user:<PO_USER> "<finding>"`.
 - Never message build agents; the PO decides which findings become backlog items.
 """
-        return rights + "\n"
+            return rights + "\n"
+        kz_suffix = (
+            "\n" + kaizen_policy.render_coordinator_kaizen_rubric(spec)
+            if any(_library_role(r) == "kaizen-analyst" for r in spec.get("team", {}).get("build_roles", []))
+            else ""
+        )
+        return rights + "\n" + kz_suffix
 
     repo = spec["vcs"]["repo"]
     flabel = _factory_label(spec)
@@ -2968,12 +2980,19 @@ def compile_factory_boilerplate(
     # 3. Shared template protocol
     shared_md = _render_shared_agents_md(spec)
     _write("templates/_shared/agents.md", shared_md)
+    review_brief_tpl = kaizen_policy.render_verification_brief_template(spec)
+    _write("templates/_shared/review-brief-template.md", review_brief_tpl)
 
     # 4. Per-role templates for Build and (when two-project) Eval teams
     role_groups: list[tuple[bool, list[dict[str, Any]]]] = [(False, spec["team"]["build_roles"])]
     if has_eval:
         role_groups.append((True, spec["team"].get("eval_roles") or []))
     for is_eval, role_list in role_groups:
+        team_lead_role = _team_lead(role_list, "eval-lead" if is_eval else "lead")
+        team_has_verifier = any(
+            _role_kind(r) in kaizen_policy.VERIFIER_KINDS or "reviewer" in str(r.get("role") or "")
+            for r in role_list
+        )
         for role_spec in role_list:
             role = role_spec["role"]
             _write(f"templates/{role}/scion-agent.yaml", _render_scion_agent_yaml(role_spec, spec))
@@ -2982,6 +3001,8 @@ def compile_factory_boilerplate(
                 _render_role_system_prompt(spec, role_spec, is_eval, compile_env=compile_env),
             )
             _write(f"templates/{role}/agents.md", shared_md)
+            if role == team_lead_role and (not is_eval or team_has_verifier):
+                _write(f"templates/{role}/home/review-brief-template.md", review_brief_tpl)
 
             if role_spec["harness"] == "opencode":
                 _write(
@@ -3303,6 +3324,7 @@ def main(argv: list[str] | None = None) -> int:
     p_hot.add_argument("--overwrite-templates", action="store_true", help="Overwrite existing Hub templates in --roles")
     p_hot.add_argument("--rule-delta", default="", help="Live prompt rule delta sent via Hub message")
     p_hot.add_argument("--rule-delta-file", default="", help="File containing a live prompt rule delta")
+    p_hot.add_argument("--flush-stale-examples", action="store_true", help="Append anti-contagion brief-template anchor to --rule-delta")
     p_hot.add_argument("--notify-agents", default="", help="Explicit comma-separated running agents to message")
     p_hot.add_argument("--spawn", action="append", default=[], help="Specialist to start via lead: template[:agent_name]")
     p_hot.add_argument("--lead", default="", help="Explicit lead agent slug (auto-detected by default)")
@@ -3523,6 +3545,7 @@ def main(argv: list[str] | None = None) -> int:
                 roles=[r for r in args.roles.split(",") if r.strip()],
                 overwrite_templates=bool(args.overwrite_templates and not args.create_only),
                 rule_delta=delta,
+                flush_stale_examples=args.flush_stale_examples,
                 notify_agents=[a for a in args.notify_agents.split(",") if a.strip()],
                 spawn_specs=hot_upgrade.parse_spawn_specs(args.spawn),
                 lead_slug=args.lead,

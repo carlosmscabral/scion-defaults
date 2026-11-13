@@ -258,6 +258,8 @@ def _load_delta_state(store: Any, project_slug: str) -> dict[str, Any]:
         "dispatched_issues": [],
         "last_wake_ts": 0.0,
         "stalled_wip_ts": 0.0,
+        "blocked_wip_wakes": 0,
+        "blocked_wip_fp": "",
     }
     if store is None or not hasattr(store, "get_document"):
         return state
@@ -279,6 +281,8 @@ def _load_delta_state(store: Any, project_slug: str) -> dict[str, Any]:
         "dispatched_issues",
         "last_wake_ts",
         "stalled_wip_ts",
+        "blocked_wip_wakes",
+        "blocked_wip_fp",
     ):
         if key in doc:
             state[key] = doc[key]
@@ -295,6 +299,8 @@ def _load_delta_state(store: Any, project_slug: str) -> dict[str, Any]:
         state["dispatched_issues"] = []
     state["last_wake_ts"] = float(state.get("last_wake_ts") or 0.0)
     state["stalled_wip_ts"] = float(state.get("stalled_wip_ts") or 0.0)
+    state["blocked_wip_wakes"] = int(state.get("blocked_wip_wakes") or 0)
+    state["blocked_wip_fp"] = str(state.get("blocked_wip_fp") or "")
     return state
 
 
@@ -317,6 +323,8 @@ def _save_delta_state(store: Any, project_slug: str, state: dict[str, Any]) -> N
         "dispatched_issues": dispatched,
         "last_wake_ts": float(state.get("last_wake_ts") or 0.0),
         "stalled_wip_ts": float(state.get("stalled_wip_ts") or 0.0),
+        "blocked_wip_wakes": int(state.get("blocked_wip_wakes") or 0),
+        "blocked_wip_fp": str(state.get("blocked_wip_fp") or ""),
         "updated_at": "REQUEST_TIME",
     }
     store.upsert_document(CONTROL_STATE_COLLECTION, f"delta__{project_slug}", payload)
@@ -407,6 +415,7 @@ def _format_delta_message(
     *,
     rotated: bool = False,
     stopped_children: list[str] | None = None,
+    parked_children: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     if rotated:
@@ -443,6 +452,12 @@ def _format_delta_message(
             f"(stopped: {', '.join(sorted(stopped_children))}); inspect scion list, restart any "
             "stopped specialist still needed by in-progress issues with scion start <slug>, and re-send its brief"
         )
+    if parked_children:
+        parts.append(
+            "STALLED_WIP: open actionable or in-review issues remain with 0 active turns "
+            f"(blocked/stalled: {', '.join(sorted(parked_children))}) - inspect teammate status and background "
+            "processes for hung shells or missed handoffs, then advance or re-brief"
+        )
 
     waiting_po = sorted(classified.get("waiting_po") or [], key=lambda x: int(x.get("number", 0)))
     if waiting_po:
@@ -466,6 +481,7 @@ def run_delta_tick(
     max_turns_before_rotate: int = 25,
     child_silence_sec: int = 1800,
     stalled_wip_sec: int = 120,
+    blocked_wip_sec: int = 900,
     github_fetcher=None,
     build_branch: str = "",
     runtime_profile: str = "",
@@ -492,6 +508,7 @@ def run_delta_tick(
     busy_children: list[dict] = []
     abnormal_children: list[dict] = []
     stopped_children: list[str] = []
+    parked_children: list[str] = []
     latest_activity_ts = 0.0
 
     for ag in ([lead_agent] if lead_agent else []) + child_agents:
@@ -515,6 +532,15 @@ def run_delta_tick(
             any_running_children.append(ch)
             if ch_phase != "running" or ch_activity not in _SLEEPABLE_CHILD_ACTIVITIES:
                 busy_children.append(ch)
+            elif ch_slug and ch_activity in ("blocked", "stalled") and blocked_wip_sec > 0:
+                ch_ts = _parse_epoch(
+                    ch.get("lastActivityEvent")
+                    or ch.get("last_activity_event")
+                    or ch.get("createdAt")
+                    or ch.get("created")
+                )
+                if ch_ts is None or (now_ts - ch_ts) >= blocked_wip_sec:
+                    parked_children.append(f"{ch_slug}({ch_activity})")
         elif ch_phase == "stopped" and ch_slug:
             stopped_children.append(ch_slug)
 
@@ -559,18 +585,35 @@ def run_delta_tick(
     cur_actionable_nums = sorted({int(iss.get("number", 0)) for iss in actionable if int(iss.get("number", 0)) > 0})
     prev_dispatched = {int(x) for x in (state.get("dispatched_issues") or []) if int(x) > 0}
 
-    # Detect specialist pod eviction / SIGTERM stop leaving open issues stranded with zero busy workers.
+    # Detect specialist pod eviction / SIGTERM stop OR running specialists stranded in
+    # blocked/stalled state leaving open or in-review issues with zero active turns.
     last_progress_ts = max(float(state.get("last_wake_ts") or 0.0), latest_activity_ts)
+    last_stall_ts = float(state.get("stalled_wip_ts") or 0.0)
+    prior_blocked_wakes = (
+        int(state.get("blocked_wip_wakes") or 0)
+        if state.get("blocked_wip_fp") == fingerprint
+        else 0
+    )
+    stopped_wip_stalled = bool(
+        stopped_children
+        and stalled_wip_sec > 0
+        and (now_ts - last_progress_ts) >= stalled_wip_sec
+        and (now_ts - last_stall_ts) >= max(stalled_wip_sec, 300)
+    )
+    blocked_wip_stalled = bool(
+        parked_children
+        and blocked_wip_sec > 0
+        and prior_blocked_wakes < 2
+        and (now_ts - float(state.get("last_wake_ts") or 0.0)) >= blocked_wip_sec
+        and (now_ts - last_stall_ts) >= max(blocked_wip_sec, 300)
+    )
     stalled_wip = bool(
         actionable
         and not po_replies
         and not abnormal_children
         and not lead_busy
         and not busy_children
-        and stopped_children
-        and stalled_wip_sec > 0
-        and (now_ts - last_progress_ts) >= stalled_wip_sec
-        and (now_ts - float(state.get("stalled_wip_ts") or 0.0)) >= max(stalled_wip_sec, 300)
+        and (stopped_wip_stalled or blocked_wip_stalled)
     )
 
     # Suppress self-inflicted mid-wave echo wakes when lead/specialists move already-dispatched issues
@@ -689,12 +732,14 @@ def run_delta_tick(
                     "abnormal_children_count": len(abnormal_children),
                 }
 
-            stalled_stopped = stopped_children if stalled_wip else None
+            stalled_stopped = stopped_children if stopped_wip_stalled else None
+            stalled_parked = parked_children if blocked_wip_stalled else None
             msg = _format_delta_message(
                 classified,
                 abnormal_children,
                 rotated=rotated_lead,
                 stopped_children=stalled_stopped,
+                parked_children=stalled_parked,
             )
             try:
                 client.request(
@@ -726,6 +771,11 @@ def run_delta_tick(
             state["last_wake_ts"] = now_ts
             if stalled_wip:
                 state["stalled_wip_ts"] = now_ts
+            if state.get("blocked_wip_fp") != fingerprint:
+                state["blocked_wip_fp"] = fingerprint
+                state["blocked_wip_wakes"] = 1 if blocked_wip_stalled else 0
+            elif blocked_wip_stalled:
+                state["blocked_wip_wakes"] = prior_blocked_wakes + 1
             state["lead_turns_in_epoch"] = int(state["lead_turns_in_epoch"]) + 1
             _save_delta_state(store, project_slug, state)
 
@@ -798,6 +848,8 @@ def run_delta_tick(
                     state["last_fingerprint"] = fingerprint
                     state["dispatched_issues"] = []
                     state["stalled_wip_ts"] = 0.0
+                    state["blocked_wip_wakes"] = 0
+                    state["blocked_wip_fp"] = ""
                     state_dirty = True
 
                 if state_dirty:
@@ -887,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
     idle_grace_sec = int(os.environ.get("IDLE_STOP_GRACE_SEC", "600"))
     max_turns = int(os.environ.get("LEAD_MAX_TURNS_BEFORE_ROTATE", "25"))
     child_silence_sec = int(os.environ.get("CHILD_SILENCE_TIMEOUT_SEC", "1800"))
+    blocked_wip_sec = int(os.environ.get("BLOCKED_WIP_TIMEOUT_SEC", "900"))
 
     client = HubClient.from_env()
     store = factory_store.store_from_env(dry_run=not effective_apply)
@@ -908,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
                 idle_grace_sec=idle_grace_sec,
                 max_turns_before_rotate=max_turns,
                 child_silence_sec=child_silence_sec,
+                blocked_wip_sec=blocked_wip_sec,
                 build_branch=build_branch,
                 runtime_profile=runtime_profile,
             )
