@@ -774,17 +774,145 @@ def knowledge_plane_sources(projects, sources_env, legacy_source, has_knowledge_
     return sources
 
 
+def _is_dry_run(apply: bool) -> bool:
+    if not apply:
+        return True
+    return str(os.environ.get("DRY_RUN", "")).strip().lower() in ("1", "true", "yes")
+
+
+def _sqlite_tables(conn) -> set[str]:
+    if conn is None:
+        return set()
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+
+def resolve_knowledge_plane_source_dir(scion_home, source_project, rel, conn=None):
+    """Locate the workspace knowledge-plane directory across `shared` and `per-agent` modes.
+
+    Shared checkouts live at `<scion_home>/projects/<source_project>/<rel>`. In `per-agent` mode,
+    check the project lead's clone under `<scion_home>/agents/<source_project>--<lead>/workspace/<rel>`.
+    """
+    shared_dir = os.path.join(scion_home, "projects", source_project, rel)
+    if os.path.isdir(shared_dir):
+        return shared_dir
+    direct_lead = os.path.join(scion_home, "agents", f"{source_project}--lead", "workspace", rel)
+    if os.path.isdir(direct_lead):
+        return direct_lead
+    tables = _sqlite_tables(conn)
+    if {"projects", "agents"} <= tables:
+        p_row = conn.execute("SELECT id FROM projects WHERE slug = ?", (source_project,)).fetchone()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+        pid_col = "project_id" if "project_id" in cols else ("projectId" if "projectId" in cols else "")
+        if p_row and pid_col and "slug" in cols:
+            tpl_expr = "template" if "template" in cols else "''"
+            a_rows = conn.execute(
+                f"SELECT slug, {tpl_expr} AS tpl FROM agents WHERE {pid_col} = ?",
+                (p_row[0],),
+            ).fetchall()
+            ranked = sorted(
+                a_rows,
+                key=lambda r: (
+                    0 if (r[1] or "") == "lead" else (1 if (r[1] or "") == "eval-lead" else 2),
+                    str(r[0] or ""),
+                ),
+            )
+            for a_row in ranked:
+                a_slug = str(a_row[0] or "")
+                if not a_slug:
+                    continue
+                cand = os.path.join(scion_home, "agents", f"{source_project}--{a_slug}", "workspace", rel)
+                if os.path.isdir(cand):
+                    return cand
+    agents_root = os.path.join(scion_home, "agents")
+    if os.path.isdir(agents_root):
+        prefix = f"{source_project}--"
+        entries = [
+            e for e in sorted(os.listdir(agents_root))
+            if e.startswith(prefix) and (e.endswith("-lead") or e == f"{prefix}eval-lead")
+        ]
+        entries.sort(key=lambda e: (1 if e.endswith("-eval-lead") else 0, e))
+        for entry in entries:
+            cand = os.path.join(agents_root, entry, "workspace", rel)
+            if os.path.isdir(cand):
+                return cand
+    return None
+
+
+def _rsync_touched_relpath(changed_lines, target_relpath):
+    """Return True when `rsync -ai` output reports an update for `target_relpath`."""
+    for ln in changed_lines:
+        _flags, sep, path = ln.partition(" ")
+        if sep and path.strip() == target_relpath:
+            return True
+    return False
+
+
+def _wake_eval_lead_on_release(conn, project_id, project_slug, apply=False):
+    """Wake an evaluation lead or evaluator in `project_id` when `state/LIVE.md` changes."""
+    if os.environ.get("WATCHDOG_EVAL_RELEASE_WAKE", "1") == "0":
+        return
+    if "agents" not in _sqlite_tables(conn):
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    pid_col = "project_id" if "project_id" in cols else ("projectId" if "projectId" in cols else "")
+    if not pid_col or "slug" not in cols:
+        return
+    tpl_expr = "template" if "template" in cols else "''"
+    phase_expr = "phase" if "phase" in cols else ("status" if "status" in cols else "'running'")
+    rows = conn.execute(
+        f"SELECT slug, {tpl_expr} AS tpl, {phase_expr} AS ph FROM agents WHERE {pid_col} = ?",
+        (project_id,),
+    ).fetchall()
+    target = None
+    for row in rows:
+        a_slug = row["slug"] or ""
+        a_tpl = row["tpl"] or ""
+        a_phase = (row["ph"] or "").lower()
+        if a_phase not in ("running", "suspended", ""):
+            continue
+        if a_tpl in ("eval-lead", "evaluator") or a_slug in ("eval-lead", "evaluator") or a_slug.endswith("-eval-lead"):
+            target = a_slug
+            break
+    if not target:
+        return
+    if _is_dry_run(apply):
+        print(f"Check 5 (Shared Knowledge Plane): {project_slug}: would wake {target} on LIVE.md release checkpoint")
+        return
+    msg = (
+        "[RELEASE CHECKPOINT] state/LIVE.md updated in /scion-volumes/knowledge-plane/state/LIVE.md. "
+        "Run an L1-L5 evaluation sweep against the newly shipped revision. "
+        "Record the run via factory_store.py put-eval-run."
+    )
+    try:
+        st, _ = api("POST", f"/api/v1/projects/{project_id}/agents/{target}/message", {"message": msg, "wake": True})
+    except Exception as exc:
+        print(
+            f"Check 5 (Shared Knowledge Plane): {project_slug}: WARNING wake {target} failed: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if 200 <= st < 300:
+        print(f"Check 5 (Shared Knowledge Plane): {project_slug}: woke {target} on LIVE.md release checkpoint")
+    else:
+        print(
+            f"Check 5 (Shared Knowledge Plane): {project_slug}: WARNING wake {target} returned HTTP {st}",
+            file=sys.stderr,
+        )
+
+
 def check_shared_knowledge_plane(conn, apply=False):
     """Keep each project's shared directory `knowledge-plane` in sync with its factory's knowledge plane.
 
-    Agents read the copy at /scion-volumes/knowledge-plane. The shared directory must exist (scion-admin.py
-    shared-dirs) and the source must be a shared checkout (~/.scion/projects/<slug>/). See knowledge_plane_sources().
+    Agents read the copy at /scion-volumes/knowledge-plane. The source comes from `~/.scion/projects/<slug>/`
+    (`shared`) or the lead clone under `~/.scion/agents/` (`per-agent`). When `state/LIVE.md` changes, wake
+    the project's evaluation lead if one is running.
     """
+    effective_apply = not _is_dry_run(apply)
     try:
         sources = knowledge_plane_sources(
             FACTORY_PROJECTS, os.environ.get("KNOWLEDGE_PLANE_SOURCES", ""),
             os.environ.get("KNOWLEDGE_PLANE_SOURCE_PROJECT", ""),
-            lambda slug: os.path.isdir(os.path.join(SCION_HOME, "projects", slug, "knowledge-plane")))
+            lambda slug: resolve_knowledge_plane_source_dir(SCION_HOME, slug, "knowledge-plane", conn=conn) is not None)
     except ValueError as e:
         print(f"Check 5 (Shared Knowledge Plane): ERROR {e}", file=sys.stderr)
         return
@@ -804,21 +932,22 @@ def check_shared_knowledge_plane(conn, apply=False):
             print(f"Check 5 (Shared Knowledge Plane): {slug}: skipped (no knowledge plane source)")
             continue
         source_project, rel = sources[slug]
-        src_dir = os.path.join(SCION_HOME, "projects", source_project, rel)
+        src_dir = resolve_knowledge_plane_source_dir(SCION_HOME, source_project, rel, conn=conn)
+        fallback_expected = os.path.join(SCION_HOME, "projects", source_project, rel)
         id8 = r["id"].replace("-", "")[:8]  # config.SharedDirHostPath: <slug>__<first 8 hex of the project ID>
         dst_dir = os.path.join(SCION_HOME, "project-configs", f"{slug}__{id8}", "shared-dirs", "knowledge-plane")
-        if not os.path.isdir(src_dir):
-            print(f"Check 5 (Shared Knowledge Plane): {slug}: source missing ({src_dir}; needs a shared checkout)")
+        if not src_dir:
+            print(f"Check 5 (Shared Knowledge Plane): {slug}: source missing ({fallback_expected}; needs a shared or lead checkout)")
             continue
         # The Hub creates project-configs/<slug>__<id8>/ with the project; shared-dirs/ appears only when the first
         # agent starts. Fill it before that, so the first agent already finds the knowledge plane (L28).
         if not os.path.isdir(os.path.dirname(os.path.dirname(dst_dir))):
             print(f"Check 5 (Shared Knowledge Plane): {slug}: skipped (project not set up on this broker)")
             continue
-        if apply:
+        if effective_apply:
             os.makedirs(dst_dir, exist_ok=True)
             res = subprocess.run(
-                ["rsync", "-ai", "--delete", src_dir + "/", dst_dir + "/"],
+                ["rsync", "-aci", "--delete", src_dir + "/", dst_dir + "/"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -831,6 +960,8 @@ def check_shared_knowledge_plane(conn, apply=False):
                 )
             elif changed:
                 print(f"Check 5 (Shared Knowledge Plane): {slug}: synced ({len(changed)} changes) from {src_dir}")
+                if _rsync_touched_relpath(changed, "state/LIVE.md"):
+                    _wake_eval_lead_on_release(conn, r["id"], slug, apply=effective_apply)
             else:
                 print(f"Check 5 (Shared Knowledge Plane): {slug}: up to date with {src_dir}")
         else:

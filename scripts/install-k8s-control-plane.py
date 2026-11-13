@@ -3,7 +3,6 @@ import base64
 import json
 import os
 import subprocess
-import sys
 
 os.environ.setdefault("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
 

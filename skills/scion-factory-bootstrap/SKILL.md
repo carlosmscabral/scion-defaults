@@ -102,7 +102,8 @@ Work through the team configuration with the human:
          reason: "complete static specification and no external dependencies"
    ```
 4. **Autonomy level:** Ask for `team.autonomy`: `standard` (default; agents decide implementation and tell the PO about verified work, while scope, cost, IAM, ADRs, and acceptance wait for the PO), `supervised` (the PO approves the plan on GitHub before implementation starts), or `autonomous` (only cost, IAM, and acceptance wait for the PO).
-5. **Never invent intent:** Always present candidates and evidence to the human; confirm every specialist addition, default drop, autonomy level, and deploy choice before updating `factory.yaml`.
+5. **Cross-family verification and reviewer capacity:** New drafts set `team.verification_policy: cross-family` so builders and verifiers use distinct model families. Run `./scripts/scion-factory diversify-team factory.yaml` if role edits reintroduce monoculture. If `team.max_wip >= 4`, set `team.reviewer_replicas: 2` to avoid review bottlenecks. Use `team.verification_policy: single-harness` with `team.single_harness_reason` only when the Hub exposes one harness.
+6. **Never invent intent:** Always present candidates and evidence to the human; confirm every specialist addition, default drop, autonomy level, and deploy choice before updating `factory.yaml`.
 
 ### Git is optional
 
