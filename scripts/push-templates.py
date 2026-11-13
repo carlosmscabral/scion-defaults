@@ -371,21 +371,28 @@ def push_templates_via_api(client, project_slug: str, roles: list[str], rendered
     return {"status": "ok"}
 
 
-def render_command(out, roles, templates=""):
-    """render-templates.py for the given roles, from this repository's templates/ or a compiled kit's templates/."""
-    cmd = [sys.executable, os.path.join(HERE, "render-templates.py"), "--out", out, "--roles", ",".join(roles)]
-    if templates:
-        cmd += ["--src", templates]
-    return cmd
+def render_command(out, roles, templates):
+    """render-templates.py for the given roles from a compiled kit's templates/ directory."""
+    if not templates:
+        raise ValueError("templates directory (--templates) is required (for example <kit>/templates from scion-factory compile)")
+    return [
+        sys.executable,
+        os.path.join(HERE, "render-templates.py"),
+        "--out",
+        out,
+        "--roles",
+        ",".join(roles),
+        "--src",
+        templates,
+    ]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--project", required=True, help="Scion project slug")
     parser.add_argument("--roles", required=True, help="comma-separated role folders from the templates directory")
-    parser.add_argument("--templates", default="",
-                        help="templates directory to push (default: ../templates; e.g. <kit>/templates from "
-                             "`scion-factory compile`)")
+    parser.add_argument("--templates", required=True,
+                        help="compiled templates directory to push (e.g. <kit>/templates from `scion-factory compile`)")
     parser.add_argument("--apply", action="store_true", help="make the changes (default: dry run)")
 
     parser.add_argument("--direct", action="store_true", help="use Hub API directly")

@@ -296,12 +296,23 @@ def test_watchdog_projects_default_to_the_factory_env(watchdog):
 # --- templates: the knowledge plane path follows FACTORY_SUBDIR --------------------------------------------------
 
 def _render(tmp_path, **extra):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import scion_factory
+
+    spec = scion_factory.load_spec(ROOT / "presets" / "starter-service.factory.yaml")
+    if extra.get("FACTORY_SUBDIR") or extra.get("AGENT_PREFIX"):
+        spec["monorepo"] = {
+            "subdir": extra.get("FACTORY_SUBDIR", "."),
+            "agent_prefix": extra.get("AGENT_PREFIX", ""),
+        }
+    kit = tmp_path / "kit"
+    scion_factory.compile_factory_boilerplate(spec, kit)
     env = tmp_path / "factory.env"
     env.write_text((ROOT / "config" / "factory.env.example").read_text()
                    + "\nSPANNER_INSTANCE=i\nSPANNER_DATABASE=d\n" + "".join(f"{k}={v}\n" for k, v in extra.items()))
     out = tmp_path / "out"
     res = subprocess.run([sys.executable, str(ROOT / "scripts" / "render-templates.py"), "--env", str(env),
-                          "--out", str(out)], capture_output=True, text=True)
+                          "--src", str(kit / "templates"), "--out", str(out)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
     return {p.relative_to(out).as_posix(): p.read_text() for p in out.rglob("*") if p.is_file()}
 

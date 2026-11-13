@@ -237,7 +237,6 @@ def fake_hub():
 
 
 def test_push_templates_direct_api_isolates_shared_storage_and_uploads(fake_hub, tmp_path):
-    import shutil
     fake_hub.seed_shared_storage_collision(project_id="proj-1", role="lead")
     env = {
         **os.environ,
@@ -245,12 +244,17 @@ def test_push_templates_direct_api_isolates_shared_storage_and_uploads(fake_hub,
         "SCION_HUB_TOKEN": "tok-admin",
         "FACTORY_ENV": str(write_minimal_env(tmp_path)),
     }
-    shutil.copytree(os.path.join(ROOT, "templates"), tmp_path / "templates")
+    shared_dir = tmp_path / "templates" / "_shared"
+    lead_dir = tmp_path / "templates" / "lead"
+    shared_dir.mkdir(parents=True)
+    lead_dir.mkdir(parents=True)
+    (shared_dir / "agents.md").write_text("# Shared protocol\n")
+    (lead_dir / "system-prompt.md").write_text("# Lead prompt\n")
     # Compiled kits emit default_harness_config instead of harness:
-    (tmp_path / "templates" / "lead" / "scion-agent.yaml").write_text(
+    (lead_dir / "scion-agent.yaml").write_text(
         "schema_version: '1'\ndefault_harness_config: antigravity-factory\n"
     )
-    helper = tmp_path / "templates" / "lead" / "home" / ".local" / "bin" / "helper.sh"
+    helper = lead_dir / "home" / ".local" / "bin" / "helper.sh"
     helper.parent.mkdir(parents=True, exist_ok=True)
     helper.write_text("echo helper")
     helper.chmod(0o755)

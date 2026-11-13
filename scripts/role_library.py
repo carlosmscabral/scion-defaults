@@ -178,6 +178,7 @@ Don't fix; a proof-of-concept patch only shows the cause and proves reproduction
         "protocol": """You coordinate the evaluation team and manage the continuous verification pyramid (L1-L5).
 Schedule automated grading sweeps against the build branch and analyze test metrics.
 Synthesize evaluation reports, detect regression trends, and track pass/fail rates.
+The Hub does not report turn or model-call counts when `current_turns` or `model_calls` are `NULL`: display unknown values as `"n/a"`, never as `0` or fabricated numbers.
 Report each finding through the channel your Evaluation findings section names, for the build lead to address.
 Never message build agents directly.""",
     },
@@ -314,9 +315,10 @@ Deliver migration scripts, validated IaC/workflow diffs, and rollback plans to y
         "needs_service": True,
         "gcp_identity": "deployer-sa",
         "protocol": """You build clean release artifacts and manage deployment to target environments.
-Package clean git archives, apply required database indexes, and execute deploy commands.
+Record the current ready revision first (`gcloud run services describe <service> --format='value(status.latestReadyRevisionName)'`) so you can roll back deterministically.
+Never pass `--source=/workspace` directly: export the verified commit SHA to a clean directory (`d=/tmp/deploy-$sha && rm -rf "$d" && mkdir -p "$d" && git -C /workspace archive "$sha" | tar -x -C "$d"`), apply required database indexes or migrations, and deploy with an explicit runtime `--service-account`, `--to-latest`, and Secret Manager bindings (`--update-secrets=KEY=secret:latest`, never literal secret values).
 Verify service health endpoints, initial traffic routing, non-empty critical payload responses, and zero unexpected `[fallback]` degradations immediately after rollout before recording the revision in `state/LIVE.md`.
-Execute rollback procedures immediately if deployment health checks fail.
+If any deployment check fails, route traffic back immediately with `gcloud run services update-traffic <service> --to-revisions=<previous-revision>=100` (and pass `--to-latest` on the next rollout so traffic does not stay pinned).
 Never deploy uncommitted local changes or bypass deployment safety flags.
 Report deployment status, revisions, and health verification outputs to your lead.""",
     },
@@ -474,11 +476,25 @@ Deliver API compatibility diffs and breaking change warnings to the evaluation l
         "needs_service": True,
         "gcp_identity": "deployer-sa",
         "protocol": """You deploy evaluation dashboards, reporting portals, and telemetry visualization tools.
-Package evaluation dashboard assets from the evaluation repository branch.
-Deploy dashboard services to hosting infrastructure using designated deployment identities.
-Verify dashboard responsiveness, data source connections, and visualization rendering.
+Record the current ready revision before deploying (`gcloud run services describe <service> --format='value(status.latestReadyRevisionName)'`), and export the verified evaluation commit via `git archive` to `/tmp/deploy-$sha` rather than passing `--source=/workspace`.
+Deploy dashboard services with an explicit runtime `--service-account`, `--to-latest`, and Secret Manager bindings (`--update-secrets=GITHUB_TOKEN=github-token:latest`, never literal secret tokens).
+Verify dashboard responsiveness, real Firestore/GitHub data source connections, and visualization rendering; if a check fails, roll back immediately with `gcloud run services update-traffic <service> --to-revisions=<previous-revision>=100`.
 Never deploy unverified dashboard code to public-facing environments.
 Report dashboard deployment status and access URLs to the evaluation lead.""",
+    },
+    "ui-craftsman": {
+        "team": "eval",
+        "kind": "catalog",
+        "default_kind": "ui-craftsman",
+        "harness": "antigravity",
+        "model": _DEFAULT_ANTIGRAVITY_MODEL,
+        "responsibility": "Builds and refines evaluation dashboard interfaces and data visualizations to the Impeccable craft floor.",
+        "needs_service": False,
+        "protocol": """You design and refine evaluation dashboards and operational data visualizations on the evaluation branch.
+Follow Operate-mode density: scannable tables and charts with clear hierarchy, tinted OKLCH neutrals, `font-variant-numeric: tabular-nums` for numbers, and themed `:focus-visible`, `::selection`, and scrollbars.
+Avoid generic AI UI anti-patterns: eyebrow labels above headings, rows of four equal metric cards, nested cards, side borders wider than 1px, purple dark-mode gradients, pure `#000`/`#fff`, and emoji icons.
+Render only real telemetry from Firestore and GitHub; show unknown or `NULL` values as `"n/a"` or `"no data yet"`, never sample numbers.
+Run `impeccable detect --json` when installed and resolve findings before handing changes to the evaluation lead.""",
     },
 }
 

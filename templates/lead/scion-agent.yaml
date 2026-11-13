@@ -1,9 +1,0 @@
-schema_version: "1"
-description: "Tech lead and orchestrator of the ${BUILD_PROJECT} factory (Claude Code). Plans and delegates GitHub issues; never writes product code."
-default_harness_config: ${CLAUDE_HARNESS}
-agent_instructions: agents.md
-system_prompt: system-prompt.md
-env:
-  FACTORY_ROLE: lead
-  FACTORY_SUBDIR: "${FACTORY_SUBDIR}"   # product folder the harness starts in (factory-cd.sh)
-# The Hub injects SCION_TELEMETRY_ENABLED from its own settings and that currently wins over this block

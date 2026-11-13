@@ -14,8 +14,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES = ROOT / "templates"
-ROLES = sorted(d.name for d in TEMPLATES.iterdir() if d.is_dir() and not d.name.startswith("_"))
+sys.path.insert(0, str(ROOT / "scripts"))
+import scion_factory  # noqa: E402
+
+PSEARCH_SPEC = scion_factory.load_spec(ROOT / "presets" / "psearch.factory.yaml")
+ROLES = sorted(
+    {r["role"] for r in PSEARCH_SPEC["team"]["build_roles"] + PSEARCH_SPEC["team"]["eval_roles"]}
+    | set(scion_factory.role_library.ALWAYS_BUILD)
+)
 
 
 def _load(name, path):
@@ -30,6 +36,19 @@ render_templates = _load("render_templates", ROOT / "scripts" / "render-template
 EXAMPLE_ENV = (ROOT / "config" / "factory.env.example").read_text()
 
 
+def _compile_psearch_templates(target_dir, subdir="", prefix=""):
+    spec = scion_factory.load_spec(ROOT / "presets" / "psearch.factory.yaml")
+    if subdir or prefix:
+        spec["monorepo"] = {"subdir": subdir or ".", "agent_prefix": prefix}
+    scion_factory.compile_factory_boilerplate(spec, target_dir)
+    return target_dir / "templates"
+
+
+@pytest.fixture(scope="module")
+def default_templates(tmp_path_factory):
+    return _compile_psearch_templates(tmp_path_factory.mktemp("psearch-kit"))
+
+
 def _env_file(tmp_path, **extra):
     """factory.env.example plus the optional values the reference templates need, plus `extra`."""
     lines = [EXAMPLE_ENV, "SPANNER_INSTANCE=psearch-instance", "SPANNER_DATABASE=psearch-db"]
@@ -39,12 +58,13 @@ def _env_file(tmp_path, **extra):
     return path
 
 
-def _run_render(tmp_path, *args, **env_values):
+def _run_render(tmp_path, src_templates, *args, **env_values):
     env_path = _env_file(tmp_path, **env_values)
-    return subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "render-templates.py"), "--env", str(env_path), *args],
-        capture_output=True, text=True,
-    )
+    cmd = [sys.executable, str(ROOT / "scripts" / "render-templates.py"), "--env", str(env_path)]
+    if src_templates is not None:
+        cmd += ["--src", str(src_templates)]
+    cmd += list(args)
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 # --- Task 1: naming and sub-folder variables -------------------------------------------------------------------
@@ -91,8 +111,8 @@ def test_normalize_subdir_rejects_paths_outside_the_repo(value):
         render_templates.normalize_subdir(value)
 
 
-def test_cli_agent_names_lists_prefixed_names(tmp_path):
-    res = _run_render(tmp_path, "--agent-names", AGENT_PREFIX="project1")
+def test_cli_agent_names_lists_prefixed_names(tmp_path, default_templates):
+    res = _run_render(tmp_path, default_templates, "--agent-names", AGENT_PREFIX="project1")
     assert res.returncode == 0, res.stderr
     lines = res.stdout.splitlines()
     assert "lead\tproject1-lead" in lines
@@ -100,16 +120,22 @@ def test_cli_agent_names_lists_prefixed_names(tmp_path):
     assert len(lines) == len(ROLES)
 
 
-def test_cli_rejects_an_invalid_prefix(tmp_path):
-    res = _run_render(tmp_path, "--agent-names", AGENT_PREFIX="Project_1")
+def test_cli_rejects_an_invalid_prefix(tmp_path, default_templates):
+    res = _run_render(tmp_path, default_templates, "--agent-names", AGENT_PREFIX="Project_1")
     assert res.returncode != 0
     assert "AGENT_PREFIX" in res.stderr
 
 
-def test_cli_rejects_a_subdir_outside_the_repo(tmp_path):
-    res = _run_render(tmp_path, "--out", str(tmp_path / "out"), FACTORY_SUBDIR="../elsewhere")
+def test_cli_rejects_a_subdir_outside_the_repo(tmp_path, default_templates):
+    res = _run_render(tmp_path, default_templates, "--out", str(tmp_path / "out"), FACTORY_SUBDIR="../elsewhere")
     assert res.returncode != 0
     assert "FACTORY_SUBDIR" in res.stderr
+
+
+def test_cli_requires_src_when_not_rendering_single_file(tmp_path):
+    res = _run_render(tmp_path, None, "--out", str(tmp_path / "out"))
+    assert res.returncode != 0
+    assert "--src is required" in res.stderr
 
 
 # --- Task 2: templates use the role variables and carry FACTORY_SUBDIR -------------------------------------------
@@ -120,8 +146,15 @@ BARE_REPORT = re.compile(rf"report to `({ROLE_ALT})`", re.IGNORECASE)
 
 
 def _render_all(tmp_path, **env_values):
+    subdir = render_templates.normalize_subdir(env_values.get("FACTORY_SUBDIR", ""))
+    prefix = env_values.get("AGENT_PREFIX", "")
+    src_tpl = _compile_psearch_templates(
+        tmp_path / "kit",
+        subdir="" if subdir == "." else subdir,
+        prefix=prefix,
+    )
     out = tmp_path / "out"
-    res = _run_render(tmp_path, "--out", str(out), **env_values)
+    res = _run_render(tmp_path, src_tpl, "--out", str(out), **env_values)
     assert res.returncode == 0, res.stderr
     return {p.relative_to(out).as_posix(): p.read_text() for p in out.rglob("*") if p.is_file()}
 
@@ -154,7 +187,7 @@ def test_unprefixed_render_keeps_bare_role_names(tmp_path):
     assert "scion message lead" in files["backend/system-prompt.md"]
     assert "You report to `lead`" in files["backend/system-prompt.md"]
     for role in ROLES:
-        assert 'FACTORY_SUBDIR: "."' in files[f"{role}/scion-agent.yaml"], role
+        assert "FACTORY_SUBDIR" not in files[f"{role}/scion-agent.yaml"], role
 
 
 def test_rendered_scion_agent_yaml_stays_valid_yaml(tmp_path):

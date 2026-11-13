@@ -88,9 +88,12 @@ def test_readme_starts_only_the_two_leads():
     assert '-t eval-lead --project="$EVAL_PROJECT"' in step8
 
 
-def test_repo_lead_templates_start_their_team():
+def test_psearch_preset_lead_templates_start_their_team(tmp_path):
+    spec = scion_factory.load_spec(ROOT / "presets" / "psearch.factory.yaml")
+    out = tmp_path / "psearch-kit"
+    scion_factory.compile_factory_boilerplate(spec, out)
     for role in ("lead", "eval-lead"):
-        text = (ROOT / "templates" / role / "system-prompt.md").read_text()
+        text = (out / "templates" / role / "system-prompt.md").read_text()
         assert "scion start" in text, role
         assert "If the admin created your team" not in text, role
 

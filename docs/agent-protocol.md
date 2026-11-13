@@ -1,7 +1,7 @@
 # Agent protocol
 
-The rules every agent follows, and why. The literal text the agents get is
-[`templates/_shared/agents.md`](../templates/_shared/agents.md) plus each role's `system-prompt.md`; this page explains
+The rules every agent follows, and why. The literal text the agents get is compiled into
+`<kit_dir>/templates/_shared/agents.md` plus each role's `system-prompt.md` by [`scripts/scion_factory.py`](../scripts/scion_factory.py) and [`scripts/role_library.py`](../scripts/role_library.py); this page explains
 the design so you can adapt it without losing what makes it work.
 
 ## Principles

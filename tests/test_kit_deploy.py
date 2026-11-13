@@ -153,7 +153,8 @@ def test_push_templates_renders_from_a_kit_directory():
     cmd = push.render_command("/tmp/out", ["lead", "backend"], "/kits/ledger/templates")
     assert cmd[1:] == [str(ROOT / "scripts" / "render-templates.py"), "--out", "/tmp/out", "--roles", "lead,backend",
                        "--src", "/kits/ledger/templates"]
-    assert "--src" not in push.render_command("/tmp/out", ["lead"], "")
+    with pytest.raises(ValueError, match="--templates"):
+        push.render_command("/tmp/out", ["lead"], "")
 
 
 def test_scion_admin_runs_the_scion_cli_as_the_admin(monkeypatch):

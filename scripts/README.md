@@ -23,8 +23,8 @@ VM at run time, and the GitHub token is only ever piped through stdin.
 | [`patch-sciontool-telemetry.sh`](patch-sciontool-telemetry.sh) | your machine | Hub VM | Installs `/usr/local/bin/sciontool` wrapper in all running agent containers and base images (`scion-antigravity`, `scion-claude`, `scion-opencode`, `scion-hermes`) so PID 1 starts loopback OTLP listeners on 4317/4318 with GCP cloud exporters. |
 | [`patch-antigravity-hooks.py`](patch-antigravity-hooks.py) | Hub VM | with `--apply` | Checks (default) or applies clean telemetry-enabled Antigravity hooks and Gemini 4 Argon model settings across provisioners, `.agents/hooks.json`, pre-start scripts, and Hub DB project hooks (L6). |
 | [`setup-sandbox.sh`](setup-sandbox.sh) | your machine | GCP | Idempotent sandbox setup: APIs, deployer and runtime service accounts, IAM, Firestore (database + control-plane indexes), optional BigQuery, optional product-only Spanner, bucket, `github-token` secret. `DRY_RUN=1` prints the plan. |
-| [`render-templates.py`](render-templates.py) | your machine | writes `build/` | Renders `../templates` with your values into `build/templates/<role>/`; `--file` renders one file to stdout (used for the heartbeat text); `--agent-names` prints `<role>\t<agent name>` (`AGENT_PREFIX` makes names `<prefix>-<role>` for several factories on one Hub). |
-| [`push-templates.py`](push-templates.py) | your machine | with `--apply` | Renders roles and creates or updates them as Hub templates through the API (dry run by default). `--templates <kit>/templates` pushes a compiled kit's roles. Never uploads into a storage path a template doesn't own; renames such rows to `<role>-legacy` (L16). |
+| [`render-templates.py`](render-templates.py) | your machine | writes `build/` | Renders `--src <kit>/templates` with your values into `build/templates/<role>/`; `--file` renders one file to stdout (used for the heartbeat text); `--agent-names` prints `<role>\t<agent name>` (`AGENT_PREFIX` makes names `<prefix>-<role>` for several factories on one Hub). |
+| [`push-templates.py`](push-templates.py) | your machine | with `--apply` | Renders roles from `--templates <kit>/templates` and creates or updates them as Hub templates through the API (dry run by default). Never uploads into a storage path a template doesn't own; renames such rows to `<role>-legacy` (L16). |
 | [`hub-preflight.py`](hub-preflight.py) | Hub VM | no | Read-only check of an existing Hub before you add a factory: health, the PO's admin user, harness images and configs, existing projects, and the merged `FACTORY_PROJECTS` that keeps other factories covered by the watchdog and the sync. Exits 1 on blocking problems. |
 | [`make-factory-harness-configs.py`](make-factory-harness-configs.py) | Hub VM | with `--apply` | Builds and publishes `claude-factory`, `antigravity-factory`, `opencode-factory`, `hermes-factory`: copies of the bundled harness-configs whose command starts with [`factory-cd.sh`](../config/harness/home/.local/bin/factory-cd.sh), so agents of a monorepo factory start in `FACTORY_SUBDIR`. Never edits the bundled configs; re-run after a Scion upgrade. |
 
@@ -42,7 +42,7 @@ scripts/run-on-hub.sh scripts/scion-admin.py schedule list --project psearch
 scripts/run-on-hub.sh scripts/scion-admin.py schedule update --project psearch --name psearch-lead-heartbeat \
   --text "$(scripts/render-templates.py --file config/heartbeat-message.txt)"
 scripts/run-on-hub.sh scripts/patch-antigravity-hooks.py                # check; add --apply to fix
-scripts/push-templates.py --project psearch-eval --roles eval-lead      # dry run; add --apply to push
+scripts/push-templates.py --project psearch-eval --templates <kit>/templates --roles eval-lead # dry run; add --apply to push
 DRY_RUN=1 scripts/setup-sandbox.sh --with-bigquery
 ```
 

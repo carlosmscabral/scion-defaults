@@ -38,9 +38,29 @@ def test_grill_me_playbook_covers_deploy_and_team_topics():
     assert "autonomy" in playbook
 
 
-def test_templates_readme_references_role_library():
+def test_templates_readme_references_role_library_and_no_static_role_folders_remain():
+    entries = sorted(p.name for p in (ROOT / "templates").iterdir())
+    assert entries == ["README.md"], f"legacy static role folders must not remain in templates/: {entries}"
     templates_readme = (ROOT / "templates/README.md").read_text()
     assert "role_library.py" in templates_readme
+    assert "scion-factory compile" in templates_readme
+    assert "\u2014" not in templates_readme
+
+    res_push = subprocess.run(
+        [sys.executable, "scripts/push-templates.py", "--project", "demo"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert res_push.returncode != 0 and "--templates" in res_push.stderr
+
+    res_render = subprocess.run(
+        [sys.executable, "scripts/render-templates.py", "--env", "config/factory.env.example"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert res_render.returncode != 0 and "--src" in res_render.stderr
 
 
 def test_setup_runbook_documents_deploy_none_sandbox_skips():

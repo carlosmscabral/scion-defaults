@@ -76,7 +76,7 @@ def test_library_role_entry_contents():
 def test_role_def_structure_and_counts():
     assert len(role_library.ALWAYS_BUILD) == 6
     assert len(role_library.ALWAYS_EVAL) == 2
-    assert len(role_library.ROLES) == 25
+    assert len(role_library.ROLES) == 26
     for r, d in role_library.ROLES.items():
         assert "team" in d
         assert "kind" in d
@@ -86,6 +86,24 @@ def test_role_def_structure_and_counts():
         assert "responsibility" in d
         assert "protocol" in d
         assert "needs_service" in d
+
+
+def test_legacy_template_operational_details_ported_to_role_library():
+    ui = role_library.ROLES["ui-craftsman"]
+    assert ui["team"] == "eval"
+    assert ui["kind"] == "catalog"
+    assert "impeccable" in ui["protocol"].lower()
+    assert "n/a" in ui["protocol"].lower()
+
+    for r in ("deployer", "eval-deployer"):
+        proto = role_library.role_protocol(r)
+        assert proto is not None
+        for needle in ("latestReadyRevisionName", "archive", "/tmp/deploy-", "--to-latest", "--update-secrets", "--to-revisions"):
+            assert needle in proto, (r, needle)
+
+    eval_lead_proto = role_library.role_protocol("eval-lead")
+    assert eval_lead_proto is not None
+    assert "NULL" in eval_lead_proto and '"n/a"' in eval_lead_proto
 
 
 def test_investigator_and_auditor_protocols_forbid_untimed_server_daemons():

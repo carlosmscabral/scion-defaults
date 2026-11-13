@@ -26,7 +26,7 @@ cp config/factory.env.example config/factory.env
 $EDITOR config/factory.env         # git-ignored; never commit it
 ```
 
-**Check:** `scripts/render-templates.py --out /tmp/tpl` finishes without "missing values".
+**Check:** `./scripts/scion-factory compile presets/psearch.factory.yaml --out /tmp/kit && scripts/render-templates.py --src /tmp/kit/templates --out /tmp/tpl` finishes without "missing values".
 
 ## 2. Hub VM and Scion server
 
@@ -228,9 +228,9 @@ scripts/run-on-hub.sh scripts/patch-antigravity-hooks.py          # check
 ## 8. Templates and agents
 
 ```bash
-scripts/push-templates.py --project "$BUILD_PROJECT" --roles lead,backend,frontend,reviewer,deployer          # dry run
-scripts/push-templates.py --project "$BUILD_PROJECT" --roles lead,backend,frontend,reviewer,deployer --apply
-scripts/push-templates.py --project "$EVAL_PROJECT" \
+scripts/push-templates.py --project "$BUILD_PROJECT" --templates /tmp/kit/templates --roles lead,backend,frontend,reviewer,deployer          # dry run
+scripts/push-templates.py --project "$BUILD_PROJECT" --templates /tmp/kit/templates --roles lead,backend,frontend,reviewer,deployer --apply
+scripts/push-templates.py --project "$EVAL_PROJECT" --templates /tmp/kit/templates \
   --roles eval-lead,factory-analyst,search-evaluator,ui-craftsman,eval-deployer --apply
 ```
 
@@ -352,8 +352,8 @@ FACTORY_SUBDIR=src/project1           # also selects the <harness>-factory harne
 
 Keep `GITHUB_REPO`, `BUILD_BRANCH` and `EVAL_BRANCH` the same for every factory.
 
-**Check:** `FACTORY_ENV=config/project1.env scripts/render-templates.py --agent-names` prints `project1-lead` for the
-`lead` role, and `FACTORY_ENV=config/project1.env scripts/render-templates.py --out /tmp/p1` renders without
+**Check:** `FACTORY_ENV=config/project1.env scripts/render-templates.py --src <kit>/templates --agent-names` prints `project1-lead` for the
+`lead` role, and `FACTORY_ENV=config/project1.env scripts/render-templates.py --src <kit>/templates --out /tmp/p1` renders without
 "missing values".
 
 On a Hub that already runs other factories, run the read-only preflight now:
@@ -419,8 +419,8 @@ New Hub projects already have `scratchpad`; the first run usually creates only `
 
 ```bash
 export FACTORY_ENV=config/project1.env
-scripts/push-templates.py --project project1 --roles lead,backend,frontend,reviewer,deployer --apply
-scripts/push-templates.py --project project1-eval \
+scripts/push-templates.py --project project1 --templates <kit>/templates --roles lead,backend,frontend,reviewer,deployer --apply
+scripts/push-templates.py --project project1-eval --templates <kit>/templates \
   --roles eval-lead,factory-analyst,search-evaluator,ui-craftsman,eval-deployer --apply
 ```
 
@@ -453,7 +453,7 @@ settings into `~/.scion/watchdog.env`, so the cron runs every 5 minutes keep the
 
 ### M8. Agents and heartbeats (per factory)
 
-`FACTORY_ENV=config/project1.env scripts/render-templates.py --agent-names` prints the names. Start the two leads as
+`FACTORY_ENV=config/project1.env scripts/render-templates.py --src <kit>/templates --agent-names` prints the names. Start the two leads as
 the admin on the VM (`--harness-auth vertex-ai` for Claude Code on Vertex AI); each lead starts its prefixed team
 (`project1-backend`, …) at its first wake-up, as its children:
 

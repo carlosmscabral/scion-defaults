@@ -120,20 +120,33 @@ def test_eval_lead_briefs_by_file_and_sizes_only_with_its_own_team(kit):
     assert "investigator" not in eval_lead
 
 
-def test_deterministic_wake_sla_reviewer_focus_and_clean_agent_yaml(kit):
+def test_deterministic_wake_sla_reviewer_focus_and_clean_agent_yaml(kit, tmp_path):
     lead_prompt = _prompt(kit, "lead")
     reviewer_prompt = _prompt(kit, "reviewer")
     assert "more than 5 minutes" in lead_prompt
     assert "scion message --interrupt" in lead_prompt
     assert "Inspect the delivered files and brief acceptance checks first" in reviewer_prompt
-    assert "telemetry:" not in (kit / "templates" / "lead" / "scion-agent.yaml").read_text()
-    assert "max_duration:" not in (kit / "templates" / "lead" / "scion-agent.yaml").read_text()
-    assert "telemetry:" not in (kit / "templates" / "reviewer" / "scion-agent.yaml").read_text()
+    assert "honoring" in lead_prompt and "`agents.md`" in lead_prompt
+    assert "honoring `agents.md`" in reviewer_prompt
+    assert "templates/_shared/agents.md" not in lead_prompt
+    assert "templates/_shared/agents.md" not in reviewer_prompt
 
-    static_lead = (ROOT / "templates" / "lead" / "system-prompt.md").read_text()
-    static_rev = (ROOT / "templates" / "reviewer" / "system-prompt.md").read_text()
-    assert "5 minutes" in static_lead and "30 minutes" not in static_lead
-    assert "Inspect deliverables first" in static_rev
+    lead_yaml = (kit / "templates" / "lead" / "scion-agent.yaml").read_text()
+    deployer_yaml = (kit / "templates" / "deployer" / "scion-agent.yaml").read_text()
+    assert "telemetry:" not in lead_yaml
+    assert "max_duration:" not in lead_yaml
+    assert "telemetry:" not in (kit / "templates" / "reviewer" / "scion-agent.yaml").read_text()
+    assert 'FACTORY_ROLE: "lead"' in lead_yaml
+    assert 'CLOUDSDK_CORE_DISABLE_PROMPTS: "1"' in deployer_yaml
+
+    psearch_kit = tmp_path / "psearch-kit"
+    scion_factory.compile_factory_boilerplate(
+        scion_factory.load_spec(ROOT / "presets" / "psearch.factory.yaml"), psearch_kit
+    )
+    opencode_launcher = psearch_kit / "templates" / "backend" / "home" / ".local" / "bin" / "opencode-launch.sh"
+    hermes_launcher = psearch_kit / "templates" / "reviewer" / "home" / ".local" / "bin" / "hermes-launch.sh"
+    assert opencode_launcher.is_file() and "google-vertex/gemini-4-argon" in opencode_launcher.read_text()
+    assert hermes_launcher.is_file() and "google/gemini-4-argon" in hermes_launcher.read_text()
 
 
 

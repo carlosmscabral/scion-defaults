@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     """Parse the command-line arguments and run the hot upgrade."""
     parser = argparse.ArgumentParser(description="Live hot-upgrade for Scion templates, prompt rules, and child agents")
     parser.add_argument("--project", required=True, help="Target Scion Hub project slug")
-    parser.add_argument("--templates", default=str(ROOT_DIR / "templates"), help="Templates directory path")
+    parser.add_argument("--templates", required=True, help="Compiled kit templates directory path (<kit>/templates)")
     parser.add_argument("--env", default="", help="Optional factory.env path")
     parser.add_argument("--roles", default="", help="Comma-separated template roles to push")
     parser.add_argument("--create-only", action="store_true", help="Default mode: create only missing Hub templates")
