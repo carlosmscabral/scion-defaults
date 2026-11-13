@@ -226,7 +226,7 @@ def _build_project_payload(
         if not git_url.endswith(".git"):
             git_url += ".git"
         branch = _resolve_branch(spec, branch_key, eff_env)
-        default_ws = "per-agent" if runtime == "kubernetes" else "shared"
+        default_ws = "per-agent" if runtime == "kubernetes" or vcs_enabled else "shared"
         ws_mode = eff_env.get("WORKSPACE_MODE", default_ws)
         body["gitRemote"] = git_url
         body["workspaceMode"] = ws_mode
