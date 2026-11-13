@@ -40,6 +40,8 @@ LAUNCHER = ["sh", "/home/scion/.local/bin/factory-cd.sh"]
 HARNESSES = ("claude", "antigravity", "opencode", "hermes")
 SUFFIX = "-factory"
 BASE_LINE = re.compile(r"^(?P<indent>[ \t]+)base:[ \t]*(?P<list>\[.*\])[ \t]*$", re.M)
+DEFAULT_PROVISIONER_TIMEOUT = "60s"
+DEFAULT_AGY_VERSION_TIMEOUT_SEC = 25
 
 
 def pre_start_iap_bytes():
@@ -60,6 +62,53 @@ def harness_vars(subdir, runtime="docker"):
     """${<HARNESS>_HARNESS} for the templates: the -factory config for monorepo subdirs or GKE pods."""
     suffix = SUFFIX if (subdir not in ("", ".") or runtime == "kubernetes") else ""
     return {f"{h.upper()}_HARNESS": h + suffix for h in HARNESSES}
+
+
+def harden_config_yaml(config_text, harness, auth_default_type=None, provisioner_timeout=DEFAULT_PROVISIONER_TIMEOUT):
+    """Apply Vertex AI auth default and Autopilot cold-start provisioner timeout cleanly when configured."""
+    if harness == "antigravity" and auth_default_type is None:
+        auth_default_type = "vertex-ai"
+    text = config_text
+    if auth_default_type:
+        if re.search(r"^auth:\s*$", text, re.M):
+            if re.search(r"^[ \t]+default_type:", text, re.M):
+                text = re.sub(
+                    r"(^auth:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+default_type:[ \t]*)[^\n]+",
+                    rf"\g<1>{auth_default_type}",
+                    text,
+                    count=1,
+                    flags=re.M,
+                )
+            else:
+                text = re.sub(r"(^auth:\s*\n)", rf"\g<1>  default_type: {auth_default_type}\n", text, count=1, flags=re.M)
+        else:
+            text = text.rstrip("\n") + f"\n\nauth:\n  default_type: {auth_default_type}\n"
+    if harness == "antigravity" and provisioner_timeout:
+        if re.search(r"^provisioner:\s*$", text, re.M):
+            if re.search(r"^provisioner:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+timeout:", text, re.M):
+                text = re.sub(
+                    r"(^provisioner:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+timeout:[ \t]*)[^\n]+",
+                    rf"\g<1>{provisioner_timeout}",
+                    text,
+                    count=1,
+                    flags=re.M,
+                )
+            else:
+                text = re.sub(r"(^provisioner:\s*\n)", rf"\g<1>  timeout: {provisioner_timeout}\n", text, count=1, flags=re.M)
+        else:
+            text = text.rstrip("\n") + f"\n\nprovisioner:\n  timeout: {provisioner_timeout}\n"
+    return text
+
+
+def harden_provision_py(py_text, version_timeout=DEFAULT_AGY_VERSION_TIMEOUT_SEC):
+    """Increase cold-start `agy --version` subprocess timeout in provision.py so Autopilot FUSE mounts don't flake."""
+    if "agy" not in py_text or "_get_agy_version" not in py_text:
+        return py_text
+    return re.sub(
+        r'(timeout\s*=\s*)([1-9]|1[0-9]|2[0-4])\b',
+        rf"\g<1>{int(version_timeout)}",
+        py_text,
+    )
 
 
 def prefix_command_base(config_text):
@@ -96,6 +145,7 @@ def build(scion_home, harness, apply):
         raise FileNotFoundError(f"no bundled harness-config {harness} at {src}")
     with open(config_path) as f:
         text, _ = prefix_command_base(f.read())
+    text = harden_config_yaml(text, harness)
     print(f"{harness} -> {harness + SUFFIX}: copy {src} to {dst}, command.base = {json.dumps(LAUNCHER)} + bundled base")
     if not apply:
         return dst
@@ -105,6 +155,14 @@ def build(scion_home, harness, apply):
                     ignore=shutil.ignore_patterns("*.bak.*", ".*.tmp-*", "__pycache__"))
     with open(os.path.join(dst, "config.yaml"), "w") as f:
         f.write(text)
+    prov_path = os.path.join(dst, "provision.py")
+    if os.path.isfile(prov_path):
+        with open(prov_path) as f:
+            prov_orig = f.read()
+        prov_hardened = harden_provision_py(prov_orig)
+        if prov_hardened != prov_orig:
+            with open(prov_path, "w") as f:
+                f.write(prov_hardened)
     bin_dir = os.path.join(dst, "home", ".local", "bin")
     os.makedirs(bin_dir, exist_ok=True)
     launcher = os.path.join(bin_dir, "factory-cd.sh")
@@ -190,7 +248,10 @@ def via_api(client, harnesses, apply):
             continue
             
         new_text, changed = prefix_command_base(config_text)
+        new_text = harden_config_yaml(new_text, harness)
         files["config.yaml"] = new_text.encode("utf-8")
+        if "provision.py" in files:
+            files["provision.py"] = harden_provision_py(files["provision.py"].decode("utf-8", errors="replace")).encode("utf-8")
         files["home/.local/bin/factory-cd.sh"] = launcher_bytes()
         files["home/.scion/hooks/pre-start.d/10-direct-iap-token"] = pre_start_iap_bytes()
         files["home/.scion/hooks/pre-stop.d/10-persist-telemetry"] = pre_stop_telemetry_bytes()
