@@ -1505,7 +1505,7 @@ def _load_env_map(env_file: str | Path | None) -> dict[str, str]:
     return env_map
 
 
-def _effective_gcp_identity_mode(spec: dict[str, Any], compile_env: dict[str, str] | None = None) -> str:
+def effective_gcp_identity_mode(spec: dict[str, Any], compile_env: dict[str, str] | None = None) -> str:
     """Return the explicit GCP identity mode configured in the spec or factory.env.
 
     If the mode is 'assign' on Docker, Scion mounts the GCE metadata sidecar.
@@ -1514,9 +1514,9 @@ def _effective_gcp_identity_mode(spec: dict[str, Any], compile_env: dict[str, st
     infra = spec.get("infrastructure") or {}
     env_map = compile_env or {}
     return (
-        str(infra.get("gcp_identity_mode") or "").strip()
-        or env_map.get("GCP_IDENTITY_DEFAULT", "").strip()
+        env_map.get("GCP_IDENTITY_DEFAULT", "").strip()
         or env_map.get("GCP_IDENTITY_MODE", "").strip()
+        or str(infra.get("gcp_identity_mode") or "").strip()
     )
 
 
@@ -1585,7 +1585,7 @@ def _render_chain_of_command(
         if rt == "kubernetes" and _vcs_enabled(spec)
         else ""
     )
-    id_mode = _effective_gcp_identity_mode(spec, compile_env)
+    id_mode = effective_gcp_identity_mode(spec, compile_env)
     omit_vertex_harness_auth = rt == "docker" and id_mode == "assign"
     rows = []
     for r in team:
@@ -1597,13 +1597,13 @@ def _render_chain_of_command(
         if not omit_vertex_harness_auth:
             cmd += " --harness-auth vertex-ai"
         if r.get("gcp_identity"):
-            cmd += ' ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}'
+            cmd += ' ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}'
         rows.append(f'| `{_agent(spec, r["role"])}` | `{cmd} "Read your instructions, then run your wake-up steps."` |')
     table = "\n".join(rows)
     sa_note = (
-        '\n- `SCION_DEPLOYER_SA_ID` is injected into your container environment by `scion-factory provision` '
+        '\n- `FACTORY_DEPLOYER_SA_ID` is injected into your container environment by `scion-factory provision` '
         "when a dedicated or `assign`-mode deployer service account is registered on the Hub. Before starting "
-        'that agent, check `echo "${SCION_DEPLOYER_SA_ID:-}"`. In `assign` mode, if it is empty, try '
+        'that agent, check `echo "${FACTORY_DEPLOYER_SA_ID:-}"`. In `assign` mode, if it is empty, try '
         "`scion project service-accounts list --json` (when supported by your `scion` CLI) and open a PO decision "
         "issue before starting the deployer if neither resolves the UUID."
         if any(r.get("gcp_identity") for r in team if r["role"] != lead_role) else ""
@@ -2706,7 +2706,10 @@ def compile_factory_boilerplate(
     out_dir: str | Path,
     force_knowledge: bool = False,
     env_file: str | Path | None = None,
+<<<<<<< HEAD
     skill_bank: str | Path | None = None,
+=======
+>>>>>>> refs/remotes/pr-latest/9
 ) -> dict[str, Any]:
     """Compile a validated FactorySpec into a complete Scion factory directory.
 
@@ -3011,8 +3014,11 @@ def main(argv: list[str] | None = None) -> int:
     p_compile.add_argument("--out", required=True, help="Output directory for generated factory boilerplate")
     p_compile.add_argument("--env", default=None,
                            help="Optional factory.env path to align GCP_IDENTITY_DEFAULT / GCP_IDENTITY_MODE at compile time")
+<<<<<<< HEAD
     p_compile.add_argument("--skill-bank", default=None,
                            help="Optional directory of curated skills to inject per role (overrides spec.skill_bank)")
+=======
+>>>>>>> refs/remotes/pr-latest/9
     p_compile.add_argument("--force-knowledge", action="store_true",
                            help="Reseed knowledge-plane/, backlog/, and eval-workspace/ even if they exist")
 
@@ -3145,7 +3151,10 @@ def main(argv: list[str] | None = None) -> int:
             args.out,
             force_knowledge=args.force_knowledge,
             env_file=args.env,
+<<<<<<< HEAD
             skill_bank=args.skill_bank,
+=======
+>>>>>>> refs/remotes/pr-latest/9
         )
         print(f"Compiled {res['files_written']} boilerplate files into {res['out_dir']}")
         if res.get("preserved"):

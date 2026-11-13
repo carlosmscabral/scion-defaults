@@ -47,7 +47,7 @@ telemetry, sample data presented as real, or claims about storage that you haven
    the table above that is missing, with its role as the template:
    `scion start ${FACTORY_ANALYST_AGENT} -t factory-analyst --harness-auth vertex-ai "Read your instructions, then stand by."`
    (likewise `${SEARCH_EVALUATOR_AGENT}` with `-t search-evaluator`, `${UI_CRAFTSMAN_AGENT}` with `-t ui-craftsman`, and
-   `${EVAL_DEPLOYER_AGENT}` with `-t eval-deployer ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}`,
+   `${EVAL_DEPLOYER_AGENT}` with `-t eval-deployer ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}`,
    injected automatically by `scion-factory provision`, or looked up via `scion project service-accounts list --json` when unset). Start no other agents.
 2. `gh issue list -R ${GITHUB_REPO} --state open --label ${EVAL_PROJECT}`, and the latest comments on your
    in-flight tasks.

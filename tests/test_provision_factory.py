@@ -131,7 +131,7 @@ def test_scion_factory_provision_dry_run_and_apply_against_gke_fake_hub(fake_hub
 
     # Verify dedicated deployer SA UUID and base64-encoded GitHub secrets are injected BEFORE lead starts
     import base64
-    assert fake_hub.project_env[build_pid]["SCION_DEPLOYER_SA_ID"] == {
+    assert fake_hub.project_env[build_pid]["FACTORY_DEPLOYER_SA_ID"] == {
         "value": "sa-uuid-2",
         "injectionMode": "always",
     }
@@ -341,11 +341,11 @@ def test_provision_go_waits_for_tmux_session_before_sending_go_message(fake_hub,
     )
     msg_idx = req_paths.index("/api/v1/projects/pid-k8s-version/agents/k8s-version-lead/message")
     assert last_exec_idx < msg_idx
-    assert "SCION_DEPLOYER_SA_ID" not in getattr(fake_hub, "project_env", {}).get("pid-k8s-version", {})
+    assert "FACTORY_DEPLOYER_SA_ID" not in getattr(fake_hub, "project_env", {}).get("pid-k8s-version", {})
 
 
 def test_single_vm_docker_provision_injects_shared_deployer_sa_uuid_and_handles_dry_run_factory_projects(fake_hub, tmp_path):
-    """Verify Single-VM Docker assign mode registers shared SA, injects SCION_DEPLOYER_SA_ID, and passes dry-run when FACTORY_PROJECTS pre-names new projects."""
+    """Verify Single-VM Docker assign mode registers shared SA, injects FACTORY_DEPLOYER_SA_ID, and passes dry-run when FACTORY_PROJECTS pre-names new projects."""
     spec = _starter()
     spec["project"]["slug"] = "vm-app"
     spec["project"]["eval_slug"] = "vm-app-eval"
@@ -362,7 +362,9 @@ def test_single_vm_docker_provision_injects_shared_deployer_sa_uuid_and_handles_
         f"HUB_URL={fake_hub.url}\n"
         "SCION_HUB_TOKEN=fake-pat\n"
         "GCP_IDENTITY_DEFAULT=assign\n"
-        "WORKER_SA_EMAIL=cabral-agent@single-vm-proj.iam.gserviceaccount.com\n"
+        "GITHUB_TOKEN=fake\n"
+        "SINGLE_SA_MODE=1\n"
+        "WORKER_SA_EMAIL=agent-worker@single-vm-proj.iam.gserviceaccount.com\n"
         "FACTORY_PROJECTS=vm-app,vm-app-eval\n"
         "AGENT_START_TIMEOUT_SEC=5\n"
         "AGENT_START_POLL_SEC=0.05\n"
@@ -413,13 +415,13 @@ def test_single_vm_docker_provision_injects_shared_deployer_sa_uuid_and_handles_
     assert fake_hub.project_settings[build_pid]["defaultGCPIdentityMode"] == "assign"
     assert fake_hub.project_settings[build_pid]["defaultGCPIdentityServiceAccountID"] == "sa-uuid-1"
     for pid in (build_pid, eval_pid):
-        assert fake_hub.project_env[pid]["SCION_DEPLOYER_SA_ID"] == {
+        assert fake_hub.project_env[pid]["FACTORY_DEPLOYER_SA_ID"] == {
             "value": "sa-uuid-1",
             "injectionMode": "always",
         }
     put_env_idx = next(
         i for i, r in enumerate(fake_hub.requests)
-        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/SCION_DEPLOYER_SA_ID") and build_pid in r["path"]
+        if r["method"] == "PUT" and r["path"].startswith("/api/v1/env/FACTORY_DEPLOYER_SA_ID") and build_pid in r["path"]
     )
     start_lead_idx = next(
         i for i, r in enumerate(fake_hub.requests)
@@ -442,12 +444,12 @@ def test_docker_passthrough_registers_explicit_deployer_sa_and_shell_expansion_h
 
     # Verify POSIX shell expansion: unset -> no --service-account flag; set -> --service-account <id>
     unset_args = subprocess.check_output(
-        ["bash", "-c", 'unset SCION_DEPLOYER_SA_ID; printf "%s\\n" ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"} "prompt"'],
+        ["env", "-u", "FACTORY_DEPLOYER_SA_ID", "bash", "-c", 'printf "%s\\n" ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"} "prompt"'],
         text=True,
     ).splitlines()
     assert unset_args == ["prompt"]
     set_args = subprocess.check_output(
-        ["bash", "-c", 'SCION_DEPLOYER_SA_ID="sa-uuid-99"; printf "%s\\n" ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"} "prompt"'],
+        ["env", "FACTORY_DEPLOYER_SA_ID=sa-uuid-99", "bash", "-c", 'printf "%s\\n" ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"} "prompt"'],
         text=True,
     ).splitlines()
     assert set_args == ["--service-account", "sa-uuid-99", "prompt"]
@@ -481,7 +483,7 @@ def test_docker_passthrough_registers_explicit_deployer_sa_and_shell_expansion_h
     )
     assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
     build_pid = fake_hub.projects_by_slug["pass-app"]["id"]
-    assert fake_hub.project_env[build_pid]["SCION_DEPLOYER_SA_ID"] == {
+    assert fake_hub.project_env[build_pid]["FACTORY_DEPLOYER_SA_ID"] == {
         "value": "sa-uuid-1",
         "injectionMode": "always",
     }
@@ -635,7 +637,7 @@ def test_provision_single_project_delta_creates_one_project_no_schedule_and_enab
     out = json.loads(r_apply.stdout)
     assert out["ok"] is True, out
 
-    # 1. Single project ONLY across phases 4-9 (no -eval project, no eval-lead started; built-in `global` untouched)
+    # 1. Single project ONLY across phases 4-9 (no -eval project, no eval-lead started built-in `global` untouched)
     assert set(fake_hub.projects_by_slug) - {"global"} == {"bananacast-hc1"}
     build_pid = fake_hub.projects_by_slug["bananacast-hc1"]["id"]
     assert out["factory_projects"] == [build_pid]
@@ -742,7 +744,7 @@ def test_ensure_vertex_env_fails_fast_when_hub_drops_project_env_and_warns_on_hu
 
 
 def test_control_plane_identity_prefers_project_owner_and_falls_back_with_a_named_role():
-    # The control plane execs into agents and deletes them; current Scion reserves both for
+    # The control plane execs into agents and deletes them current Scion reserves both for
     # project-owner. With project-admin the factory could neither wake lead nor go to sleep
     # (hillclimb Run 1).
     import provision_factory
@@ -813,3 +815,29 @@ def test_provision_factory_spot_workers_lead_on_demand(fake_hub, tmp_path):
 
     eval_lead_post = next(p for p in agent_posts if p["name"] == "eval-lead")
     assert eval_lead_post["profile"] == "remote"
+
+
+def test_kubernetes_provisioning_with_sandbox_project_and_empty_hub_project(fake_hub, tmp_path):
+    spec = _starter()
+    spec["project"]["slug"] = "sbx-only"
+    spec["project"]["eval_slug"] = "sbx-only-eval"
+    spec["infrastructure"]["runtime"] = "kubernetes"
+    spec_path = tmp_path / "factory.yaml"
+    kit_dir = tmp_path / "kit"
+    scion_factory.save_spec(spec, spec_path)
+    scion_factory.compile_factory_boilerplate(spec, kit_dir)
+
+    env_file = write_gke_factory_env(tmp_path, fake_hub.url)
+    env_text = "\n".join(
+        line for line in env_file.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("HUB_PROJECT=")
+    ) + "\nHUB_PROJECT=\nSANDBOX_PROJECT=demo-sbx\n"
+    env_file.write_text(env_text, encoding="utf-8")
+
+    r_apply = subprocess.run(
+        [sys.executable, "scripts/scion_factory.py", "provision", str(spec_path),
+         "--kit", str(kit_dir), "--env", str(env_file), "--apply", "--json"],
+        cwd=ROOT, env=fake_cli_env(tmp_path, fake_hub.url), capture_output=True, text=True,
+    )
+    assert r_apply.returncode == 0, r_apply.stderr + "\n" + r_apply.stdout
+    assert json.loads(r_apply.stdout)["ok"] is True

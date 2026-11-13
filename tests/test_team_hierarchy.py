@@ -152,14 +152,14 @@ def test_renamed_eval_lead_is_detected_by_kind_when_not_first(tmp_path):
 
 
 def test_deployer_start_uses_injected_sa_env_var_and_docker_assign_omits_vertex_harness_auth(tmp_path):
-    """Verify compiled leads pass ${SCION_DEPLOYER_SA_ID} and omit --harness-auth vertex-ai on Docker assign mode."""
+    """Verify compiled leads pass ${FACTORY_DEPLOYER_SA_ID} and omit --harness-auth vertex-ai on Docker assign mode."""
     spec = scion_factory.load_spec(PRESET)
     out_default = tmp_path / "kit-default"
     scion_factory.compile_factory_boilerplate(spec, out_default)
     lead_default = _prompt(out_default, "lead")
     eval_lead_default = _prompt(out_default, "eval-lead")
-    assert '${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}' in lead_default
-    assert '${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}' in eval_lead_default
+    assert '${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}' in lead_default
+    assert '${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}' in eval_lead_default
     assert "--service-account <ID>" not in lead_default
     assert "--harness-auth vertex-ai" in lead_default
 
@@ -172,7 +172,7 @@ def test_deployer_start_uses_injected_sa_env_var_and_docker_assign_omits_vertex_
     lead_assign = _prompt(out_assign, "lead")
     assert "--harness-auth vertex-ai" not in lead_assign
     assert (
-        'scion start deployer -t deployer ${SCION_DEPLOYER_SA_ID:+--service-account "$SCION_DEPLOYER_SA_ID"}'
+        'scion start deployer -t deployer ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}'
         in lead_assign
     )
 
