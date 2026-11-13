@@ -18,6 +18,8 @@ CLI_FOLDER_ID=""
 CLI_ORG_ID=""
 CLI_BILLING_ACCOUNT=""
 CLI_WRITE_ENV_FILE=""
+CLI_PRE_HOOKS=()
+CLI_POST_HOOKS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +35,8 @@ while [[ $# -gt 0 ]]; do
     --org-id) CLI_ORG_ID="$2"; shift 2 ;;
     --billing-account) CLI_BILLING_ACCOUNT="$2"; shift 2 ;;
     --write-env) CLI_WRITE_ENV_FILE="$2"; shift 2 ;;
+    --pre-hook) CLI_PRE_HOOKS+=("$2"); shift 2 ;;
+    --post-hook) CLI_POST_HOOKS+=("$2"); shift 2 ;;
     --approve-apply) CLI_APPROVE_APPLY="1"; shift 1 ;;
     --dry-run) CLI_DRY_RUN="1"; shift 1 ;;
     -h|--help) echo "Usage: $0 [options]"; exit 0 ;;
@@ -47,6 +51,7 @@ _PRESERVE_VARS=(
   EXTRA_ADMIN_EMAILS EXTRA_IAP_MEMBERS IAP_OAUTH_CLIENT_ID HUB_IMPERSONATE_SA USE_OPERATOR_SA
   FOLDER_ID ORG_ID BILLING_ACCOUNT SCION_GIT_URL SCION_REF DRY_RUN BUILD_POLL_SEC SKIP_EXISTING_IMAGES
   CREATE_PROJECT WRITE_ENV_FILE SCION_REPO TIER HUB_MODE HARNESSES IMAGE_TAG WORK_DIR
+  PRE_HOOKS_ENV POST_HOOKS_ENV
 )
 for _v in "${_PRESERVE_VARS[@]}"; do
   if [[ -n "${!_v:-}" ]]; then
@@ -149,6 +154,25 @@ run() {
   else
     "$@"
   fi
+}
+
+run_hooks() {
+  local phase="$1"
+  shift
+  local hook
+  export HUB_PROJECT HUB_REGION HUB_ZONE SHARED_PREFIX HUB_NAME TIER HUB_MODE
+  export SCION_REPO WORK_DIR ABS_WORK_DIR CLUSTER_NAME HUB_K8S_NAMESPACE
+  export IMAGE_REGISTRY IMAGE_TAG APPROVE_APPLY DRY_RUN PO_EMAIL
+  export HUB_URL_OUT="${HUB_URL_OUT:-}" IAP_CLIENT_ID="${IAP_CLIENT_ID:-}"
+  for hook in "$@"; do
+    [[ -n "$hook" ]] || continue
+    echo "== Running ${phase}-hook: ${hook}"
+    if [[ -x "$hook" ]]; then
+      run "$hook"
+    else
+      run bash "$hook"
+    fi
+  done
 }
 
 wait_for_cloud_build() {
@@ -324,6 +348,25 @@ EOF
   fi
 }
 
+PRE_HOOKS=()
+POST_HOOKS=("${CLI_POST_HOOKS[@]+"${CLI_POST_HOOKS[@]}"}")
+if [[ -n "${PRE_HOOKS_ENV:-}" ]]; then
+  IFS=',' read -ra _ENV_PRE <<< "$PRE_HOOKS_ENV"
+  PRE_HOOKS+=("${_ENV_PRE[@]+"${_ENV_PRE[@]}"}")
+fi
+PRE_HOOKS+=("${CLI_PRE_HOOKS[@]+"${CLI_PRE_HOOKS[@]}"}")
+if [[ -n "${POST_HOOKS_ENV:-}" ]]; then
+  IFS=',' read -ra _ENV_POST <<< "$POST_HOOKS_ENV"
+  POST_HOOKS+=("${_ENV_POST[@]+"${_ENV_POST[@]}"}")
+fi
+for _h in "${PRE_HOOKS[@]+"${PRE_HOOKS[@]}"}" "${POST_HOOKS[@]+"${POST_HOOKS[@]}"}"; do
+  [[ -n "$_h" ]] || continue
+  if [[ ! -f "$_h" ]]; then
+    echo "Hook script not found: ${_h}" >&2
+    exit 1
+  fi
+done
+
 mkdir -p "$WORK_DIR"
 ABS_WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
@@ -359,6 +402,10 @@ if [[ -z "$SCION_REPO" ]]; then
       run git clone --depth 1 -b "$SCION_REF" "$SCION_GIT_URL" "$SCION_REPO"
     fi
   fi
+fi
+
+if [[ ${#PRE_HOOKS[@]} -gt 0 ]]; then
+  run_hooks "pre" "${PRE_HOOKS[@]}"
 fi
 
 OPERATOR_SA_NAME="${OPERATOR_SA_NAME:-factory-operator}"
@@ -936,6 +983,10 @@ EOF
   else
     echo "Plan: would run $SCION_REPO/scripts/single-node-vm/deploy.sh --config ${ABS_WORK_DIR}/deploy-config.json"
   fi
+fi
+
+if [[ ${#POST_HOOKS[@]} -gt 0 ]]; then
+  run_hooks "post" "${POST_HOOKS[@]}"
 fi
 
 echo ""

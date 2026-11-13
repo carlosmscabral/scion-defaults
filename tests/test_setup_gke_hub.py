@@ -1660,3 +1660,91 @@ def test_setup_gke_hub_patches_iam_sleep_suppresses_scion_base_warning_and_retri
     assert state["env"]["GOOGLE_CLOUD_PROJECT"]["value"] == "demo-hub-proj"
     assert state["server_config"]["telemetry"]["cloud"]["gcp_project_id"] == "demo-hub-proj"
 
+
+def test_setup_gke_hub_runs_pre_and_post_hooks_and_validates_missing(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-hooks"
+    pre_hook = tmp_path / "pre.sh"
+    post_hook = tmp_path / "post.sh"
+    pre_hook.write_text("#!/usr/bin/env bash\necho PRE:$HUB_PROJECT:$HUB_NAME\n")
+    post_hook.write_text("#!/usr/bin/env bash\necho POST:$HUB_K8S_NAMESPACE:$IMAGE_TAG\n")
+
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "demo-scion-x",
+        "HUB_REGION": "us-central1",
+        "HUB_ZONE": "us-central1-b",
+        "SHARED_PREFIX": "tfhx",
+        "HUB_NAME": "main",
+        "PO_EMAIL": "admin@example.com",
+    }
+
+    # Dry-run prints planned pre/post hook invocations without executing them
+    res_dry = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--scion-repo", str(scion_repo),
+            "--work-dir", str(work_dir),
+            "--pre-hook", str(pre_hook),
+            "--post-hook", str(post_hook),
+            "--image-tag", "v20261112",
+        ],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    out_dry = res_dry.stdout + res_dry.stderr
+    assert res_dry.returncode == 0, out_dry
+    assert "Running pre-hook" in out_dry and str(pre_hook) in out_dry
+    assert "Running post-hook" in out_dry and str(post_hook) in out_dry
+
+    # Missing hook fails fast before Step 1
+    res_missing = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--scion-repo", str(scion_repo),
+            "--work-dir", str(work_dir),
+            "--pre-hook", str(tmp_path / "missing.sh"),
+        ],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    assert res_missing.returncode == 1
+    assert "Hook script not found" in res_missing.stderr
+
+    # Hybrid non-dry-run actually executes pre-hook and post-hook in order with exported context
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gcloud_stub = bin_dir / "gcloud"
+    gcloud_stub.write_text("#!/usr/bin/env bash\nif [[ \"$1 $2\" == \"builds describe\" ]]; then echo SUCCESS; fi\nexit 0\n")
+    gcloud_stub.chmod(0o755)
+    deploy_sh = scion_repo / "scripts" / "single-node-vm" / "deploy.sh"
+    deploy_sh.parent.mkdir(parents=True, exist_ok=True)
+    deploy_sh.write_text("#!/usr/bin/env bash\necho DEPLOY_CALLED\n")
+    deploy_sh.chmod(0o755)
+    build_sh = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_sh.parent.mkdir(parents=True, exist_ok=True)
+    build_sh.write_text("#!/usr/bin/env bash\necho https://console.cloud.google.com/cloud-build/builds/11111111-1111-1111-1111-111111111111\n")
+    build_sh.chmod(0o755)
+    res_exec = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier", "hybrid-gke",
+            "--scion-repo", str(scion_repo),
+            "--work-dir", str(work_dir),
+            "--pre-hook", str(pre_hook),
+            "--post-hook", str(post_hook),
+            "--image-tag", "v20261112",
+            "--approve-apply",
+        ],
+        cwd=ROOT,
+        env={**env, "DRY_RUN": "0", "SKIP_EXISTING_IMAGES": "1", "PATH": f"{bin_dir}:{env['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    assert res_exec.returncode == 0, res_exec.stdout + res_exec.stderr
+    assert "PRE:demo-scion-x:main" in res_exec.stdout
+    assert "DEPLOY_CALLED" in res_exec.stdout
+    assert "POST:scion-hub-main:v20261112" in res_exec.stdout
+    assert res_exec.stdout.index("PRE:demo-scion-x:main") < res_exec.stdout.index("DEPLOY_CALLED") < res_exec.stdout.index("POST:scion-hub-main:v20261112")
