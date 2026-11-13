@@ -1,0 +1,966 @@
+diff --git a/pkg/experiments/registry.go b/pkg/experiments/registry.go
+index a03ed8690..7f0f1b11f 100644
+--- a/pkg/experiments/registry.go
++++ b/pkg/experiments/registry.go
+@@ -207,6 +207,12 @@ const AsyncAgentLaunch = "hub.async_agent_launch"
+ // whatever its value.
+ const AsyncAgentStart = "hub.async_agent_start"
+ 
++// TelegramDMMirror mirrors native web DMs with the Telegram broker: the web DM
++// view also shows telegram-channel rows of the same conversation, and web-stored
++// agent replies plus web-typed user messages are copied to the user's Telegram
++// chat. Out-of-tree patch (scion-defaults patches/telegram-dm-mirror).
++const TelegramDMMirror = "hub.telegram_dm_mirror"
++
+ // compiled is the production experiment list. It is reachable only through
+ // Default(); there is no package-level Lookup/All, so hub code cannot bypass
+ // the Registry instance it was given (ptone/scion#2217).
+@@ -379,6 +385,17 @@ var compiled = []Experiment{
+ 		Owner:       "harness",
+ 		ReviewBy:    "2027-01-13",
+ 	},
++	{
++		Name:        TelegramDMMirror,
++		Title:       "Telegram DM mirror",
++		Description: "Shows a user's Telegram messages to an agent in the native web DM (history and live), and copies web-stored agent replies and web-typed user messages to the user's Telegram chat. Copies are observer-only, so no extra rows are stored. Read on every message; no restart needed.",
++		Default:     false,
++		Layers:      []Layer{LayerServer},
++		Stage:       StageAlpha,
++		Issue:       "local/telegram-dm-mirror",
++		Owner:       "local",
++		ReviewBy:    "2027-03-31",
++	},
+ }
+ 
+ // compiledRetired lists names that PUT rejects true/false for, ignores and
+diff --git a/pkg/hub/events.go b/pkg/hub/events.go
+index 62c5217fa..8eb52af49 100644
+--- a/pkg/hub/events.go
++++ b/pkg/hub/events.go
+@@ -20,6 +20,7 @@ import (
+ 	"log/slog"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
+@@ -417,6 +418,28 @@ type DispatchDoneEvent struct {
+ // one place guarantees both backends publish identical subjects and payloads.
+ type eventBuilder struct {
+ 	sink func(subject string, event interface{})
++	// dmMirrorChannel (Telegram DM mirror, local patch) reports whether a
++	// non-web channel's DM messages are also pushed on user.<id>.chat.dm.
++	// Unset means web only, as upstream.
++	dmMirrorChannel atomic.Pointer[func(channel string) bool]
++}
++
++// setDMMirrorChannel installs the DM mirror channel predicate (see
++// Server.SetEventPublisher).
++func (p *eventBuilder) setDMMirrorChannel(f func(channel string) bool) {
++	p.dmMirrorChannel.Store(&f)
++}
++
++// dmSubjectChannel reports whether a DM message on channel ch is pushed on
++// the user.<id>.chat.dm subject.
++func (p *eventBuilder) dmSubjectChannel(ch string) bool {
++	if ch == "web" {
++		return true
++	}
++	if f := p.dmMirrorChannel.Load(); f != nil && *f != nil {
++		return (*f)(ch)
++	}
++	return false
+ }
+ 
+ // ChannelEventPublisher is an in-process event publisher that fans out events
+@@ -839,7 +862,7 @@ func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message,
+ 	// v2 frontend (which subscribes to user.<self>.chat.>) receives real-time
+ 	// DM updates. The wave-1 user.<id>.message subject above is kept for
+ 	// backward compat. Wave-2 §4.4.
+-	if msg.Channel == "web" && msg.ThreadID != "" && strings.HasPrefix(msg.ThreadID, "dm:") {
++	if msg.ThreadID != "" && strings.HasPrefix(msg.ThreadID, "dm:") && p.dmSubjectChannel(msg.Channel) {
+ 		// Publish to both participants extracted from the DM key.
+ 		dmParts := strings.Split(msg.ThreadID, ":")
+ 		if len(dmParts) >= 5 {
+diff --git a/pkg/hub/handlers_agent_messaging.go b/pkg/hub/handlers_agent_messaging.go
+index 51fc9b6cf..4a438eb24 100644
+--- a/pkg/hub/handlers_agent_messaging.go
++++ b/pkg/hub/handlers_agent_messaging.go
+@@ -1458,6 +1458,13 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
+ 			// lifecycle events.
+ 			persisting := bp.subscribeProjectUserMessages(agent.ProjectID)
+ 			recordLogged = persisting
++			// Telegram DM mirror: copy before publishing — deliverToUser
++			// mutates the shared message (Metadata, ConversationID).
++			var tgMirror *messages.StructuredMessage
++			if s.agentReplyMirrorsToTelegram(structuredMsg, result.ConvResult) {
++				cp := *structuredMsg
++				tgMirror = &cp
++			}
+ 			err := bp.PublishUserMessage(ctx, agent.ProjectID, result.RecipientID, structuredMsg)
+ 			if errors.Is(err, eventbus.ErrReservedChannel) {
+ 				// Nothing was published or stored: the request named a
+@@ -1521,6 +1528,10 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
+ 			}
+ 			s.messageLog.Info("Outbound message dispatched through broker",
+ 				"agent_id", agent.ID, "recipient_id", result.RecipientID, "project_id", agent.ProjectID)
++			if tgMirror != nil {
++				s.mirrorToTelegram(ctx, agent.ProjectID, agent.Slug, *tgMirror, storeMsg.CreatedAt,
++					map[string]string{tgMirrorOriginKey: "web"})
++			}
+ 		}
+ 
+ 	case deliveryUserDirect:
+diff --git a/pkg/hub/handlers_broker_inbound.go b/pkg/hub/handlers_broker_inbound.go
+index e48952551..2b32221b6 100644
+--- a/pkg/hub/handlers_broker_inbound.go
++++ b/pkg/hub/handlers_broker_inbound.go
+@@ -594,6 +594,7 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
+ 	} else {
+ 		// Validated dm: key: advance the sender's v2 watermarks before
+ 		// publish; their web client refetches unread state on this event.
++		pubMsg := storeMsg
+ 		if strings.HasPrefix(storeMsg.ThreadID, "dm:") && senderUserID != "" {
+ 			s.mu.RLock()
+ 			dmWcs := s.webChatStore
+@@ -603,8 +604,24 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
+ 				s.touchConversationActivity(r.Context(), storeMsg.ThreadID, storeMsg.ID)
+ 				s.autoAdvanceSenderReadState(r.Context(), senderUserID, storeMsg.ThreadID, storeMsg.ID)
+ 			}
++		} else if dmKey := s.telegramInboundDMKey(storeMsg, effectiveConv, senderUserID); dmKey != "" {
++			// Telegram DM mirror: the row was filed in the native DM
++			// conversation without a thread key. Treat it like a DM send
++			// for watermarks, and give the live event the DM key so the
++			// open web DM shows it. The stored row keeps ThreadID "".
++			s.mu.RLock()
++			dmWcs := s.webChatStore
++			s.mu.RUnlock()
++			if dmWcs != nil {
++				registerDMParticipants(r.Context(), dmWcs, dmKey)
++				s.touchConversationActivity(r.Context(), dmKey, storeMsg.ID)
++				s.autoAdvanceSenderReadState(r.Context(), senderUserID, dmKey, storeMsg.ID)
++			}
++			ev := *storeMsg
++			ev.ThreadID = dmKey
++			pubMsg = &ev
+ 		}
+-		s.events.PublishUserMessage(r.Context(), storeMsg, nil, nil)
++		s.events.PublishUserMessage(r.Context(), pubMsg, nil, nil)
+ 
+ 		// Group conversations: list the dispatched agent and the posting
+ 		// user as participants, mirroring the native group path (listing
+diff --git a/pkg/hub/handlers_chat_v2.go b/pkg/hub/handlers_chat_v2.go
+index 11f3d867b..4a30136ea 100644
+--- a/pkg/hub/handlers_chat_v2.go
++++ b/pkg/hub/handlers_chat_v2.go
+@@ -2067,6 +2067,24 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
+ 		dispatchedAgents = append(dispatchedAgents, primaryAgent)
+ 	}
+ 
++	// Telegram DM mirror: echo a delivered web DM message to the user's
++	// Telegram chat. Built fresh from the stored row (original text, not the
++	// agent-facing rendering), so it shares nothing with msg.
++	if primaryDispatchOK && strings.HasPrefix(key, "dm:") && s.telegramDMMirrorEnabled() {
++		s.mirrorToTelegram(ctx, primaryAgent.ProjectID, primaryAgent.Slug, messages.StructuredMessage{
++			Version:     messages.Version,
++			Sender:      msg.Sender,
++			SenderID:    msg.SenderID,
++			Recipient:   msg.Recipient,
++			RecipientID: msg.RecipientID,
++			Msg:         storeMsg.Msg,
++			Type:        storeMsg.Type,
++		}, storeMsg.CreatedAt, map[string]string{
++			tgMirrorOriginKey:     "web",
++			tgMirrorSenderNameKey: user.DisplayName(),
++		})
++	}
++
+ 	// Handle additional mentioned agents (fan-out).
+ 	if len(agents) > 1 {
+ 		for _, mentionAgent := range agents[1:] {
+@@ -2998,6 +3016,13 @@ func (s *Server) handleConversationHistory(w http.ResponseWriter, r *http.Reques
+ 			ThreadID: key,
+ 		}
+ 	}
++	// Telegram DM mirror: a web DM view also shows the telegram rows of its
++	// conversation. Other external channels stay excluded (G3-d); a visitor's
++	// page (historyChannel "") already lists every channel.
++	if isDM && filter.Channel == "web" && s.telegramDMMirrorEnabled() {
++		filter.Channel = ""
++		filter.Channels = tgMirrorDMChannels
++	}
+ 	opts := store.ListOptions{
+ 		Limit: limit,
+ 		// Keyset pagination cursor. The client sends the opaque `nextCursor`
+@@ -3022,7 +3047,7 @@ func (s *Server) handleConversationHistory(w http.ResponseWriter, r *http.Reques
+ 			}
+ 			return
+ 		}
+-		if (filter.Channel != "" && anchor.Channel != filter.Channel) ||
++		if !filterAllowsChannel(filter, anchor.Channel) ||
+ 			(filter.ConversationID != "" && anchor.ConversationID != filter.ConversationID) ||
+ 			(filter.ThreadID != "" && anchor.ThreadID != filter.ThreadID) {
+ 			NotFound(w, "Message")
+@@ -3582,8 +3607,9 @@ func (s *Server) conversationRecentMessages(
+ 		// Mention fan-out copies are excluded, matching nativeDMLastMessages —
+ 		// chat-thread does not display them, so they must not count as the
+ 		// "latest message" mark-unread reasons about.
+-		filter = store.MessageFilter{Channel: nativeDMMessageScope.Channel, ThreadID: key,
+-			ExcludeType: nativeDMMessageScope.ExcludeType}
++		scope := s.nativeDMScope()
++		filter = store.MessageFilter{Channel: scope.Channel, Channels: scope.Channels, ThreadID: key,
++			ExcludeType: scope.ExcludeType}
+ 		if ops := s.GetOperationalSettings(); ops != nil && ops.ConversationEnvelopeSwitch() {
+ 			parts := strings.Split(key, ":")
+ 			if len(parts) != 5 {
+@@ -4257,9 +4283,10 @@ func (s *Server) nativeDMLastMessagesStrict(ctx context.Context, keys []string)
+ 		return result, nil
+ 	}
+ 
++	scope := s.nativeDMScope()
+ 	ops := s.GetOperationalSettings()
+ 	if ops == nil || !ops.ConversationEnvelopeSwitch() {
+-		latest, err := s.store.LatestMessagesByThreadIDs(ctx, keys, nativeDMMessageScope)
++		latest, err := s.store.LatestMessagesByThreadIDs(ctx, keys, scope)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("latest DM messages: %w", err)
+ 		}
+@@ -4307,7 +4334,7 @@ func (s *Server) nativeDMLastMessagesStrict(ctx context.Context, keys []string)
+ 	if len(convIDs) == 0 {
+ 		return result, nil
+ 	}
+-	latest, err := s.store.LatestMessagesByConversationIDs(ctx, convIDs, nativeDMMessageScope)
++	latest, err := s.store.LatestMessagesByConversationIDs(ctx, convIDs, scope)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("latest DM conversation messages: %w", err)
+ 	}
+diff --git a/pkg/hub/messagebroker.go b/pkg/hub/messagebroker.go
+index ed5514e15..0094fb0db 100644
+--- a/pkg/hub/messagebroker.go
++++ b/pkg/hub/messagebroker.go
+@@ -296,6 +296,18 @@ func (p *MessageBrokerProxy) PublishUserMessage(ctx context.Context, projectID,
+ 	return p.bus.Publish(ctx, topic, msg)
+ }
+ 
++// PublishChannelMirror publishes an observer-only copy of a message on the
++// AGENT topic so that only the broker spoke named by msg.Channel acts on it.
++// The agent topic's in-process subscriber (deliverToAgent) skips ObserverOnly
++// messages, whereas the user topic's deliverToUser would persist a duplicate
++// row — so mirrors must never go through PublishUserMessage.
++func (p *MessageBrokerProxy) PublishChannelMirror(ctx context.Context, projectID, agentSlug string, msg *messages.StructuredMessage) error {
++	if msg == nil || !msg.ObserverOnly || msg.Channel == "" {
++		return errors.New("channel mirror must be observer-only and name a channel")
++	}
++	return p.bus.Publish(ctx, eventbus.TopicAgentMessages(projectID, agentSlug), msg)
++}
++
+ // PublishToGroup fans out a message to a parsed set of recipients, delegating
+ // to PublishMessage for agents and PublishUserMessage for users.
+ func (p *MessageBrokerProxy) PublishToGroup(ctx context.Context, projectID string, recipients []messages.GroupRecipient, msg *messages.StructuredMessage) map[string]error {
+diff --git a/pkg/hub/server.go b/pkg/hub/server.go
+index 785c45c5a..bf7929024 100644
+--- a/pkg/hub/server.go
++++ b/pkg/hub/server.go
+@@ -4676,6 +4676,14 @@ func (s *Server) SetGCPProjectID(projectID string) {
+ }
+ 
+ func (s *Server) SetEventPublisher(ep EventPublisher) {
++	// Telegram DM mirror (local patch): telegram DM rows are pushed live on
++	// the DM subject while the experiment is on. Checked per event; the
++	// experiment read takes no Server lock.
++	if m, ok := ep.(interface{ setDMMirrorChannel(func(string) bool) }); ok {
++		m.setDMMirrorChannel(func(ch string) bool {
++			return ch == tgMirrorChannel && s.telegramDMMirrorEnabled()
++		})
++	}
+ 	s.mu.Lock()
+ 	s.events = ep
+ 	s.mu.Unlock()
+diff --git a/pkg/hub/telegram_dm_mirror.go b/pkg/hub/telegram_dm_mirror.go
+new file mode 100644
+index 000000000..41123857b
+--- /dev/null
++++ b/pkg/hub/telegram_dm_mirror.go
+@@ -0,0 +1,148 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package hub
++
++// Telegram DM mirror (local patch, experiment hub.telegram_dm_mirror).
++//
++// A user's Telegram messages to an agent are stored with channel "telegram"
++// in the same direct conversation as the native web DM, but the web DM view
++// only reads channel "web" (G3-d). With the experiment on:
++//   - the web DM view reads {web, telegram} rows of DM conversations, and
++//     telegram rows are pushed live on the DM subject with the DM key;
++//   - web-stored agent replies and web-typed user messages are copied to the
++//     Telegram spoke as observer-only messages on the agent topic, so no
++//     extra row is stored (deliverToAgent skips ObserverOnly).
++// With the experiment off every path behaves exactly as upstream.
++
++import (
++	"context"
++	"slices"
++	"strings"
++	"time"
++
++	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
++	"github.com/GoogleCloudPlatform/scion/pkg/messages"
++	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
++	"github.com/GoogleCloudPlatform/scion/pkg/store"
++)
++
++const (
++	tgMirrorChannel = "telegram"
++	// Metadata keys the Telegram plugin uses to recognize and label mirror
++	// copies. The plugin patch defines the same literals.
++	tgMirrorOriginKey     = "mirror_origin"
++	tgMirrorSenderNameKey = "sender_display_name"
++)
++
++// tgMirrorDMChannels is the channel set the web DM view reads while the mirror
++// is on. Other external channels (discord) and NULL-channel notices stay hidden.
++var tgMirrorDMChannels = []string{"web", tgMirrorChannel}
++
++func (s *Server) telegramDMMirrorEnabled() bool {
++	return s.experimentEnabled(experiments.TelegramDMMirror)
++}
++
++// nativeDMScope is nativeDMMessageScope, widened to tgMirrorDMChannels while
++// the mirror is on.
++func (s *Server) nativeDMScope() store.LatestMessageOptions {
++	if !s.telegramDMMirrorEnabled() {
++		return nativeDMMessageScope
++	}
++	return store.LatestMessageOptions{Channels: tgMirrorDMChannels, ExcludeType: nativeDMMessageScope.ExcludeType}
++}
++
++// filterAllowsChannel reports whether a message on channel ch would match the
++// channel constraint of f.
++func filterAllowsChannel(f store.MessageFilter, ch string) bool {
++	if len(f.Channels) > 0 {
++		return slices.Contains(f.Channels, ch)
++	}
++	return f.Channel == "" || f.Channel == ch
++}
++
++// tgMirrorableType limits mirroring to conversational messages; notices
++// (input-needed, state-change, system) already reach Telegram on their own.
++func tgMirrorableType(t string) bool {
++	switch t {
++	case messages.TypeInstruction, messages.TypeChat, messages.TypeReply:
++		return true
++	}
++	return false
++}
++
++func isDirectDMConversation(conv *messaging.ConversationResult) bool {
++	return conv != nil && conv.Kind == "direct" && validDMKey(conv.ExternalRef)
++}
++
++// telegramInboundDMKey returns the DM key for an inbound telegram row that was
++// filed in a direct DM conversation, or "" when the row is not one or the
++// mirror is off.
++func (s *Server) telegramInboundDMKey(m *store.Message, conv *messaging.ConversationResult, senderUserID string) string {
++	if m == nil || m.Channel != tgMirrorChannel || m.ThreadID != "" || senderUserID == "" || !isDirectDMConversation(conv) {
++		return ""
++	}
++	if !s.telegramDMMirrorEnabled() {
++		return ""
++	}
++	return conv.ExternalRef
++}
++
++// agentReplyMirrorsToTelegram reports whether an agent-to-user message stored
++// on the web channel of a direct DM conversation should be copied to Telegram.
++// Replies already routed to telegram by reply affinity are not copied again.
++func (s *Server) agentReplyMirrorsToTelegram(m *messages.StructuredMessage, conv *messaging.ConversationResult) bool {
++	if m == nil || m.Channel != "web" || !strings.HasPrefix(m.Recipient, "user:") ||
++		m.Broadcasted || m.ObserverOnly || !tgMirrorableType(m.Type) || !isDirectDMConversation(conv) {
++		return false
++	}
++	return s.telegramDMMirrorEnabled()
++}
++
++// mirrorToTelegram publishes an observer-only copy of m to the Telegram spoke
++// on the agent topic of agentSlug. It returns immediately: the plugin call
++// blocks until Telegram accepts the message, so it runs in the background and
++// failures are only logged. m is taken by value and given a fresh Metadata map,
++// so the copy shares no mutable state with the caller's message.
++func (s *Server) mirrorToTelegram(ctx context.Context, projectID, agentSlug string, m messages.StructuredMessage, createdAt time.Time, meta map[string]string) {
++	bp := s.GetMessageBrokerProxy()
++	if bp == nil || projectID == "" || agentSlug == "" || !tgMirrorableType(m.Type) {
++		return
++	}
++	m.Channel = tgMirrorChannel
++	m.ObserverOnly = true
++	m.ThreadID = ""
++	m.ConversationID = ""
++	m.ConversationAsserted = false
++	m.DeliveryText = ""
++	if !createdAt.IsZero() {
++		// The plugin dedups on sender|recipient|timestamp|type|msg.
++		m.Timestamp = createdAt.UTC().Format(time.RFC3339Nano)
++	}
++	md := make(map[string]string, len(meta))
++	for k, v := range meta {
++		md[k] = v
++	}
++	m.Metadata = md
++
++	logger := s.messageLog
++	go func() {
++		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), brokerCallbackTimeout)
++		defer cancel()
++		if err := bp.PublishChannelMirror(pctx, projectID, agentSlug, &m); err != nil {
++			logger.Warn("Telegram DM mirror publish failed",
++				"project_id", projectID, "agent_slug", agentSlug, "sender", m.Sender, "error", err)
++		}
++	}()
++}
+diff --git a/pkg/hub/telegram_dm_mirror_test.go b/pkg/hub/telegram_dm_mirror_test.go
+new file mode 100644
+index 000000000..6d038c1ea
+--- /dev/null
++++ b/pkg/hub/telegram_dm_mirror_test.go
+@@ -0,0 +1,399 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build !no_sqlite
++
++package hub
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
++	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
++	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
++	"github.com/GoogleCloudPlatform/scion/pkg/messages"
++	"github.com/GoogleCloudPlatform/scion/pkg/store"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// setTelegramDMMirror installs operational settings with the conversation
++// envelope switch on (the production default) and hub.telegram_dm_mirror set.
++func setTelegramDMMirror(t *testing.T, srv *Server, enabled bool) {
++	t.Helper()
++	fakeStore := newFakeHubSettingStore()
++	fakeStore.seed("messaging", json.RawMessage(`{"conversation_envelope_switch":true}`))
++	fakeStore.seed("experiments", json.RawMessage(fmt.Sprintf(`{"overrides":{%q:%t}}`, experiments.TelegramDMMirror, enabled)))
++	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
++	_, err := ops.Refresh(context.Background())
++	require.NoError(t, err)
++	srv.SetOperationalSettings(ops)
++	require.True(t, srv.GetOperationalSettings().ConversationEnvelopeSwitch())
++	require.Equal(t, enabled, srv.telegramDMMirrorEnabled())
++}
++
++// spokeCopies returns the messages with the given body that r received.
++func spokeCopies(r *recordingSpoke, body string) []messages.StructuredMessage {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var out []messages.StructuredMessage
++	for _, m := range r.msgs {
++		if m.Msg == body {
++			out = append(out, m)
++		}
++	}
++	return out
++}
++
++func storedWithBody(t *testing.T, s store.Store, agentID, body string) int {
++	t.Helper()
++	res, err := s.ListMessages(context.Background(), store.MessageFilter{AgentID: agentID}, store.ListOptions{Limit: 100})
++	require.NoError(t, err)
++	n := 0
++	for _, m := range res.Items {
++		if m.Msg == body {
++			n++
++		}
++	}
++	return n
++}
++
++// tgMirrorDMRows names the rows seedTGMirrorDM creates, oldest first.
++type tgMirrorDMRows struct {
++	key, web, telegram, discord, notice string
++}
++
++// seedTGMirrorDM seeds a DM conversation between DevUserID and an agent with
++// a web reply, a Telegram message stored the way broker inbound stores it (no
++// thread key), and newer discord and NULL-channel rows that must stay hidden.
++func seedTGMirrorDM(t *testing.T, s store.Store, name string) tgMirrorDMRows {
++	t.Helper()
++	ctx := context.Background()
++	projectID := rsProject(t, s, name+"-project")
++	agentID := rsAgent(t, s, name+"-agent", projectID)
++	key := makeDMKey(agentID, DevUserID)
++	convID := seedConversation(t, s, "native", key, "direct")
++	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
++
++	add := func(suffix, channel, typ, threadID string, fromUser bool, offset time.Duration) string {
++		m := &store.Message{
++			ID: tid(name + "-" + suffix), ProjectID: projectID, AgentID: agentID,
++			Sender: "agent:" + name + "-agent", SenderID: agentID,
++			Recipient: "user:" + DevUserID, RecipientID: DevUserID,
++			Msg: suffix, Type: typ, Channel: channel, ThreadID: threadID,
++			ConversationID: convID, CreatedAt: base.Add(offset),
++		}
++		if fromUser {
++			m.Sender, m.SenderID = "user:"+DevUserID, DevUserID
++			m.Recipient, m.RecipientID = "agent:"+name+"-agent", agentID
++		}
++		require.NoError(t, s.CreateMessage(ctx, m))
++		return m.ID
++	}
++	return tgMirrorDMRows{
++		key:      key,
++		web:      add("web", "web", messages.TypeInstruction, key, false, 0),
++		telegram: add("telegram", tgMirrorChannel, messages.TypeInstruction, "", true, time.Minute),
++		discord:  add("discord", "discord", messages.TypeInstruction, key, true, 2*time.Minute),
++		notice:   add("notice", "", messages.TypeInputNeeded, "", false, 3*time.Minute),
++	}
++}
++
++func TestTelegramDMMirror_ExperimentRegistered(t *testing.T) {
++	exp, ok := experiments.Default().Lookup(experiments.TelegramDMMirror)
++	require.True(t, ok)
++	assert.False(t, exp.Default, "the mirror is opt-in")
++	assert.True(t, exp.HasLayer(experiments.LayerServer))
++}
++
++func TestTelegramDMMirror_History(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			srv, s := testServer(t)
++			setTelegramDMMirror(t, srv, enabled)
++			rows := seedTGMirrorDM(t, s, fmt.Sprintf("tgm-hist-%t", enabled))
++
++			rec := doRequest(t, srv, http.MethodGet, "/api/v1/chat/conversations/"+rows.key+"/messages", nil)
++			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++			var hist chatHistoryResponse
++			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &hist))
++			got := map[string]bool{}
++			for _, m := range hist.Messages {
++				got[m.ID] = true
++			}
++			assert.True(t, got[rows.web])
++			assert.Equal(t, enabled, got[rows.telegram], "telegram rows show only with the mirror on")
++			assert.False(t, got[rows.discord], "other external channels stay hidden (G3-d)")
++			assert.False(t, got[rows.notice], "NULL-channel notices stay hidden")
++
++			rec = doRequest(t, srv, http.MethodGet,
++				"/api/v1/chat/conversations/"+rows.key+"/messages?around="+rows.telegram, nil)
++			if enabled {
++				assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++			} else {
++				assert.Equal(t, http.StatusNotFound, rec.Code)
++			}
++		})
++	}
++}
++
++func TestTelegramDMMirror_DMLastMessageAndMarkUnread(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			srv, s := testServer(t)
++			setTelegramDMMirror(t, srv, enabled)
++			rows := seedTGMirrorDM(t, s, fmt.Sprintf("tgm-last-%t", enabled))
++			want := rows.web
++			if enabled {
++				want = rows.telegram
++			}
++
++			latest := srv.nativeDMLastMessages(context.Background(), []string{rows.key})
++			require.Contains(t, latest, rows.key)
++			assert.Equal(t, want, latest[rows.key].ID, "DM rail last message")
++
++			recent, err := srv.conversationRecentMessages(context.Background(), rows.key, true, nil, 1)
++			require.NoError(t, err)
++			require.Len(t, recent, 1)
++			assert.Equal(t, want, recent[0].ID, "mark-unread latest message")
++		})
++	}
++}
++
++func TestTelegramDMMirror_LiveDMSubject(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			srv, _ := testServer(t)
++			setTelegramDMMirror(t, srv, enabled)
++			pub := NewChannelEventPublisher()
++			t.Cleanup(pub.Close)
++			srv.SetEventPublisher(pub)
++
++			agentID, userID := tid(fmt.Sprintf("tgm-live-agent-%t", enabled)), tid(fmt.Sprintf("tgm-live-user-%t", enabled))
++			key := makeDMKey(agentID, userID)
++			ch, unsub := pub.Subscribe("user." + userID + ".chat.dm")
++			t.Cleanup(unsub)
++
++			for _, channel := range []string{"discord", tgMirrorChannel, "web"} {
++				pub.PublishUserMessage(context.Background(), &store.Message{
++					ID: tid("tgm-live-" + channel + fmt.Sprint(enabled)), AgentID: agentID,
++					Sender: "user:u@example.com", SenderID: userID, Recipient: "agent:a", RecipientID: agentID,
++					Msg: channel, Type: messages.TypeInstruction, Channel: channel, ThreadID: key, CreatedAt: time.Now(),
++				}, nil, nil)
++			}
++
++			// "web" is published last and is always pushed: once it arrives,
++			// everything that will arrive has.
++			var got []string
++			deadline := time.After(5 * time.Second)
++			for len(got) == 0 || got[len(got)-1] != "web" {
++				select {
++				case evt := <-ch:
++					var payload UserMessageEvent
++					require.NoError(t, json.Unmarshal(evt.Data, &payload))
++					got = append(got, payload.Channel)
++				case <-deadline:
++					t.Fatalf("timed out; got %v", got)
++				}
++			}
++			want := []string{"web"}
++			if enabled {
++				want = []string{tgMirrorChannel, "web"}
++			}
++			assert.Equal(t, want, got)
++		})
++	}
++}
++
++func TestTelegramDMMirror_BrokerInbound(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			srv, s := testServer(t)
++			ctx := context.Background()
++			sfx := fmt.Sprint(enabled)
++
++			db := openTestMemorySQLite(t, "sqlite")
++			wcs := NewWebChatStore(db, "sqlite")
++			require.NoError(t, wcs.Init())
++			srv.SetWebChatStore(wcs)
++			srv.SetDispatcher(&brokerMockDispatcher{})
++			setTelegramDMMirror(t, srv, enabled)
++			spy := &readStateAtPublishSpy{wcs: wcs}
++			srv.SetEventPublisher(spy)
++
++			user := &store.User{
++				ID: tid("tgm-inbound-user-" + sfx), Email: "tgm-inbound-" + sfx + "@example.com",
++				DisplayName: "Telegram User", Role: store.UserRoleMember, Status: "active", Created: time.Now(),
++			}
++			require.NoError(t, s.CreateUser(ctx, user))
++			ensureHubMembership(ctx, s, user.ID)
++			project := &store.Project{
++				ID: tid("tgm-inbound-proj-" + sfx), Slug: "tgm-inbound-" + sfx, Name: "Telegram Inbound",
++				OwnerID: user.ID, CreatedBy: user.ID, Created: time.Now(), Updated: time.Now(),
++			}
++			require.NoError(t, s.CreateProject(ctx, project))
++			srv.seedProjectCreatorMembership(ctx, project)
++			msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
++			agent := &store.Agent{
++				ID: tid("tgm-inbound-agent-" + sfx), Slug: "tgm-agent", Name: "Telegram Agent", ProjectID: project.ID,
++				Phase: string(state.PhaseRunning), MessageMode: store.MessageModeProject, StateVersion: 1,
++				Created: time.Now(), Updated: time.Now(),
++			}
++			require.NoError(t, s.CreateAgent(ctx, agent))
++			dmKey := makeDMKey(agent.ID, user.ID)
++
++			// As the Telegram plugin sends a group message: channel
++			// telegram, no thread key, chat id in metadata.
++			body, err := json.Marshal(inboundMessageRequest{
++				Topic: "scion.project." + project.ID + ".agent." + agent.Slug + ".messages",
++				Message: &messages.StructuredMessage{
++					Version: messages.Version, Timestamp: time.Now().UTC().Format(time.RFC3339),
++					Channel: tgMirrorChannel, Sender: "user:" + user.Email, Recipient: "agent:" + agent.Slug,
++					Msg: "hello from telegram", Type: messages.TypeInstruction,
++					Metadata: map[string]string{"telegram_chat_id": "-100", "telegram_message_id": "7"},
++				},
++			})
++			require.NoError(t, err)
++			req := httptest.NewRequest(http.MethodPost, "/api/v1/broker/inbound", bytes.NewReader(body))
++			req.Header.Set("Content-Type", "application/json")
++			req = req.WithContext(contextWithBrokerIdentity(req.Context(), NewBrokerIdentity("test-broker")))
++			rec := httptest.NewRecorder()
++			srv.mux.ServeHTTP(rec, req)
++			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
++
++			res, err := s.ListMessages(ctx, store.MessageFilter{AgentID: agent.ID}, store.ListOptions{Limit: 10})
++			require.NoError(t, err)
++			require.Len(t, res.Items, 1)
++			persisted := res.Items[0]
++			assert.Empty(t, persisted.ThreadID, "the stored row keeps an empty thread key")
++			conv, err := s.GetConversationByExternalRef(ctx, "native", dmKey)
++			require.NoError(t, err)
++			assert.Equal(t, conv.ID, persisted.ConversationID, "filed in the native DM conversation")
++
++			require.True(t, spy.called)
++			rs, err := wcs.GetReadState(ctx, user.ID, dmKey)
++			require.NoError(t, err)
++			if !enabled {
++				assert.Empty(t, spy.lastMessageIDAtPublish, "stock: the live event carries no DM key")
++				assert.Nil(t, rs)
++				return
++			}
++			assert.Equal(t, persisted.ID, spy.lastMessageIDAtPublish,
++				"the live event carries the DM key and the DM watermark is already current")
++			assert.False(t, spy.hasUnreadAtPublish, "the sender's own Telegram message is not unread for them")
++			require.NotNil(t, rs)
++			assert.Equal(t, persisted.ID, rs.LastReadMessageID)
++		})
++	}
++}
++
++func TestTelegramDMMirror_AgentReply(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			f := newAssistantReplyFixture(t, true)
++			setTelegramDMMirror(t, f.srv, enabled)
++
++			const body = "deploy plan ready"
++			f.send(t, messages.TypeInstruction, body)
++			f.waitStored(t, body)
++			const question = "which branch?"
++			f.send(t, messages.TypeInputNeeded, question)
++			f.waitStored(t, question)
++			if enabled {
++				require.Eventually(t, func() bool { return f.telegram.has(body) }, 5*time.Second, 20*time.Millisecond)
++			}
++			time.Sleep(200 * time.Millisecond) // a stray second copy would have landed by now
++
++			for _, m := range spokeCopies(f.telegram, question) {
++				assert.Empty(t, m.Metadata[tgMirrorOriginKey], "notices are never mirrored")
++			}
++			copies := spokeCopies(f.telegram, body)
++			if !enabled {
++				assert.Empty(t, copies)
++				return
++			}
++			require.Len(t, copies, 1, "exactly one Telegram copy")
++			c := copies[0]
++			assert.True(t, c.ObserverOnly)
++			assert.Equal(t, tgMirrorChannel, c.Channel)
++			assert.Equal(t, "web", c.Metadata[tgMirrorOriginKey])
++			assert.True(t, strings.HasPrefix(c.Recipient, "user:"), c.Recipient)
++			assert.Empty(t, c.ThreadID)
++			assert.Empty(t, c.ConversationID)
++			assert.False(t, f.teams.has(body), "the copy goes to the telegram spoke only")
++			assert.Equal(t, 1, storedWithBody(t, f.s, f.agent.ID, body), "the mirror stores no extra row")
++		})
++	}
++}
++
++func TestTelegramDMMirror_WebSend(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mirror=%t", enabled), func(t *testing.T) {
++			srv, s, _, proj, _ := setupSendTest(t)
++			srv.SetDispatcher(&brokerMockDispatcher{})
++			setTelegramDMMirror(t, srv, enabled)
++
++			events := NewChannelEventPublisher()
++			t.Cleanup(events.Close)
++			tg := &recordingSpoke{}
++			fanout := eventbus.NewFanOutEventBus([]eventbus.NamedEventBus{
++				{Name: eventbus.InProcessBusName, Bus: eventbus.NewInProcessEventBus(slog.Default())},
++				{Name: tgMirrorChannel, Bus: tg},
++			}, slog.Default())
++			proxy := NewMessageBrokerProxy(fanout, s, events, func() AgentDispatcher { return nil }, slog.Default())
++			proxy.Start()
++			t.Cleanup(proxy.Stop)
++			srv.SetMessageBrokerProxy(proxy)
++
++			agent := interruptTestAgent(t, s, proj.ID, fmt.Sprintf("tgm-web-%t", enabled), "running")
++			dmKey := makeDMKey(agent.ID, DevUserID)
++			setDMConversationID(t, s, dmKey, proj.ID)
++
++			const body = "ping from the web"
++			rec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/conversations/"+dmKey+"/messages",
++				map[string]interface{}{"content": body})
++			require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
++			if enabled {
++				require.Eventually(t, func() bool { return tg.has(body) }, 5*time.Second, 20*time.Millisecond)
++			}
++			time.Sleep(200 * time.Millisecond)
++
++			copies := spokeCopies(tg, body)
++			if !enabled {
++				assert.Empty(t, copies)
++				return
++			}
++			require.Len(t, copies, 1)
++			c := copies[0]
++			assert.True(t, c.ObserverOnly)
++			assert.Equal(t, tgMirrorChannel, c.Channel)
++			assert.Equal(t, "web", c.Metadata[tgMirrorOriginKey])
++			_, hasName := c.Metadata[tgMirrorSenderNameKey]
++			assert.True(t, hasName, "the copy carries the sender's display name")
++			assert.True(t, strings.HasPrefix(c.Sender, "user:"), c.Sender)
++			assert.Equal(t, DevUserID, c.SenderID)
++			assert.Equal(t, "agent:"+agent.Slug, c.Recipient)
++			assert.Equal(t, 1, storedWithBody(t, s, agent.ID, body), "the mirror stores no extra row")
++		})
++	}
++}
+diff --git a/pkg/hub/test_admin_policy.go b/pkg/hub/test_admin_policy.go
+index 3a067ad4c..2e4c9ff1a 100644
+--- a/pkg/hub/test_admin_policy.go
++++ b/pkg/hub/test_admin_policy.go
+@@ -559,6 +559,7 @@ var testAdminExperimentPolicy = map[string]testAdminPolicy{
+ 	experiments.ChatThreadGroups:             testAdminPolicyDeny,
+ 	experiments.AttachmentArtifacts:          testAdminPolicyDeny,
+ 	experiments.AgentPlugins:                 testAdminPolicyDeny,
++	experiments.TelegramDMMirror:             testAdminPolicyDeny,
+ }
+ 
+ // testAdminPolicyInputs are the vocabularies the classification must cover.
+diff --git a/pkg/store/entadapter/batch_lookups.go b/pkg/store/entadapter/batch_lookups.go
+index d6adb8ced..2a086ea23 100644
+--- a/pkg/store/entadapter/batch_lookups.go
++++ b/pkg/store/entadapter/batch_lookups.go
+@@ -174,7 +174,9 @@ func (s *MessageStore) latestMessagesPerGroup(
+ 	ctx context.Context, groupCol string, inKeys predicate.Message, opts store.LatestMessageOptions,
+ ) ([]*store.Message, error) {
+ 	query := s.client.Message.Query().Where(inKeys)
+-	if opts.Channel != "" {
++	if len(opts.Channels) > 0 {
++		query.Where(message.ChannelIn(opts.Channels...))
++	} else if opts.Channel != "" {
+ 		query.Where(message.ChannelEQ(opts.Channel))
+ 	}
+ 	if opts.ExcludeType != "" {
+@@ -192,7 +194,16 @@ func (s *MessageStore) latestMessagesPerGroup(
+ 				),
+ 			),
+ 		}
+-		if opts.Channel != "" {
++		// The newer-row check must use the same channel set as the outer
++		// predicate, or a newer row on an excluded channel would hide the
++		// latest visible one.
++		if len(opts.Channels) > 0 {
++			chans := make([]any, len(opts.Channels))
++			for i, ch := range opts.Channels {
++				chans[i] = ch
++			}
++			conds = append(conds, entsql.In(newer.C(message.FieldChannel), chans...))
++		} else if opts.Channel != "" {
+ 			conds = append(conds, entsql.EQ(newer.C(message.FieldChannel), opts.Channel))
+ 		}
+ 		if opts.ExcludeType != "" {
+diff --git a/pkg/store/entadapter/batch_lookups_test.go b/pkg/store/entadapter/batch_lookups_test.go
+index 07cbab89e..4542ce692 100644
+--- a/pkg/store/entadapter/batch_lookups_test.go
++++ b/pkg/store/entadapter/batch_lookups_test.go
+@@ -97,11 +97,14 @@ func TestLatestMessagesByThreadIDs_MatchesListMessages(t *testing.T) {
+ 		{Channel: "web", ExcludeType: messages.TypeMention},
+ 		{Channel: "web"},
+ 		{},
++		// Channel sets: the IN predicate and the NOT EXISTS must agree.
++		{Channels: []string{"web", "discord"}, ExcludeType: messages.TypeMention},
++		{Channels: []string{"web", "telegram"}, ExcludeType: messages.TypeMention},
+ 	} {
+ 		got, err := s.LatestMessagesByThreadIDs(ctx, append(keys, "", "dm:none"), opts)
+ 		require.NoError(t, err)
+ 		for _, k := range keys {
+-			want, err := s.ListMessages(ctx, store.MessageFilter{Channel: opts.Channel,
++			want, err := s.ListMessages(ctx, store.MessageFilter{Channel: opts.Channel, Channels: opts.Channels,
+ 				ExcludeType: opts.ExcludeType, ThreadID: k}, store.ListOptions{Limit: 1, SkipTotalCount: true})
+ 			require.NoError(t, err)
+ 			if len(want.Items) == 0 {
+@@ -154,6 +157,23 @@ func TestLatestMessagesByConversationIDs_MatchesListMessages(t *testing.T) {
+ 	}
+ 	assert.Len(t, got, 6)
+ 
++	// A channel set widens what counts as latest, in the outer predicate and
++	// the newer-row check alike.
++	setOpts := store.LatestMessageOptions{Channels: []string{"web", "discord"}, ExcludeType: messages.TypeMention}
++	gotSet, err := s.LatestMessagesByConversationIDs(ctx, keys, setOpts)
++	require.NoError(t, err)
++	for _, k := range keys {
++		want, err := s.ListMessages(ctx, store.MessageFilter{Channels: setOpts.Channels,
++			ExcludeType: setOpts.ExcludeType, ConversationID: k}, store.ListOptions{Limit: 1, SkipTotalCount: true})
++		require.NoError(t, err)
++		if len(want.Items) == 0 {
++			assert.NotContains(t, gotSet, k)
++			continue
++		}
++		require.Contains(t, gotSet, k)
++		assert.Equal(t, want.Items[0].ID, gotSet[k].ID, "key %s", k)
++	}
++
+ 	_, err = s.LatestMessagesByConversationIDs(ctx, []string{"not-a-uuid"}, opts)
+ 	assert.Error(t, err, "a malformed conversation ID is rejected, as ListMessages rejects it")
+ }
+diff --git a/pkg/store/entadapter/message_store.go b/pkg/store/entadapter/message_store.go
+index ecc49969b..249455b48 100644
+--- a/pkg/store/entadapter/message_store.go
++++ b/pkg/store/entadapter/message_store.go
+@@ -395,7 +395,9 @@ func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFil
+ 	if filter.ExcludeType != "" {
+ 		query.Where(message.TypeNEQ(filter.ExcludeType))
+ 	}
+-	if filter.Channel != "" {
++	if len(filter.Channels) > 0 {
++		query.Where(message.ChannelIn(filter.Channels...))
++	} else if filter.Channel != "" {
+ 		query.Where(message.ChannelEQ(filter.Channel))
+ 	}
+ 	if filter.ThreadID != "" {
+diff --git a/pkg/store/models.go b/pkg/store/models.go
+index af993fda4..e9754adc0 100644
+--- a/pkg/store/models.go
++++ b/pkg/store/models.go
+@@ -3186,6 +3186,7 @@ type MessageFilter struct {
+ 	Type           string    // Filter by message type
+ 	ExcludeType    string    // Exclude a message type (e.g. mention fan-out copies)
+ 	Channel        string    // Filter by channel (e.g. "web", "discord")
++	Channels       []string  // Filter by any of these channels; when non-empty it replaces Channel
+ 	ThreadID       string    // Filter by thread_id (wave-2 conversation key)
+ 	ConversationID string    // Filter by conversation_id (S4 conversation model)
+ 	Before         time.Time // Upper bound for created_at (exclusive)
+@@ -3197,8 +3198,9 @@ type MessageFilter struct {
+ // has the meaning of the MessageFilter field of the same name; empty fields
+ // do not filter.
+ type LatestMessageOptions struct {
+-	Channel     string // Only messages on this channel
+-	ExcludeType string // Ignore messages of this type
++	Channel     string   // Only messages on this channel
++	Channels    []string // Only messages on any of these channels; when non-empty it replaces Channel
++	ExcludeType string   // Ignore messages of this type
+ }
+ 
+ // =============================================================================

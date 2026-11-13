@@ -20,6 +20,9 @@
 if [ -n "${GOOGLE_CLOUD_PROJECT:-}" ] && [ -z "${GOOGLE_CLOUD_QUOTA_PROJECT:-}" ]; then
   export GOOGLE_CLOUD_QUOTA_PROJECT="${GOOGLE_CLOUD_PROJECT}"
 fi
+if [ -z "${SCION_DEPLOYER_SA_ID:-}" ] && [ -n "${FACTORY_DEPLOYER_SA_ID:-}" ]; then
+  export SCION_DEPLOYER_SA_ID="${FACTORY_DEPLOYER_SA_ID}"
+fi
 
 # Google-managed Cloud Run Direct IAP (369001918367-*) rejects OIDC ID tokens unless a custom OAuth client is
 # manually bound via Console, and instead accepts Service Account OAuth2 access tokens (or opt-in IAM signJwt RS256
