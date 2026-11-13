@@ -4,7 +4,6 @@ This module creates Hub projects, registers service accounts, and injects projec
 Then it syncs shared directories, pushes templates, and starts lead schedules.
 """
 import importlib.util
-import json
 import os
 import re
 import subprocess
@@ -848,6 +847,35 @@ def provision_factory(
                             "eventType": "message",
                             "agentName": lead_name,
                             "message": hb_msg,
+                        },
+                    )
+
+            eval_cron = (
+                (spec.get("team") or {}).get("eval_heartbeat_cron")
+                or eff_env.get("EVAL_HEARTBEAT_CRON", "")
+            ).strip()
+            if eval_pid and eval_pid_id and eval_cron:
+                eval_scheds_resp = client.request("GET", f"/api/v1/projects/{eval_pid_id}/schedules")[1]
+                eval_scheds = (
+                    eval_scheds_resp.get("schedules", [])
+                    if isinstance(eval_scheds_resp, dict)
+                    else (eval_scheds_resp or [])
+                )
+                eval_sched_name = f"{eval_pid}-lead-heartbeat"
+                eval_hb_msg = (
+                    "Evaluation sweep check: inspect /scion-volumes/knowledge-plane/state/LIVE.md and "
+                    "list-eval-runs, and run an L1-L5 sweep if a newer revision has shipped."
+                )
+                if not any(isinstance(s, dict) and s.get("name") == eval_sched_name for s in eval_scheds):
+                    client.request(
+                        "POST",
+                        f"/api/v1/projects/{eval_pid_id}/schedules",
+                        body={
+                            "name": eval_sched_name,
+                            "cronExpr": eval_cron,
+                            "eventType": "message",
+                            "agentName": eval_lead_name,
+                            "message": eval_hb_msg,
                         },
                     )
 

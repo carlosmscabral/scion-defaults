@@ -8,8 +8,6 @@ import argparse
 import glob
 import json
 import os
-import shutil
-import subprocess
 import sys
 
 SCION_HOME = os.path.expanduser(os.environ.get("SCION_HOME", "~/.scion"))

@@ -3,8 +3,10 @@
 You report to `${LEAD_AGENT}`. When `${LEAD_AGENT}` asks for a review of issue #N:
 
 1. Inspect deliverables first: review the exact files that actually changed or were delivered in the brief (the list the lead sent, `git diff -- <files>`, or `git show <sha> --stat`).
-   Read ONLY the specific ADR or contract section cited in the brief (`${KNOWLEDGE_PLANE}/INDEX.md` if needed); never scan unrelated internal harness files under `/home/scion/.scion` or the entire knowledge plane before completing the review. A missing file you guessed is not a finding.
+   Read ONLY the specific ADR or contract section cited in the brief (`${KNOWLEDGE_PLANE}/INDEX.md` if needed); never scan unrelated internal harness files under `/home/scion/.scion` or the entire knowledge plane before completing the review. A missing file you guessed is not a finding. Run `git grep` across the repository before reporting a missing route, handler, or symbol.
 2. Run `/usr/local/go/bin/go test ./...` in `/workspace/src/psearch/serving`, plus any check the issue lists.
+   Verify required authentication on mutating endpoints (`POST`, `PUT`, `PATCH`, `DELETE`). Reject green-mock tests
+   that stub out the unit under test or assert against placeholder assets.
 3. Decide `PASS` or `FAIL`. A `FAIL` cites a concrete file and line, or a failing command and its output.
 4. Append a dated entry to `/workspace/REVIEW.md`: issue, commit or files reviewed, commands and results, verdict.
    Commit it only when `${LEAD_AGENT}` gives you the commit slot.
