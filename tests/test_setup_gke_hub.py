@@ -1748,3 +1748,192 @@ def test_setup_gke_hub_runs_pre_and_post_hooks_and_validates_missing(tmp_path):
     assert "DEPLOY_CALLED" in res_exec.stdout
     assert "POST:scion-hub-main:v20261112" in res_exec.stdout
     assert res_exec.stdout.index("PRE:demo-scion-x:main") < res_exec.stdout.index("DEPLOY_CALLED") < res_exec.stdout.index("POST:scion-hub-main:v20261112")
+
+
+def test_setup_gke_hub_skip_shared_infra_reuses_existing_cluster(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-reuse"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_log = tmp_path / "calls.log"
+
+    build_script = scion_repo / "image-build" / "scripts" / "build-images.sh"
+    build_script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "Created [https://cloudbuild.googleapis.com/v1/projects/demo/locations/global/builds/11111111-2222-3333-4444-555555555555]."\n'
+    )
+    build_script.chmod(0o755)
+
+    (fake_bin / "gcloud").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "gcloud $*" >> "{calls_log}"\n'
+        'case "$*" in\n'
+        '  *"container clusters describe"*) echo "tfha-agents" ;;\n'
+        '  *"builds get-default-service-account"*) echo "projects/demo/serviceAccounts/123-compute@developer.gserviceaccount.com" ;;\n'
+        '  *"artifacts docker images describe"*) echo "sha256:deadbeef" ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    (fake_bin / "gcloud").chmod(0o755)
+
+    (fake_bin / "terraform").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "terraform $*" >> "{calls_log}"\n'
+        'if [[ "$*" == *"output -raw hub_url"* ]]; then echo "https://tfha-staging-123.us-east1.run.app"; fi\n'
+        'exit 0\n'
+    )
+    (fake_bin / "terraform").chmod(0o755)
+
+    (fake_bin / "kubectl").write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "kubectl $*" >> "{calls_log}"\n'
+        'exit 0\n'
+    )
+    (fake_bin / "kubectl").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DRY_RUN": "0",
+        "SKIP_EXISTING_IMAGES": "1",
+        "IAP_OAUTH_CLIENT_ID": "123456-abcdef.apps.googleusercontent.com",
+        "HUB_PROJECT": "demo-hub-proj",
+        "HUB_REGION": "us-east1",
+        "HUB_ZONE": "us-east1-b",
+        "HUB_NAME": "staging",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--skip-shared-infra",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--image-tag",
+            "v20261111",
+            "--harnesses",
+            "antigravity",
+            "--approve-apply",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    calls = calls_log.read_text()
+    assert "configurations/shared-infra" not in calls
+    assert not (work_dir / "shared-infra.tfvars").exists()
+    assert "container clusters describe tfha-agents --project=demo-hub-proj --region=us-east1" in calls
+    assert "configurations/hub apply" in calls
+    assert "container clusters get-credentials tfha-agents --project=demo-hub-proj --region=us-east1" in calls
+    assert "kubectl get namespace tfha-staging" in calls
+    assert "HUB_K8S_CLUSTER=tfha-agents" in out
+    assert "HUB_K8S_NAMESPACE=tfha-staging" in out
+
+
+def test_setup_gke_hub_external_gke_cluster_propagates_tfvars_and_credentials(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    (scion_repo / "deploy/terraform/configurations/shared-infra/variables.tf").write_text(
+        'variable "external_gke_project_id" { default = "" }\n'
+        'variable "external_gke_cluster_name" { default = "" }\n'
+    )
+    (scion_repo / "deploy/terraform/configurations/hub/variables.tf").write_text(
+        'variable "external_gke_project_id" { default = "" }\n'
+        'variable "external_gke_cluster_name" { default = "" }\n'
+    )
+    work_dir = tmp_path / "work-ext-gke"
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "ephemeral-hub-proj",
+        "HUB_REGION": "us-central1",
+        "HUB_ZONE": "us-central1-a",
+        "HUB_NAME": "prod",
+        "PO_EMAIL": "admin@example.com",
+        "RUNTIME_PROFILE": "spot",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--hub-mode",
+            "cloudrun",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--gke-project",
+            "shared-gke-proj",
+            "--gke-cluster",
+            "shared-autopilot",
+            "--gke-region",
+            "us-east1",
+            "--harnesses",
+            "antigravity",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+
+    shared_tfvars = (work_dir / "shared-infra.tfvars").read_text()
+    assert 'external_gke_project_id   = "shared-gke-proj"' in shared_tfvars
+    assert 'external_gke_cluster_name = "shared-autopilot"' in shared_tfvars
+
+    hub_tfvars = (work_dir / "hub.tfvars").read_text()
+    assert 'external_gke_project_id   = "shared-gke-proj"' in hub_tfvars
+    assert 'external_gke_cluster_name = "shared-autopilot"' in hub_tfvars
+
+    assert "gcloud container clusters get-credentials shared-autopilot --project=shared-gke-proj --region=us-east1" in out
+    assert "RUNTIME_PROFILE=spot" in out
+    assert "HUB_GKE_PROJECT=shared-gke-proj" in out
+    assert "HUB_GKE_REGION=us-east1" in out
+    assert "HUB_K8S_CLUSTER=shared-autopilot" in out
+
+
+def test_setup_gke_hub_external_gke_rejects_upstream_repo_without_variables(tmp_path):
+    scion_repo = make_fake_scion_upstream(tmp_path)
+    work_dir = tmp_path / "work-ext-err"
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "HUB_PROJECT": "ephemeral-hub-proj",
+        "HUB_REGION": "us-central1",
+        "HUB_NAME": "prod",
+        "PO_EMAIL": "admin@example.com",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/setup-gke-hub.sh"),
+            "--tier",
+            "terraform-ha",
+            "--scion-repo",
+            str(scion_repo),
+            "--work-dir",
+            str(work_dir),
+            "--gke-project",
+            "shared-gke-proj",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode != 0
+    assert "external_gke_project_id" in res.stderr
+    assert "--skip-shared-infra" in res.stderr

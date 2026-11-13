@@ -61,6 +61,11 @@ For a completely serverless/managed infrastructure, use the Terraform configurat
    ```bash
    scripts/setup-gke-hub.sh --tier terraform-ha --scion-repo <dir> --harnesses claude,antigravity --approve-apply
    ```
+   To deploy an additional Hub reusing an already-provisioned `shared-infra` stack and GKE Autopilot cluster (`<SHARED_PREFIX>-agents`) in the same project, pass `--skip-shared-infra` (and optionally `SKIP_EXISTING_IMAGES=1`):
+   ```bash
+   HUB_NAME=staging SKIP_EXISTING_IMAGES=1 scripts/setup-gke-hub.sh --tier terraform-ha --skip-shared-infra --scion-repo <dir> --harnesses claude,antigravity --approve-apply
+   ```
+   If your `--scion-repo` checkout declares `external_gke_project_id` / `external_gke_cluster_name`, you can also point `setup-gke-hub.sh` at a pre-provisioned shared cluster via `--gke-project` / `--gke-cluster` (or `HUB_GKE_PROJECT` / `HUB_GKE_CLUSTER`).
 4. Verify connectivity using IAP `Proxy-Authorization` and the `/health` endpoint. On Cloud Run Direct IAP (`369001918367-*`), `scripts/hub_client.py` (for K8s `CronJob`s), `config/harness/home/.scion/hooks/pre-start.d/10-direct-iap-token` (pre-start pod hook), and `config/harness/home/.local/bin/factory-cd.sh` (3-minute in-pod refresh inside `gke-metadata-server`'s 5-minute pre-expiry window) automatically mint Workload Identity Service Account access tokens with `cloud-platform`, `userinfo.email`, and `openid` scopes, requiring zero static Kubernetes Secrets or PATs.
 
 ## Option B: Hybrid VM + GKE Tier
