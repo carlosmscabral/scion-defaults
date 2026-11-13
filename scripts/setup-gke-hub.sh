@@ -24,6 +24,7 @@ CLI_SKIP_SHARED_INFRA=""
 CLI_GKE_PROJECT=""
 CLI_GKE_CLUSTER=""
 CLI_GKE_REGION=""
+CLI_SPOT_WORKERS=""
 
 usage() {
   cat <<EOF
@@ -46,6 +47,8 @@ Options:
   --gke-project <id>     GCP project hosting the GKE cluster (default: HUB_PROJECT)
   --gke-cluster <name>   Existing GKE cluster name override (default: <SHARED_PREFIX>-agents)
   --gke-region <region>  GKE cluster region/location override (default: HUB_REGION)
+  --spot-workers         Configure GKE Autopilot 'spot' profile and set as default runtime profile
+  --no-spot-workers      Keep 'remote' on-demand as default profile
   --pre-hook <script>    Run hook script before bootstrap (repeatable)
   --post-hook <script>   Run hook script after bootstrap (repeatable)
   --approve-apply        Execute Terraform apply, Cloud Build, and IAM changes
@@ -74,6 +77,8 @@ while [[ $# -gt 0 ]]; do
     --gke-project) CLI_GKE_PROJECT="$2"; shift 2 ;;
     --gke-cluster) CLI_GKE_CLUSTER="$2"; shift 2 ;;
     --gke-region) CLI_GKE_REGION="$2"; shift 2 ;;
+    --spot-workers) CLI_SPOT_WORKERS="1"; shift 1 ;;
+    --no-spot-workers) CLI_SPOT_WORKERS="0"; shift 1 ;;
     --approve-apply) CLI_APPROVE_APPLY="1"; shift 1 ;;
     --dry-run) CLI_DRY_RUN="1"; shift 1 ;;
     -h|--help) usage; exit 0 ;;
@@ -90,7 +95,7 @@ _PRESERVE_VARS=(
   CREATE_PROJECT WRITE_ENV_FILE SCION_REPO TIER HUB_MODE HARNESSES IMAGE_TAG WORK_DIR
   PRE_HOOKS_ENV POST_HOOKS_ENV
   SKIP_SHARED_INFRA HUB_GKE_PROJECT HUB_GKE_CLUSTER HUB_GKE_REGION HUB_GKE_LOCATION
-  EXTERNAL_GKE_PROJECT_ID EXTERNAL_GKE_CLUSTER_NAME RUNTIME_PROFILE
+  EXTERNAL_GKE_PROJECT_ID EXTERNAL_GKE_CLUSTER_NAME RUNTIME_PROFILE SPOT_WORKERS LEAD_PROFILE
 )
 for _v in "${_PRESERVE_VARS[@]}"; do
   if [[ -n "${!_v:-}" ]]; then
@@ -127,6 +132,7 @@ ORG_ID="${ORG_ID:-}"
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-}"
 WRITE_ENV_FILE="${WRITE_ENV_FILE:-}"
 SKIP_SHARED_INFRA="${SKIP_SHARED_INFRA:-0}"
+SPOT_WORKERS="${SPOT_WORKERS:-0}"
 
 [[ -n "$CLI_TIER" ]] && TIER="$CLI_TIER"
 [[ -n "$CLI_HUB_MODE" ]] && HUB_MODE="$CLI_HUB_MODE"
@@ -142,6 +148,7 @@ SKIP_SHARED_INFRA="${SKIP_SHARED_INFRA:-0}"
 [[ -n "$CLI_BILLING_ACCOUNT" ]] && BILLING_ACCOUNT="$CLI_BILLING_ACCOUNT"
 [[ -n "$CLI_WRITE_ENV_FILE" ]] && WRITE_ENV_FILE="$CLI_WRITE_ENV_FILE"
 [[ -n "$CLI_SKIP_SHARED_INFRA" ]] && SKIP_SHARED_INFRA="$CLI_SKIP_SHARED_INFRA"
+[[ -n "$CLI_SPOT_WORKERS" ]] && SPOT_WORKERS="$CLI_SPOT_WORKERS"
 
 HUB_PROJECT="${HUB_PROJECT:-}"
 SHARED_PREFIX="${SHARED_PREFIX:-tfha}"
@@ -994,7 +1001,10 @@ if [[ "$TIER" == "terraform-ha" ]]; then
 
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "Plan: would set hub-scope env GOOGLE_CLOUD_PROJECT=${TARGET_PROJECT}, GOOGLE_CLOUD_REGION=${TARGET_LOCATION}, GOOGLE_CLOUD_LOCATION=${TARGET_LOCATION}"
-  elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" == https://* ]]; then
+    if [[ "$SPOT_WORKERS" == "1" ]]; then
+      echo "Plan: would configure Hub server-config profiles 'remote' (on-demand) and 'spot' (GKE Autopilot Spot)"
+    fi
+  elif [[ "$APPROVE_APPLY" == 1 && -n "$HUB_URL_OUT" && "$HUB_URL_OUT" != "https://..." && ( "$HUB_URL_OUT" == https://* || "$HUB_URL_OUT" == http://* ) ]]; then
     HUB_URL="${HUB_API_BASE_URL:-$HUB_URL_OUT}" \
     HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" \
     HUB_PROJECT="$HUB_PROJECT" \
@@ -1003,6 +1013,7 @@ if [[ "$TIER" == "terraform-ha" ]]; then
     _HUB_TARGET_PROJECT="$TARGET_PROJECT" \
     _HUB_TARGET_LOCATION="$TARGET_LOCATION" \
     _HUB_URL_OUT="$HUB_URL_OUT" \
+    _HUB_SPOT_WORKERS="$SPOT_WORKERS" \
     _HUB_ENV_MAX_ATTEMPTS="${HUB_ENV_MAX_ATTEMPTS:-12}" \
     _HUB_ENV_RETRY_SEC="${HUB_ENV_RETRY_SEC:-10}" \
     python3 - <<'PY' || echo "Warning: could not set hub-scope env automatically; set via Hub API after IAP propagates." >&2
@@ -1012,6 +1023,7 @@ from hub_client import HubAPIError, HubClient
 
 target_project = os.environ["_HUB_TARGET_PROJECT"]
 target_location = os.environ["_HUB_TARGET_LOCATION"]
+spot_workers = os.environ.get("_HUB_SPOT_WORKERS") == "1"
 max_attempts = max(int(os.environ.get("_HUB_ENV_MAX_ATTEMPTS", "12")), 1)
 retry_sec = float(os.environ.get("_HUB_ENV_RETRY_SEC", "10"))
 
@@ -1026,22 +1038,46 @@ for attempt in range(1, max_attempts + 1):
             # The Hub env API rejects SCION_* names (reserved control-plane namespace); cloud telemetry is
             # configured through Hub server-config settings instead.
             client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
-        client.request(
-            "PUT",
-            "/api/v1/admin/server-config",
-            body={
-                "telemetry": {
+        sc_body = {
+            "telemetry": {
+                "enabled": True,
+                "cloud": {
                     "enabled": True,
-                    "cloud": {
-                        "enabled": True,
-                        "provider": "gcp",
-                        "gcp_project_id": target_project,
-                    },
-                }
-            },
-            timeout=15,
-        )
+                    "provider": "gcp",
+                    "gcp_project_id": target_project,
+                },
+            }
+        }
+        if spot_workers:
+            existing_profiles = {}
+            try:
+                _, cfg = client.request("GET", "/api/v1/admin/server-config", timeout=15)
+                if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict):
+                    existing_profiles = dict(cfg["profiles"])
+            except HubAPIError as exc:
+                if exc.status in (401, 403, 500, 502, 503, 504):
+                    raise
+                existing_profiles = {}
+            except Exception:
+                existing_profiles = {}
+            existing_profiles.setdefault("remote", {"runtime": "remote"})
+            existing_profiles["spot"] = {
+                "runtime": "remote",
+                "node_selector": {"cloud.google.com/gke-spot": "true"},
+                "tolerations": [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+            }
+            sc_body["profiles"] = existing_profiles
+        client.request("PUT", "/api/v1/admin/server-config", body=sc_body, timeout=15)
         print("Configured hub-scope Vertex AI and Cloud Telemetry defaults on", os.environ["_HUB_URL_OUT"])
+        if spot_workers:
+            print("Configured GKE Autopilot Spot Workers profile ('spot') and On-Demand profile ('remote') on", os.environ["_HUB_URL_OUT"])
         sys.exit(0)
     except HubAPIError as exc:
         if exc.status in (401, 403, 500, 502, 503, 504) and attempt < max_attempts:
@@ -1097,7 +1133,12 @@ if [[ "${USE_OPERATOR_SA:-0}" == "1" && -n "${HUB_IMPERSONATE_SA:-}" ]]; then
   echo "HUB_IMPERSONATE_SA=${HUB_IMPERSONATE_SA}"
 fi
 echo "AGENT_RUNTIME=kubernetes"
-echo "RUNTIME_PROFILE=${RUNTIME_PROFILE:-remote}"
+if [[ "$SPOT_WORKERS" == "1" ]]; then
+  echo "RUNTIME_PROFILE=${RUNTIME_PROFILE:-spot}"
+  echo "LEAD_PROFILE=${LEAD_PROFILE:-remote}"
+else
+  echo "RUNTIME_PROFILE=${RUNTIME_PROFILE:-remote}"
+fi
 if [[ "$HUB_GKE_PROJECT" != "$HUB_PROJECT" ]]; then
   echo "HUB_GKE_PROJECT=${HUB_GKE_PROJECT}"
 fi
@@ -1124,6 +1165,9 @@ if [[ -n "$WRITE_ENV_FILE" ]]; then
     _WE_HUB_IAP_AUDIENCE="${IAP_CLIENT_ID:-}" \
     _WE_USE_OPERATOR_SA="${USE_OPERATOR_SA:-0}" \
     _WE_HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" \
+    _WE_SPOT_WORKERS="$SPOT_WORKERS" \
+    _WE_RUNTIME_PROFILE="${RUNTIME_PROFILE:-}" \
+    _WE_LEAD_PROFILE="${LEAD_PROFILE:-}" \
     _WE_HUB_K8S_CLUSTER="$CLUSTER_NAME" \
     _WE_HUB_K8S_NAMESPACE="$HUB_K8S_NAMESPACE" \
     _WE_IMAGE_REGISTRY="$IMAGE_REGISTRY" \
@@ -1181,9 +1225,15 @@ if iap_aud:
 if os.environ.get("_WE_USE_OPERATOR_SA") == "1" and os.environ.get("_WE_HUB_IMPERSONATE_SA"):
     ordered_updates.append(("HUB_IMPERSONATE_SA", os.environ["_WE_HUB_IMPERSONATE_SA"]))
 
+spot_on = os.environ.get("_WE_SPOT_WORKERS") == "1"
+rt_prof = os.environ.get("_WE_RUNTIME_PROFILE") or ("spot" if spot_on else "remote")
 ordered_updates.extend([
     ("AGENT_RUNTIME", "kubernetes"),
-    ("RUNTIME_PROFILE", "remote"),
+    ("RUNTIME_PROFILE", rt_prof),
+])
+if spot_on or os.environ.get("_WE_LEAD_PROFILE"):
+    ordered_updates.append(("LEAD_PROFILE", os.environ.get("_WE_LEAD_PROFILE") or "remote"))
+ordered_updates.extend([
     ("HUB_K8S_CLUSTER", os.environ["_WE_HUB_K8S_CLUSTER"]),
     ("HUB_K8S_NAMESPACE", os.environ["_WE_HUB_K8S_NAMESPACE"]),
     ("IMAGE_REGISTRY", os.environ["_WE_IMAGE_REGISTRY"]),

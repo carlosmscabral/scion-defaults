@@ -72,7 +72,7 @@ Work through the `questions` in pillar order. For each question:
 | Pillar | Fields to fill |
 |---|---|
 | `1_mission_and_boundaries` | `project.name`, `project.mission`, `project.non_goals`, and the `vcs` section |
-| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` for Cloud Run Terraform HA, `"gke"` for Hybrid VM+GKE, or `""` for default), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
+| `2_runtime_data_and_iam` | `stack.*` commands, `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` for Cloud Run Terraform HA, `"spot"` for GKE Autopilot Spot workers, `"gke"` for Hybrid VM+GKE, or `""` for default), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy` (`service` or `none`), `infrastructure.cloud_stores`, `infrastructure.deployer_iam_roles` |
 | `3_roster_models_and_cost` | `team.build_roles`, optional `team.eval_roles` (omit `project.eval_slug` and place `evaluator` in `build_roles` for single-project `heartbeat_mode: delta`), `team.dropped_defaults`, `team.autonomy`, `team.heartbeat_mode` (`delta` or `direct-lead`), `team.max_wip`, `infrastructure.budget_usd` |
 | `4_evaluation_pyramid_oracle` | `evaluation_pyramid.l1_health` through `evaluation_pyramid.l5_latency_slo` |
 | `5_backlog_waves_and_autonomy` | `waves[*].issues[*]` with `owner_role`, `acceptance_criteria`, and `requirements` (REQ- IDs) |
@@ -86,7 +86,7 @@ The draft specification starts with the default roster:
 
 Work through the team configuration with the human:
 
-1. **Deploy & heartbeat mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` on Full GKE Cloud Run HA, `"gke"` on Hybrid VM+GKE, or `""`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy), and `team.heartbeat_mode`: `delta` (`Recommended` on GKE with Git: single Hub project, zero-LLM 1-minute `scion-factory-delta`, automatic 0-pod idle sleep) or `direct-lead` (15-minute LLM schedule across build + eval projects). With `deploy: none`, do not add `deployer` or `eval-deployer` roles.
+1. **Deploy & heartbeat mode:** Ask for `infrastructure.runtime` (`kubernetes` or `docker`), `infrastructure.runtime_profile` (`"remote"` on Full GKE Cloud Run HA, `"spot"` for GKE Autopilot Spot workers, `"gke"` on Hybrid VM+GKE, or `""`), `infrastructure.worker_sa_name` (default `"agent-worker"`), `infrastructure.deploy`: `service` (the factory deploys and tests a live service) or `none` (a library, CLI, or monorepo package with nothing to deploy), and `team.heartbeat_mode`: `delta` (`Recommended` on GKE with Git: single Hub project, zero-LLM 1-minute `scion-factory-delta`, automatic 0-pod idle sleep) or `direct-lead` (15-minute LLM schedule across build + eval projects). With `deploy: none`, do not add `deployer` or `eval-deployer` roles.
 2. **Review proposed specialists:** Present the default roster and each item in `proposed_roles` with its evidence. For each specialist the human confirms, run:
    ```bash
    ./scripts/scion-factory add-role factory.yaml --role R --evidence "..."
