@@ -31,6 +31,7 @@ _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def _load_env_file(env_file: Path | None) -> dict[str, str]:
+    """Read the environment file into a dictionary."""
     env: dict[str, str] = {}
     if env_file and env_file.exists():
         for raw in env_file.read_text(encoding="utf-8").splitlines():
@@ -63,6 +64,7 @@ def parse_spawn_specs(raw_items: list[str] | tuple[str, ...]) -> list[tuple[str,
 
 
 def _extract_template_slugs(data: Any) -> set[str]:
+    """Extract the template slugs from the Hub API response."""
     items = data if isinstance(data, list) else []
     if isinstance(data, dict):
         items = data.get("templates") if isinstance(data.get("templates"), list) else (data.get("items") or [])
@@ -76,6 +78,7 @@ def _extract_template_slugs(data: Any) -> set[str]:
 
 
 def _normalize_agents(raw_agents: list[Any]) -> list[dict[str, Any]]:
+    """Convert agent strings into agent dictionaries."""
     out: list[dict[str, Any]] = []
     for item in raw_agents:
         if isinstance(item, dict):
@@ -86,6 +89,7 @@ def _normalize_agents(raw_agents: list[Any]) -> list[dict[str, Any]]:
 
 
 def _resolve_lead_slug(agents: list[dict[str, Any]], explicit_lead: str = "") -> str:
+    """Find the lead agent slug. If the explicit lead is not empty, use the explicit lead."""
     if explicit_lead:
         return _validate_slug(explicit_lead, "lead agent")
     for a in agents:
@@ -107,7 +111,7 @@ def run_hot_upgrade(
     spawn_specs: list[tuple[str, str]] | None = None,
     lead_slug: str = "",
     branch: str = "",
-    harness_auth: str = "vertex-ai",
+    harness_auth: str = "",
     apply: bool = False,
 ) -> dict[str, Any]:
     """Execute or preview a three-step live upgrade against a running Hub project."""
@@ -140,7 +144,7 @@ def run_hot_upgrade(
     skipped_existing: list[str] = []
     if roles_to_push and not overwrite_templates:
         st, tpl_data = client.request("GET", f"/api/v1/templates?scope=project&scopeId={pid}&projectId={pid}")
-        existing_tpls = _extract_template_slugs(tpl_data) if st == 200 else set()
+        existing_tpls = _extract_template_slugs(tpl_data) if 200 <= st < 300 else set()
         skipped_existing = [r for r in roles_to_push if r in existing_tpls]
         roles_to_push = [r for r in roles_to_push if r not in existing_tpls]
 
@@ -182,10 +186,14 @@ def run_hot_upgrade(
         parts = ["scion", "start", ag, "-t", tpl]
         if branch.strip():
             parts.extend(["-b", branch.strip()])
-        if harness_auth.strip():
-            parts.extend(["--harness-auth", harness_auth.strip()])
         parts.append("Read your instructions, then run your wake-up steps.")
-        spawn_commands.append(" ".join(shlex.quote(p) for p in parts))
+        cmd_str = " ".join(shlex.quote(p) for p in parts)
+        if harness_auth:
+            cmd_str += f" --harness-auth {shlex.quote(harness_auth)}"
+        tpl_yaml = templates_dir / tpl / "scion-agent.yaml"
+        if tpl_yaml.exists() and "gcp_identity" in tpl_yaml.read_text(encoding="utf-8"):
+            cmd_str += ' ${FACTORY_DEPLOYER_SA_ID:+--service-account "$FACTORY_DEPLOYER_SA_ID"}'
+        spawn_commands.append(cmd_str)
 
     lead_notified = False
     if spawn_commands:
@@ -209,6 +217,7 @@ def run_hot_upgrade(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command-line arguments and run the hot upgrade."""
     parser = argparse.ArgumentParser(description="Live hot-upgrade for Scion templates, prompt rules, and child agents")
     parser.add_argument("--project", required=True, help="Target Scion Hub project slug")
     parser.add_argument("--templates", default=str(ROOT_DIR / "templates"), help="Templates directory path")
@@ -222,7 +231,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spawn", action="append", default=[], help="Specialist to start via lead: template[:agent_name]")
     parser.add_argument("--lead", default="", help="Explicit lead agent slug")
     parser.add_argument("--branch", default="", help="Optional Git branch (-b) for per-agent specialist starts")
-    parser.add_argument("--harness-auth", default="vertex-ai", help="Harness auth flag passed to scion start")
     parser.add_argument("--apply", action="store_true", help="Execute mutations (dry-run by default)")
     parser.add_argument("--json", action="store_true", help="Print JSON summary")
     args = parser.parse_args(argv)
@@ -237,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             rule_delta=delta,
             notify_agents=[a for a in args.notify_agents.split(",") if a.strip()],
             spawn_specs=parse_spawn_specs(args.spawn), lead_slug=args.lead,
-            branch=args.branch, harness_auth=args.harness_auth, apply=args.apply,
+            branch=args.branch, apply=args.apply,
         )
     except (ValueError, RuntimeError) as err:
         print(f"error: {err}", file=sys.stderr)

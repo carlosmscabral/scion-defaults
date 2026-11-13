@@ -113,6 +113,8 @@ def test_hot_upgrade_dry_run_and_apply_preserve_ancestry_and_broadcast_delta(fak
             "reviewer-claude",
             "--branch",
             "main",
+            "--harness-auth",
+            "vertex-ai",
             "--apply",
             "--json",
         ],
@@ -139,7 +141,7 @@ def test_hot_upgrade_dry_run_and_apply_preserve_ancestry_and_broadcast_delta(fak
     )
     assert any(
         path == f"/api/v1/projects/{pid}/agents/lead/message"
-        and "scion start reviewer-claude -t reviewer-claude -b main --harness-auth vertex-ai" in msg
+        and "scion start reviewer-claude -t reviewer-claude -b main \'Read your" in msg
         for path, msg in msg_reqs
     )
 

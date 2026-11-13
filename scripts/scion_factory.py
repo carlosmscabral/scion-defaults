@@ -2706,10 +2706,7 @@ def compile_factory_boilerplate(
     out_dir: str | Path,
     force_knowledge: bool = False,
     env_file: str | Path | None = None,
-<<<<<<< HEAD
     skill_bank: str | Path | None = None,
-=======
->>>>>>> refs/remotes/pr-latest/9
 ) -> dict[str, Any]:
     """Compile a validated FactorySpec into a complete Scion factory directory.
 
@@ -3014,11 +3011,8 @@ def main(argv: list[str] | None = None) -> int:
     p_compile.add_argument("--out", required=True, help="Output directory for generated factory boilerplate")
     p_compile.add_argument("--env", default=None,
                            help="Optional factory.env path to align GCP_IDENTITY_DEFAULT / GCP_IDENTITY_MODE at compile time")
-<<<<<<< HEAD
     p_compile.add_argument("--skill-bank", default=None,
                            help="Optional directory of curated skills to inject per role (overrides spec.skill_bank)")
-=======
->>>>>>> refs/remotes/pr-latest/9
     p_compile.add_argument("--force-knowledge", action="store_true",
                            help="Reseed knowledge-plane/, backlog/, and eval-workspace/ even if they exist")
 
@@ -3151,10 +3145,7 @@ def main(argv: list[str] | None = None) -> int:
             args.out,
             force_knowledge=args.force_knowledge,
             env_file=args.env,
-<<<<<<< HEAD
             skill_bank=args.skill_bank,
-=======
->>>>>>> refs/remotes/pr-latest/9
         )
         print(f"Compiled {res['files_written']} boilerplate files into {res['out_dir']}")
         if res.get("preserved"):
