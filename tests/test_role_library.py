@@ -29,10 +29,11 @@ def test_specialist_protocols_carry_their_guardrails():
 
 def test_default_harnesses():
     assert role_library.library_role_entry("lead")["harness"] == "claude"
+    assert role_library.library_role_entry("kaizen-analyst")["harness"] == "claude"
     assert all(
         role_library.library_role_entry(r)["harness"] == "antigravity"
         for r in role_library.ROLES
-        if r != "lead"
+        if r not in ("lead", "kaizen-analyst")
     )
 
 
@@ -75,7 +76,7 @@ def test_library_role_entry_contents():
 def test_role_def_structure_and_counts():
     assert len(role_library.ALWAYS_BUILD) == 6
     assert len(role_library.ALWAYS_EVAL) == 2
-    assert len(role_library.ROLES) == 24
+    assert len(role_library.ROLES) == 25
     for r, d in role_library.ROLES.items():
         assert "team" in d
         assert "kind" in d

@@ -309,6 +309,14 @@
         },
         "worker_sa_name": {
           "type": "string"
+        },
+        "gcp_identity_mode": {
+          "type": "string",
+          "enum": [
+            "assign",
+            "passthrough",
+            "block"
+          ]
         }
       },
       "if": {
@@ -366,6 +374,33 @@
           ],
           "default": "standard",
           "description": "Decision rights for the leads (spec section 7.4)."
+        },
+        "verification_policy": {
+          "type": "string",
+          "enum": [
+            "advisory",
+            "cross-family",
+            "single-harness"
+          ],
+          "description": "Builder/verifier model-family separation policy."
+        },
+        "single_harness_reason": {
+          "type": "string",
+          "description": "Required justification when verification_policy is single-harness."
+        },
+        "reviewer_replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Standing reviewer pool size (reviewer-2..reviewer-k)."
+        },
+        "eval_heartbeat_cron": {
+          "type": "string",
+          "description": "Optional independent schedule for eval-lead."
+        },
+        "strict_scion_delegation": {
+          "type": "boolean",
+          "description": "Deny in-process Claude Agent/Task subagent tools on coordinator roles so delegation spawns Scion child containers."
         },
         "dropped_defaults": {
           "type": "array",
@@ -506,6 +541,10 @@
         "subdir",
         "agent_prefix"
       ]
+    },
+    "skill_bank": {
+      "type": "string",
+      "description": "Optional directory of curated skills injected per role at compile time."
     }
   },
   "allOf": [
@@ -716,6 +755,13 @@
         "default_kind": {
           "type": "string",
           "description": "The default this role stands in for, e.g. `implementer` for a renamed backend such as `go-dev`."
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Curated skill names from skill_bank to inject into this role template."
         }
       }
     }

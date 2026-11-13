@@ -98,6 +98,8 @@ team:
   heartbeat_mode: delta
   watchdog_cron: '*/5 * * * *'
   max_wip: 2
+  verification_policy: single-harness
+  single_harness_reason: Ephemeral clean-room GKE hillclimb benchmark builds and runs only the antigravity harness without manual third-party Model Garden approvals.
   autonomy: standard
   dropped_defaults:
   - role: researcher

@@ -36,6 +36,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discovery  # noqa: E402
+import kaizen_policy  # noqa: E402
 import knowledge_plane as kp  # noqa: E402
 import role_library  # noqa: E402
 import verification_policy  # noqa: E402
@@ -1367,16 +1368,16 @@ REPORTS_DIR = "/scion-volumes/scratchpad/reports"
 DURABILITY_RULE = "A task is done only when its result is pushed or sent in a message."
 
 _FOCUS_COMMAND_KINDS = ("implementer", "test-engineer", "investigator", "evaluator")
-_FOCUS_DOC_KINDS = ("doc-writer", "researcher")
+_FOCUS_DOC_KINDS = ("doc-writer", "researcher", "kaizen-analyst")
 _FOCUS_KEYS = ("paths", "commands", "docs")
 
 # Kinds that never change product code, commit or push: they deliver reports, verdicts or measurements to their lead.
 # Every other kind writes (implementer, doc-writer, test-engineer, frontend, migration-specialist, release-manager,
 # deployers, domain-evaluator, and roles outside the library).
 _READ_ONLY_KINDS = frozenset({
-    "reviewer", "researcher", "investigator", "security-auditor", "performance-analyst", "contract-tester",
-    "latency-prober", "ui-auditor", "safety-evaluator", "factory-analyst", "benchmark-runner", "api-compat-checker",
-    "evaluator",
+    "reviewer", "researcher", "investigator", "security-auditor", "performance-analyst", "kaizen-analyst",
+    "contract-tester", "latency-prober", "ui-auditor", "safety-evaluator", "factory-analyst",
+    "benchmark-runner", "api-compat-checker", "evaluator",
 })
 # Reviewers whose verdicts the lead collects before it gives the commit slot (they never message each other).
 _PARALLEL_REVIEWER_KINDS = ("reviewer", "security-auditor", "performance-analyst")
@@ -1452,6 +1453,8 @@ def role_focus(spec: dict[str, Any], role_spec: dict[str, Any]) -> dict[str, lis
 def _render_role_protocol(spec: dict[str, Any], role_spec: dict[str, Any]) -> str:
     lib_role = _library_role(role_spec)
     wmode = wake_mode(spec)
+    if lib_role == "kaizen-analyst":
+        return f"## Role protocol\n{kaizen_policy.render_kaizen_analyst_protocol(spec).strip()}\n\n"
     protocol = role_library.role_protocol(lib_role, deploy_mode(spec), wake_mode=wmode) if lib_role else None
     if not protocol:
         return ""
@@ -1828,6 +1831,8 @@ The digest is never a Scion message: a daily message would page the PO every day
   The body cites the evaluation run (`run_id`), the level (L1–L5), the evidence, and the `REQ-` IDs.
 - Search first (`gh issue list -R {repo} --label eval-finding --label {flabel} --search "<finding>"`) and comment on
   the open issue instead of filing a duplicate.
+- When an open `kaizen-proposal` issue carries `kaizen-eval` or `[eval]`-tagged items, adopt those probe/evaluation
+  improvements on your evaluation trunk and comment your `commit` or `run_id` evidence on that issue.
 - Never message build agents: the build lead takes the issue from the backlog. When a later run confirms the fix,
   comment the run on the issue; only the PO closes it.
 
@@ -1843,11 +1848,14 @@ The digest is never a Scion message: a daily message would page the PO every day
   The digest lists the issue; the PO accepts it by closing it.
 - An `eval-finding` issue (filed by the eval-lead at `status:ready`) is work like any other: work it directly and
   never file a duplicate issue for it.
+- A `kaizen-proposal` issue (filed at `status:ready`) is triaged autonomously against active WIP: fold `[build]` process,
+  test, review, and knowledge-plane gates into briefs with mutation proof, escalate to `status:po-decision` only on cost,
+  IAM/secrets, quotas, or scope changes, and summarize outcomes under `### Auto-improvement (Kaizen)` in the daily digest.
 - A new issue you file from any other finding links the finding (issue, evaluation run or report) in its body.
 - When you restart a specialist, comment on the issue it works on.
 - Never `scion message` the PO for a tell notice or the digest.
 
-"""
+""" + (kaizen_policy.render_coordinator_kaizen_rubric(spec) + "\n" if any(_library_role(r) == "kaizen-analyst" for r in spec.get("team", {}).get("build_roles", [])) else "")
 
 
 def _render_role_system_prompt(
@@ -2420,7 +2428,8 @@ def _render_seed_waves_sh(spec: dict[str, Any]) -> str:
     flabel = _factory_label(spec)
     digest = _digest_title(spec)
     labels = ["status:ready", "status:in-progress", "status:in-review", "status:verified", "status:blocked",
-              "status:po-decision", "status:po-review", "status:approved", "digest", "eval-finding", flabel]
+              "status:po-decision", "status:po-review", "status:approved", "digest", "eval-finding",
+              "kaizen-proposal", "kaizen-eval", flabel]
     create_labels = f'"status:ready", "--label", "{flabel}"'
     return f"""#!/usr/bin/env bash
 # Seed Wave 1..N GitHub Issues for {proj['name']} ({repo})
@@ -2816,6 +2825,8 @@ def compile_factory_boilerplate(
 
     # 2. Config files
     _write("config/factory.env.example", _render_factory_env_example(spec))
+    if any(_library_role(r) == "kaizen-analyst" for r in spec.get("team", {}).get("build_roles", [])):
+        _write("config/kaizen-manifest.json", json.dumps(kaizen_policy.build_kaizen_manifest(spec), indent=2) + "\n")
     _write("config/firestore/README.md", _render_firestore_contract(spec))
     _write("config/firestore/firestore.indexes.json", json.dumps(FIRESTORE_INDEXES, indent=2) + "\n")
     _write("config/firestore/firestore.rules", FIRESTORE_RULES)

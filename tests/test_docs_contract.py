@@ -278,7 +278,7 @@ def test_docs_cover_gke_hillclimb_delta_orchestration_and_l34():
         assert needle in readme, f"missing {needle!r} in README.md"
 
     agents_md = (ROOT / "AGENTS.md").read_text()
-    for needle in ("gke-hillclimb-report.md", "bananacast-gke.factory.yaml", "factory_delta.py", "38 lessons learned"):
+    for needle in ("gke-hillclimb-report.md", "bananacast-gke.factory.yaml", "factory_delta.py", "39 lessons learned"):
         assert needle in agents_md, f"missing {needle!r} in AGENTS.md"
 
     leak_re = re.compile(

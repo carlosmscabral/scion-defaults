@@ -1,0 +1,9 @@
+schema_version: "1"
+description: "Closed-loop 24h continuous-improvement analyst of the ${BUILD_PROJECT} factory (Claude Code). Reports to ${LEAD_AGENT}."
+default_harness_config: ${CLAUDE_HARNESS}
+model: "opus"
+agent_instructions: agents.md
+system_prompt: system-prompt.md
+env:
+  FACTORY_ROLE: kaizen-analyst
+  FACTORY_SUBDIR: "${FACTORY_SUBDIR}"
